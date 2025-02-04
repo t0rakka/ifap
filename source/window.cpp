@@ -285,7 +285,7 @@ namespace ifap
         }
         else
         {
-            setTitle("iFap 9000 v0.4.2");
+            setTitle("iFap Image Viewer");
         }
 
         onDraw();
