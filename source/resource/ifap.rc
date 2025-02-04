@@ -1,0 +1,2 @@
+#include "ifap.h"
+IDI_ICON1  ICON  DISCARDABLE  "ifap.ico"

@@ -1,0 +1,53 @@
+
+# -------------------------------------------
+# Linux / Android
+# -------------------------------------------
+
+*.o
+*.so
+*.a
+*.d
+
+# -------------------------------------------
+# OS X
+# -------------------------------------------
+
+*.DS_Store
+*.dylib
+*.xcworkspacedata
+*.xcscheme
+*.xcuserstate
+*.plist
+*.xcsettings
+
+# -------------------------------------------
+# Windows
+# -------------------------------------------
+
+*.tlog
+*.obj
+*.pdb
+*.idb
+*.suo
+*.sdf
+*.log
+*.lastbuildstate
+*.lib
+*.opensdf
+*.db
+*.ipch
+*.opendb
+*.FileListAbsolute.txt
+*.exe
+*.filters
+*.aps
+*.res
+
+# -------------------------------------------
+# Others
+# -------------------------------------------
+
+*.vscode
+CMakeFiles
+CMakeCache.txt
+*.cmake
