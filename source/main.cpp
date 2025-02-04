@@ -6,8 +6,7 @@
 
 //
 // NOTE: Load all .so files from the same directory as the binary:
-//
-// > patchelf --set-rpath '$ORIGIN' ifap
+//   patchelf --set-rpath '$ORIGIN' ifap
 //
 
 namespace ifap
