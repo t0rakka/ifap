@@ -54,8 +54,7 @@ if (NOT WIN32)
 endif ()
 
 find_package(mango REQUIRED)
-find_package(mango-opengl REQUIRED)
-target_link_libraries(ifap PUBLIC mango mango-opengl)
+target_link_libraries(ifap PUBLIC mango)
 
 if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -65,7 +64,7 @@ message(STATUS "Build: ${CMAKE_BUILD_TYPE}")
 
 if (APPLE)
 
-    link_libraries("-framework OpenGL -framework Cocoa")
+    target_link_libraries(ifap PUBLIC "-framework OpenGL -framework Cocoa")
 
     # fix wrapped compiler dropping /usr/local
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -I/usr/local/include")
@@ -73,7 +72,7 @@ if (APPLE)
 
 elseif (UNIX)
 
-    target_link_libraries(ifap PUBLIC GL X11)
+    target_link_libraries(ifap PUBLIC X11 GL)
 
 elseif (WIN32)
 
