@@ -10,6 +10,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 FILE(GLOB sources
     "source/*.cpp"
+    "source/*.hpp"
     "source/resource/ifap.rc"
 )
 
