@@ -22,7 +22,6 @@ namespace ifap
         , m_shaders()
         , m_texture_cache(*this)
     {
-        setIcon();
         resetTransformation();
 
         GLint componentType;
@@ -51,25 +50,6 @@ namespace ifap
 
     AppWindow::~AppWindow()
     {
-    }
-
-    void AppWindow::setIcon()
-    {
-#ifdef MANGO_PLATFORM_WINDOWS
-        HINSTANCE hinstance = ::GetModuleHandle(NULL);
-        HICON hIcon = ::LoadIcon(hinstance, MAKEINTRESOURCE(IDI_ICON1));
-        if (hIcon)
-        {
-            HWND hwnd = *this;
-            SendMessage(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
-            SendMessage(hwnd, WM_SETICON, ICON_BIG, (LPARAM)hIcon);
-            SendMessage(GetWindow(hwnd, GW_OWNER), WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
-            SendMessage(GetWindow(hwnd, GW_OWNER), WM_SETICON, ICON_BIG, (LPARAM)hIcon);
-            ::DestroyIcon(hIcon);
-        }
-#else
-        // NOTE: setIcon() doesn't work on xlib when using GNOME
-#endif
     }
 
     void AppWindow::nextImage(int direction)
