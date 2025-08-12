@@ -2,6 +2,7 @@
     iFap Image Viewer Example for MANGO
     Copyright 2013-2025 Twilight 3D Finland Oy. All rights reserved.
 */
+#define MANGO_IMPLEMENT_MAIN
 #include "window.hpp"
 
 //
@@ -9,84 +10,20 @@
 //   patchelf --set-rpath '$ORIGIN' ifap
 //
 
-namespace ifap
-{
-
-    // -----------------------------------------------------------------------
-    // main()
-    // -----------------------------------------------------------------------
-
-    int main(const CommandLine& commands)
-    {
-        ifap::OpenGLContext::Config config;
-        config.red   = 16;
-        config.green = 16;
-        config.blue  = 16;
-        config.alpha = 16;
-
-        printEnable(Print::Info, true);
-
-        ifap::AppWindow window(config, commands);
-        window.enterEventLoop();
-
-        return 0;
-    }
-
-} // namespace ifap
-
-#ifdef MANGO_PLATFORM_WINDOWS
-
 using namespace mango;
-using namespace mango::filesystem;
-using namespace mango::image;
 
-// -----------------------------------------------------------------------
-// WinMain()
-// -----------------------------------------------------------------------
-
-//#define CREATE_CONSOLE
-
-int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPTSTR cmdline, int)
+int mangoMain(const mango::CommandLine& commands)
 {
-#ifdef CREATE_CONSOLE
-	// create output console
-	AllocConsole();
-	FILE* fp;
-	freopen_s(&fp, "CON", "w", stdout);
-#endif
+    ifap::OpenGLContext::Config config;
+    config.red   = 16;
+    config.green = 16;
+    config.blue  = 16;
+    config.alpha = 16;
 
-    // Get the executable path (including binary filename)
-    WCHAR executable[_MAX_PATH];
-    ::GetModuleFileNameW(NULL, executable, _MAX_PATH);
+    printEnable(Print::Info, true);
 
-    ifap::CommandLine commands;
-    commands.push_back(mango::u16_toBytes(executable));
+    ifap::AppWindow window(config, commands);
+    window.enterEventLoop();
 
-    int status = ifap::main(commands);
-
-#ifdef CREATE_CONSOLE
-    // close output console
-	fclose(fp);
-#endif
-
-	return status;
+    return 0;
 }
-
-#else
-
-int main(int argc, const char* argv[])
-{
-    ifap::CommandLine commands(argv + 0, argv + argc);
-    if (argc > 2)
-    {
-        // This is for XCode littering command line with it's debugging junk
-        commands.clear();
-    }
-
-    int status = ifap::main(commands);
-
-    return status;
-}
-
-#endif
-
