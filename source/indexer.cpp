@@ -43,6 +43,13 @@ namespace ifap
                 return;
             }
 
+            bool encrypted = info.isEncrypted();
+            if (encrypted)
+            {
+                // skip encrypted folders and files
+                continue;
+            }
+
             if (!info.isDirectory())
             {
                 // Filter only decodable files
