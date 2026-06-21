@@ -2,52 +2,42 @@
     iFap Image Viewer Example for MANGO
     Copyright 2013-2025 Twilight 3D Finland Oy. All rights reserved.
 */
-#include <string>
-#include <sstream>
-#include "window.hpp"
+#include "app_view.hpp"
 
-#ifdef MANGO_PLATFORM_WINDOWS
-#include "resource/ifap.h"
-#endif
+#include <string>
 
 namespace ifap
 {
 
-    // -----------------------------------------------------------------------
-    // AppWindow
-    // -----------------------------------------------------------------------
-
-    AppWindow::AppWindow(const OpenGLContext::Config& config, const CommandLine& commands)
-        : OpenGLContext(1280, 800, 0, &config)
-        , m_renderer(*this)
-        , m_texture_cache(m_renderer)
+    AppView::AppView(Window& window, RenderBackend& renderer, std::function<void()> toggle_fullscreen)
+        : m_window(window)
+        , m_renderer(renderer)
+        , m_toggle_fullscreen(std::move(toggle_fullscreen))
+        , m_texture_cache(renderer)
     {
         resetTransformation();
+    }
 
-        m_renderer.initialize();
+    AppView::~AppView()
+    {
+    }
 
+    void AppView::startup(const CommandLine& commands)
+    {
         printEnable(Print::Info, false);
 
         m_left_time = 0;
         m_right_time = 0;
 
-        // process commands
         if (commands.size() > 1)
         {
-            std::string filename = std::string(commands[1]);
-
             FileIndex index;
-            index.emplace(filename);
-
+            index.emplace(std::string(commands[1]));
             onDropFiles(index);
         }
     }
 
-    AppWindow::~AppWindow()
-    {
-    }
-
-    void AppWindow::nextImage(int direction)
+    void AppView::nextImage(int direction)
     {
         if (direction)
         {
@@ -55,7 +45,6 @@ namespace ifap
             size_t count = indexer.size();
             if (!count)
             {
-                // no files found
                 return;
             }
 
@@ -75,15 +64,15 @@ namespace ifap
         }
     }
 
-    void AppWindow::resetTransformation()
+    void AppView::resetTransformation()
     {
         m_translate = float32x2(0.0f, 0.0f);
         m_scale = 1.0f;
     }
 
-    float32x2 AppWindow::computeAspect() const
+    float32x2 AppView::computeAspect() const
     {
-        int32x2 window_size = getWindowSize();
+        int32x2 window_size = m_window.getWindowSize();
         window_size.x = std::max(1, window_size.x);
         window_size.y = std::max(1, window_size.y);
 
@@ -109,9 +98,9 @@ namespace ifap
         return aspect;
     }
 
-    float32x2 AppWindow::computeTranslate() const
+    float32x2 AppView::computeTranslate() const
     {
-        int32x2 window_size = getWindowSize();
+        int32x2 window_size = m_window.getWindowSize();
         window_size.x = std::max(1, window_size.x);
         window_size.y = std::max(1, window_size.y);
         float dx = m_mouse_translate.delta.x / float(window_size.x) * 2.0f;
@@ -119,26 +108,50 @@ namespace ifap
         return float32x2(dx, dy);
     }
 
-    float AppWindow::computeScale() const
+    float AppView::computeScale() const
     {
-        int32x2 window_size = getWindowSize();
+        int32x2 window_size = m_window.getWindowSize();
         window_size.y = std::max(1, window_size.y);
         float s = m_scale - m_scale * (m_mouse_scale.delta.y / float(window_size.y) * 4.0f);
         s = std::max(0.3f, s);
         return s;
     }
 
-    void AppWindow::onClose()
+    ImageDrawRequest AppView::makeDrawRequest() const
+    {
+        float32x2 aspect = computeAspect();
+        float32x2 scale = aspect * computeScale();
+        float32x2 translate = m_translate + computeTranslate() / scale;
+
+        ImageDrawRequest request;
+        request.texture = m_current_texture.handle;
+        request.width = m_current_texture.width;
+        request.height = m_current_texture.height;
+        request.linear = m_current_texture.linear;
+        request.translate = translate;
+        request.scale = scale;
+        request.filter = m_texture_filter;
+        request.intensity = 1.0f;
+
+        if (!m_current_texture.linear && m_hdr)
+        {
+            request.intensity = 2.0f;
+        }
+
+        return request;
+    }
+
+    void AppView::onClose()
     {
     }
 
-    void AppWindow::onMouseMove(int x, int y)
+    void AppView::onMouseMove(int x, int y)
     {
         m_mouse_translate.update(x, y);
         m_mouse_scale.update(x, y);
     }
 
-    void AppWindow::onMouseClick(int x, int y, MouseButton button, int count)
+    void AppView::onMouseClick(int x, int y, MouseButton button, int count)
     {
         switch (button)
         {
@@ -155,7 +168,7 @@ namespace ifap
                     break;
 
                 case 2:
-                    toggleFullscreen();
+                    m_toggle_fullscreen();
                     break;
 
                 default:
@@ -185,16 +198,18 @@ namespace ifap
         }
     }
 
-    void AppWindow::onKeyPress(Keycode code, u32 mask)
+    void AppView::onKeyPress(Keycode code, u32 mask)
     {
+        MANGO_UNREFERENCED(mask);
+
         switch (code)
         {
             case KEYCODE_ESC:
-                breakEventLoop();
+                m_window.breakEventLoop();
                 break;
 
             case KEYCODE_F:
-                toggleFullscreen();
+                m_toggle_fullscreen();
                 break;
 
             case KEYCODE_Q:
@@ -228,14 +243,13 @@ namespace ifap
         }
     }
 
-    void AppWindow::onDropFiles(const FileIndex& fileIndex)
+    void AppView::onDropFiles(const FileIndex& fileIndex)
     {
         if (fileIndex.empty())
         {
             return;
         }
 
-        // select first dropped object
         auto& object = fileIndex[0];
 
         size_t index = m_texture_cache.setCurrentPath(object.name);
@@ -247,7 +261,7 @@ namespace ifap
         }
     }
 
-    void AppWindow::onIdle()
+    void AppView::onIdle()
     {
         const ImageFileIndexer& indexer = m_texture_cache;
 
@@ -256,27 +270,27 @@ namespace ifap
             std::string filename = indexer[m_current_index];
             std::string title = fmt::format("[{} / {}] {}",
                 m_current_index + 1, indexer.size(), filename);
-            setTitle(title);
+            m_window.setTitle(title);
         }
         else
         {
-            setTitle("iFap Image Viewer");
+            m_window.setTitle("iFap Image Viewer");
         }
 
         onDraw();
         std::this_thread::sleep_for(std::chrono::milliseconds(4));
     }
 
-    void AppWindow::onResize(int width, int height)
+    void AppView::onResize(int width, int height)
     {
         m_renderer.resize(width, height);
     }
 
-    void AppWindow::onDraw()
+    void AppView::onDraw()
     {
         u64 current_time = mango::Time::ms();
 
-        if (isKeyPressed(KEYCODE_LEFT) || isKeyPressed(KEYCODE_Q))
+        if (m_window.isKeyPressed(KEYCODE_LEFT) || m_window.isKeyPressed(KEYCODE_Q))
         {
             if (current_time - m_left_time > repeat_treshold)
             {
@@ -285,7 +299,7 @@ namespace ifap
             }
         }
 
-        if (isKeyPressed(KEYCODE_RIGHT) || isKeyPressed(KEYCODE_W))
+        if (m_window.isKeyPressed(KEYCODE_RIGHT) || m_window.isKeyPressed(KEYCODE_W))
         {
             if (current_time - m_right_time > repeat_treshold)
             {
@@ -294,36 +308,18 @@ namespace ifap
             }
         }
 
-        const bool blend = !isKeyPressed(KEYCODE_B);
-        m_renderer.beginFrame(0.06f, 0.06f, 0.06f, 1.0f, blend);
-
+        // Upload decoded regions first so GPU transfers can overlap with acquire/present work.
         m_texture_cache.update();
+
+        const bool blend = !m_window.isKeyPressed(KEYCODE_B);
+        m_renderer.beginFrame(0.06f, 0.06f, 0.06f, 1.0f, blend);
 
         if (m_current_texture)
         {
-            float32x2 aspect = computeAspect();
-            float32x2 scale = aspect * computeScale();
-            float32x2 translate = m_translate + computeTranslate() / scale;
-
-            ImageDrawRequest request;
-            request.texture = m_current_texture.handle;
-            request.width = m_current_texture.width;
-            request.height = m_current_texture.height;
-            request.linear = m_current_texture.linear;
-            request.translate = translate;
-            request.scale = scale;
-            request.filter = m_texture_filter;
-
-            request.intensity = 1.0f;
-            if (!m_current_texture.linear && m_hdr)
-            {
-                request.intensity = 2.0f;
-            }
-
-            m_renderer.drawImage(request);
+            m_renderer.drawImage(makeDrawRequest());
         }
 
-        swapBuffers();
+        m_renderer.endFrame();
     }
 
 } // namespace ifap

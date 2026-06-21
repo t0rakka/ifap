@@ -16,6 +16,7 @@ namespace ifap
     protected:
         mango::OpenGLContext& m_context;
         bool m_apple_client_storage = false;
+        int m_max_texture_dimension = 0;
 
         struct Uniform
         {
@@ -73,6 +74,7 @@ namespace ifap
         {
             Uniform4f uniform_transform;
             Uniform1i uniform_texture;
+            Uniform2f uniform_texture_scale;
             Uniform1f uniform_scale;
             GLint attribute_position;
         };
@@ -116,10 +118,14 @@ namespace ifap
         void beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend) override;
         void drawImage(const ImageDrawRequest& request) override;
 
+        int getMaxTextureDimension() const override;
+
         TextureHandle createTexture(int width, int height, PixelFormat format, const void* initial_data) override;
         void uploadTextureRegion(TextureHandle handle, PixelFormat format,
                                  int x, int y, int width, int height, const void* pixels) override;
         void destroyTexture(TextureHandle handle) override;
+
+        void endFrame() override;
     };
 
 } // namespace ifap

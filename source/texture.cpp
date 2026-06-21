@@ -195,6 +195,26 @@ namespace ifap
                 return {};
             }
 
+            const int max_texture_dimension = m_renderer.getMaxTextureDimension();
+            if (max_texture_dimension > 0 &&
+                (header.width > max_texture_dimension || header.height > max_texture_dimension))
+            {
+                printLine(Print::Error, "{}: {} x {} exceeds GPU texture limit (max dimension: {})",
+                    filename, header.width, header.height, max_texture_dimension);
+
+                static const u8 placeholder_pixel[] = { 32, 32, 32, 255 };
+
+                GpuTexture& texture = task->texture;
+                texture.width = header.width;
+                texture.height = header.height;
+                texture.format = PixelFormat::RGBA8_UNORM;
+                texture.linear = true;
+                texture.handle = m_renderer.createTexture(1, 1, PixelFormat::RGBA8_UNORM, placeholder_pixel);
+
+                m_cache.insert(index, task);
+                return task->texture;
+            }
+
             GpuTexture& texture = task->texture;
 
             Format format;
@@ -268,7 +288,7 @@ namespace ifap
             DecodeTask& task = *value.second;
             GpuTexture& texture = task.texture;
 
-            if (texture.handle)
+            if (texture.handle && task.bitmap)
             {
                 std::vector<ImageDecodeRect> updates = task.getUpdates();
 
