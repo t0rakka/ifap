@@ -21,9 +21,14 @@ namespace ifap
         std::unique_ptr<File> file;
         std::unique_ptr<ImageDecoder> decoder;
         std::unique_ptr<Bitmap> bitmap;
+        std::unique_ptr<Bitmap> scaled_bitmap;
         ImageDecodeFuture future;
 
         GpuTexture texture;
+
+        bool downscale = false;
+        int downscale_width = 0;
+        int downscale_height = 0;
 
         std::mutex mutex;
         std::vector<ImageDecodeRect> updates;
@@ -53,7 +58,11 @@ namespace ifap
 
         size_t setCurrentPath(const std::string& name);
         GpuTexture getTexture(size_t index);
+        bool syncTexture(size_t index, GpuTexture& texture);
         void update();
+
+    protected:
+        void uploadDownscaledPreview(DecodeTask& task);
     };
 
 } // namespace ifap

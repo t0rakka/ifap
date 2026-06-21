@@ -125,8 +125,8 @@ namespace ifap
 
         ImageDrawRequest request;
         request.texture = m_current_texture.handle;
-        request.width = m_current_texture.width;
-        request.height = m_current_texture.height;
+        request.width = m_current_texture.sample_width;
+        request.height = m_current_texture.sample_height;
         request.linear = m_current_texture.linear;
         request.translate = translate;
         request.scale = scale;
@@ -310,6 +310,7 @@ namespace ifap
 
         // Upload decoded regions first so GPU transfers can overlap with acquire/present work.
         m_texture_cache.update();
+        m_texture_cache.syncTexture(m_current_index, m_current_texture);
 
         const bool blend = !m_window.isKeyPressed(KEYCODE_B);
         m_renderer.beginFrame(0.06f, 0.06f, 0.06f, 1.0f, blend);

@@ -33,6 +33,8 @@ namespace ifap
         TextureHandle handle = 0;
         int width = 0;
         int height = 0;
+        int sample_width = 0;
+        int sample_height = 0;
         PixelFormat format = PixelFormat::RGBA8_UNORM;
         bool linear = false;
 

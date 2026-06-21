@@ -4,8 +4,45 @@
 */
 #include "texture.hpp"
 
+#include <mango/image/bicubic.hpp>
+
+#include <algorithm>
+
 namespace ifap
 {
+
+    namespace
+    {
+        math::int32x2 computeDownscaleDimensions(int width, int height, int max_dimension)
+        {
+            if (width <= max_dimension && height <= max_dimension)
+            {
+                return math::int32x2(width, height);
+            }
+
+            const float scale = std::min(float(max_dimension) / float(width),
+                                         float(max_dimension) / float(height));
+
+            return math::int32x2(
+                std::max(1, int(float(width) * scale)),
+                std::max(1, int(float(height) * scale)));
+        }
+
+        void createPlaceholderTexture(DecodeTask& task, RenderBackend& renderer, int width, int height)
+        {
+            static const u8 placeholder_pixel[] = { 32, 32, 32, 255 };
+
+            GpuTexture& texture = task.texture;
+            texture.width = width;
+            texture.height = height;
+            texture.sample_width = 1;
+            texture.sample_height = 1;
+            texture.format = PixelFormat::RGBA8_UNORM;
+            texture.linear = true;
+            texture.handle = renderer.createTexture(1, 1, PixelFormat::RGBA8_UNORM, placeholder_pixel);
+        }
+
+    } // namespace
 
     // -----------------------------------------------------------------------
     // DecodeTask
@@ -58,6 +95,31 @@ namespace ifap
     TextureCache::operator const ImageFileIndexer& () const
     {
         return m_indexer;
+    }
+
+    void TextureCache::uploadDownscaledPreview(DecodeTask& task)
+    {
+        GpuTexture& texture = task.texture;
+
+        if (!task.bitmap || !task.scaled_bitmap)
+        {
+            return;
+        }
+
+        const int dw = task.downscale_width;
+        const int dh = task.downscale_height;
+
+        u32_bicubic_blit(*task.scaled_bitmap, *task.bitmap,
+            0.5f, 0.5f, float(dw) - 1.0f, float(dh) - 1.0f);
+
+        if (!texture.handle)
+        {
+            texture.handle = m_renderer.createTexture(dw, dh, texture.format, task.scaled_bitmap->image);
+            return;
+        }
+
+        m_renderer.uploadTextureRegion(texture.handle, texture.format,
+            0, 0, dw, dh, task.scaled_bitmap->image);
     }
 
     size_t TextureCache::setCurrentPath(const std::string& name)
@@ -196,20 +258,15 @@ namespace ifap
             }
 
             const int max_texture_dimension = m_renderer.getMaxTextureDimension();
-            if (max_texture_dimension > 0 &&
-                (header.width > max_texture_dimension || header.height > max_texture_dimension))
+            const bool needs_downscale = max_texture_dimension > 0 &&
+                (header.width > max_texture_dimension || header.height > max_texture_dimension);
+
+            if (needs_downscale && header.format.isFloat())
             {
-                printLine(Print::Error, "{}: {} x {} exceeds GPU texture limit (max dimension: {})",
+                printLine(Print::Error, "{}: {} x {} exceeds GPU texture limit (max dimension: {}); float preview not supported yet",
                     filename, header.width, header.height, max_texture_dimension);
 
-                static const u8 placeholder_pixel[] = { 32, 32, 32, 255 };
-
-                GpuTexture& texture = task->texture;
-                texture.width = header.width;
-                texture.height = header.height;
-                texture.format = PixelFormat::RGBA8_UNORM;
-                texture.linear = true;
-                texture.handle = m_renderer.createTexture(1, 1, PixelFormat::RGBA8_UNORM, placeholder_pixel);
+                createPlaceholderTexture(*task, m_renderer, header.width, header.height);
 
                 m_cache.insert(index, task);
                 return task->texture;
@@ -252,6 +309,22 @@ namespace ifap
                 }
             }
 
+            if (needs_downscale)
+            {
+                const math::int32x2 preview_size = computeDownscaleDimensions(
+                    header.width, header.height, max_texture_dimension);
+
+                task->downscale = true;
+                task->downscale_width = preview_size.x;
+                task->downscale_height = preview_size.y;
+
+                printLine(Print::Info, "{}: {} x {} exceeds GPU limit ({}), preview {} x {}",
+                    filename, header.width, header.height, max_texture_dimension,
+                    task->downscale_width, task->downscale_height);
+
+                task->scaled_bitmap = std::make_unique<Bitmap>(task->downscale_width, task->downscale_height, format);
+            }
+
             task->bitmap = std::make_unique<Bitmap>(header.width, header.height, format);
             task->updates.clear();
             task->progress = 0.0f;
@@ -260,13 +333,24 @@ namespace ifap
             texture.height = header.height;
             texture.format = pixel_format;
 
-            const void* initial_data = nullptr;
-            if (task->bitmap->image)
+            if (needs_downscale)
             {
-                initial_data = task->bitmap->image;
+                texture.sample_width = task->downscale_width;
+                texture.sample_height = task->downscale_height;
             }
+            else
+            {
+                texture.sample_width = header.width;
+                texture.sample_height = header.height;
 
-            texture.handle = m_renderer.createTexture(header.width, header.height, pixel_format, initial_data);
+                const void* initial_data = nullptr;
+                if (task->bitmap->image)
+                {
+                    initial_data = task->bitmap->image;
+                }
+
+                texture.handle = m_renderer.createTexture(header.width, header.height, pixel_format, initial_data);
+            }
 
             // don't capture the shared_ptr because the callback lambda will hold a reference
             task->future = task->decoder->launch([task = task.get()] (const ImageDecodeRect& rect)
@@ -281,6 +365,18 @@ namespace ifap
         }
     }
 
+    bool TextureCache::syncTexture(size_t index, GpuTexture& texture)
+    {
+        auto entry = m_cache.get(index);
+        if (!entry)
+        {
+            return false;
+        }
+
+        texture = entry.value()->texture;
+        return true;
+    }
+
     void TextureCache::update()
     {
         for (auto& value : m_cache)
@@ -288,25 +384,42 @@ namespace ifap
             DecodeTask& task = *value.second;
             GpuTexture& texture = task.texture;
 
-            if (texture.handle && task.bitmap)
+            if (!task.bitmap)
             {
-                std::vector<ImageDecodeRect> updates = task.getUpdates();
+                continue;
+            }
 
-                for (auto rect : updates)
+            const std::vector<ImageDecodeRect> updates = task.getUpdates();
+
+            if (task.downscale)
+            {
+                if (!updates.empty() || !texture.handle)
                 {
-                    if (task.bitmap->width == rect.width)
-                    {
-                        u8* image = task.bitmap->address(rect.x, rect.y);
-                        m_renderer.uploadTextureRegion(texture.handle, texture.format,
-                            rect.x, rect.y, rect.width, rect.height, image);
-                    }
-                    else
-                    {
-                        Surface source(*task.bitmap, rect.x, rect.y, rect.width, rect.height);
-                        Bitmap temp(source);
-                        m_renderer.uploadTextureRegion(texture.handle, texture.format,
-                            rect.x, rect.y, rect.width, rect.height, temp.image);
-                    }
+                    uploadDownscaledPreview(task);
+                }
+
+                continue;
+            }
+
+            if (!texture.handle)
+            {
+                continue;
+            }
+
+            for (auto rect : updates)
+            {
+                if (task.bitmap->width == rect.width)
+                {
+                    u8* image = task.bitmap->address(rect.x, rect.y);
+                    m_renderer.uploadTextureRegion(texture.handle, texture.format,
+                        rect.x, rect.y, rect.width, rect.height, image);
+                }
+                else
+                {
+                    Surface source(*task.bitmap, rect.x, rect.y, rect.width, rect.height);
+                    Bitmap temp(source);
+                    m_renderer.uploadTextureRegion(texture.handle, texture.format,
+                        rect.x, rect.y, rect.width, rect.height, temp.image);
                 }
             }
         }
