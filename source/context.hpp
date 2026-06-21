@@ -6,7 +6,6 @@
 
 #include <mango/mango.hpp>
 #include <mango/math/vector.hpp>
-#include <mango/opengl/opengl.hpp>
 
 namespace ifap
 {

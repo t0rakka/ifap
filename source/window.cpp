@@ -19,17 +19,12 @@ namespace ifap
 
     AppWindow::AppWindow(const OpenGLContext::Config& config, const CommandLine& commands)
         : OpenGLContext(1280, 800, 0, &config)
-        , m_shaders()
-        , m_texture_cache(*this)
+        , m_renderer(*this)
+        , m_texture_cache(m_renderer)
     {
         resetTransformation();
 
-        GLint componentType;
-        glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_BACK_LEFT, GL_FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE, &componentType);
-        if (componentType != GL_FLOAT)
-        {
-            glEnable(GL_FRAMEBUFFER_SRGB);
-        }
+        m_renderer.initialize();
 
         printEnable(Print::Info, false);
 
@@ -219,13 +214,13 @@ namespace ifap
                 break;
 
             case KEYCODE_1:
-                m_shaders.texture_filter = TextureFilter::NEAREST;
+                m_texture_filter = TextureFilter::NEAREST;
                 break;
             case KEYCODE_2:
-                m_shaders.texture_filter = TextureFilter::BILINEAR;
+                m_texture_filter = TextureFilter::BILINEAR;
                 break;
             case KEYCODE_3:
-                m_shaders.texture_filter = TextureFilter::BICUBIC;
+                m_texture_filter = TextureFilter::BICUBIC;
                 break;
 
             default:
@@ -274,16 +269,12 @@ namespace ifap
 
     void AppWindow::onResize(int width, int height)
     {
-        glViewport(0, 0, width, height);
-        glScissor(0, 0, width, height);
+        m_renderer.resize(width, height);
     }
 
     void AppWindow::onDraw()
     {
         u64 current_time = mango::Time::ms();
-
-        const u64 repeat_treshold = 420;
-        const u64 repeat_delay = 3;
 
         if (isKeyPressed(KEYCODE_LEFT) || isKeyPressed(KEYCODE_Q))
         {
@@ -303,35 +294,33 @@ namespace ifap
             }
         }
 
-        glClearColor(0.06f, 0.06f, 0.06f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        if (isKeyPressed(KEYCODE_B))
-            glDisable(GL_BLEND);
-        else
-            glEnable(GL_BLEND);
+        const bool blend = !isKeyPressed(KEYCODE_B);
+        m_renderer.beginFrame(0.06f, 0.06f, 0.06f, 1.0f, blend);
 
         m_texture_cache.update();
 
-        GLuint texture = m_current_texture.texture;
-        if (texture)
+        if (m_current_texture)
         {
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, texture);
-
             float32x2 aspect = computeAspect();
             float32x2 scale = aspect * computeScale();
             float32x2 translate = m_translate + computeTranslate() / scale;
 
-            float intensity = 1.0f;
+            ImageDrawRequest request;
+            request.texture = m_current_texture.handle;
+            request.width = m_current_texture.width;
+            request.height = m_current_texture.height;
+            request.linear = m_current_texture.linear;
+            request.translate = translate;
+            request.scale = scale;
+            request.filter = m_texture_filter;
 
+            request.intensity = 1.0f;
             if (!m_current_texture.linear && m_hdr)
             {
-                intensity = 2.0f;
+                request.intensity = 2.0f;
             }
 
-            m_shaders.draw(m_current_texture, intensity, translate, scale);
+            m_renderer.drawImage(request);
         }
 
         swapBuffers();

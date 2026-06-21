@@ -11,7 +11,8 @@ namespace ifap
     // DecodeTask
     // -----------------------------------------------------------------------
 
-    DecodeTask::DecodeTask()
+    DecodeTask::DecodeTask(RenderBackend& renderer)
+        : renderer(renderer)
     {
     }
 
@@ -27,9 +28,9 @@ namespace ifap
             future.get();
         }
 
-        if (texture.texture)
+        if (texture.handle)
         {
-            glDeleteTextures(1, &texture.texture);
+            renderer.destroyTexture(texture.handle);
         }
     }
 
@@ -45,14 +46,9 @@ namespace ifap
     // TextureCache
     // -----------------------------------------------------------------------
 
-    TextureCache::TextureCache(const OpenGLContext& context)
+    TextureCache::TextureCache(RenderBackend& renderer)
+        : m_renderer(renderer)
     {
-        APPLE_client_storage = context.ext.APPLE_client_storage;
-
-        if (APPLE_client_storage)
-        {
-            printLine("APPLE_client_storage : enabled.");
-        }
     }
 
     TextureCache::~TextureCache()
@@ -173,7 +169,7 @@ namespace ifap
         return m_current_index;
     }
 
-    Texture TextureCache::getTexture(size_t index)
+    GpuTexture TextureCache::getTexture(size_t index)
     {
         auto entry = m_cache.get(index);
         if (entry)
@@ -185,7 +181,7 @@ namespace ifap
         else
         {
             // cache miss
-            std::shared_ptr<DecodeTask> task = std::make_shared<DecodeTask>();
+            std::shared_ptr<DecodeTask> task = std::make_shared<DecodeTask>(m_renderer);
 
             std::string filename = m_indexer[index];
 
@@ -196,13 +192,13 @@ namespace ifap
             printLine("{}: {} x {}", filename, header.width, header.height);
             if (!header.width || !header.height)
             {
-                return { 0, 0, 0 };
+                return {};
             }
 
-            Texture& texture = task->texture;
+            GpuTexture& texture = task->texture;
 
             Format format;
-            GLenum internalFormat;
+            PixelFormat pixel_format;
 
             if (header.format.isFloat())
             {
@@ -210,17 +206,13 @@ namespace ifap
                 if (header.format.bits <= 64)
                 {
                     format = Format(64, Format::FLOAT16, Format::RGBA, 16, 16, 16, 16);
-                    internalFormat = GL_RGBA16F;
-                    texture.format = GL_RGBA;
-                    texture.type = GL_HALF_FLOAT;
+                    pixel_format = PixelFormat::RGBA16F;
                     texture.linear = true;
                 }
                 else
                 {
                     format = Format(128, Format::FLOAT32, Format::RGBA, 32, 32, 32, 32);
-                    internalFormat = GL_RGBA32F;
-                    texture.format = GL_RGBA;
-                    texture.type = GL_FLOAT;
+                    pixel_format = PixelFormat::RGBA32F;
                     texture.linear = true;
                 }
             }
@@ -230,43 +222,31 @@ namespace ifap
 
                 if (header.linear)
                 {
-                    internalFormat = GL_RGBA;
+                    pixel_format = PixelFormat::RGBA8_UNORM;
                     texture.linear = true;
                 }
                 else
                 {
-                    internalFormat = GL_SRGB8;
+                    pixel_format = PixelFormat::RGBA8_SRGB;
                     texture.linear = false;
                 }
-
-                texture.format = GL_RGBA;
-                texture.type = GL_UNSIGNED_BYTE;
             }
 
             task->bitmap = std::make_unique<Bitmap>(header.width, header.height, format);
             task->updates.clear();
             task->progress = 0.0f;
 
-            glGenTextures(1, &texture.texture);
             texture.width = header.width;
             texture.height = header.height;
+            texture.format = pixel_format;
 
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, task->texture);
+            const void* initial_data = nullptr;
+            if (task->bitmap->image)
+            {
+                initial_data = task->bitmap->image;
+            }
 
-            if (APPLE_client_storage)
-            {
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_STORAGE_HINT_APPLE, GL_STORAGE_CACHED_APPLE);
-                glPixelStorei(GL_UNPACK_CLIENT_STORAGE_APPLE, GL_TRUE);
-                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-                glTexImage2D(GL_TEXTURE_2D, 0, internalFormat, header.width, header.height, 0,
-                             texture.format, texture.type, task->bitmap->image);
-            }
-            else
-            {
-                glTexImage2D(GL_TEXTURE_2D, 0, internalFormat, header.width, header.height, 0,
-                             texture.format, texture.type, nullptr);
-            }
+            texture.handle = m_renderer.createTexture(header.width, header.height, pixel_format, initial_data);
 
             // don't capture the shared_ptr because the callback lambda will hold a reference
             task->future = task->decoder->launch([task = task.get()] (const ImageDecodeRect& rect)
@@ -286,13 +266,10 @@ namespace ifap
         for (auto& value : m_cache)
         {
             DecodeTask& task = *value.second;
-            Texture& texture = task.texture;
+            GpuTexture& texture = task.texture;
 
-            if (texture.texture)
+            if (texture.handle)
             {
-                glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, texture);
-
                 std::vector<ImageDecodeRect> updates = task.getUpdates();
 
                 for (auto rect : updates)
@@ -300,81 +277,19 @@ namespace ifap
                     if (task.bitmap->width == rect.width)
                     {
                         u8* image = task.bitmap->address(rect.x, rect.y);
-                        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-                        glTexSubImage2D(GL_TEXTURE_2D, 0, rect.x, rect.y, rect.width, rect.height,
-                                        texture.format, texture.type, image);
+                        m_renderer.uploadTextureRegion(texture.handle, texture.format,
+                            rect.x, rect.y, rect.width, rect.height, image);
                     }
                     else
                     {
                         Surface source(*task.bitmap, rect.x, rect.y, rect.width, rect.height);
                         Bitmap temp(source);
-                        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-                        glTexSubImage2D(GL_TEXTURE_2D, 0, rect.x, rect.y, rect.width, rect.height,
-                                        texture.format, texture.type, temp.image);
+                        m_renderer.uploadTextureRegion(texture.handle, texture.format,
+                            rect.x, rect.y, rect.width, rect.height, temp.image);
                     }
                 }
             }
         }
     }
-
-    /* TODO:
-
-    - PBO to make texture updates non-blocking
-    - half/float image format support w/ HDR resolve
-    - sRGB and Linear resolve
-    - block compressed textures w/o decompression
-
-    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-    glCompressedTexImage2D(GL_TEXTURE_2D, 0, internalFormat, header.width, header.height, 0, GLsizei(block.size), block.address);
-
-    textureFormat.surfaceFormat = Format(128, Format::FLOAT32, Format::RGBA, 32, 32, 32, 32);
-    textureFormat.internalFormat = GL_RGBA32F;
-    textureFormat.format = GL_RGBA;
-    textureFormat.type = GL_FLOAT;
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_GREEN);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_BLUE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ALPHA);
-
-    textureFormat.surfaceFormat = FORMAT_L8;
-    textureFormat.internalFormat = GL_RED;
-    textureFormat.format = GL_RED;
-    textureFormat.type = GL_UNSIGNED_BYTE;
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_RED);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ONE);
-
-    textureFormat.surfaceFormat = FORMAT_L8A8;
-    textureFormat.internalFormat = GL_RG;
-    textureFormat.format = GL_RG;
-    textureFormat.type = GL_UNSIGNED_BYTE;
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_G, GL_RED);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_B, GL_RED);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_GREEN);
-
-    case Format::FLOAT16:
-        if (context.core.texture_float || context.core.half_float)
-
-    case Format::FLOAT32:
-        if (context.core.texture_float)
-
-    GLenum getCompressedFormat(OpenGLContext& context, const ImageHeader& header)
-    {
-        GLenum format = 0;
-
-		if (context.isCompressedTextureSupported(header.compression))
-		{
-			format = opengl::getTextureFormat(header.compression);
-		}
-
-        return format;
-    }
-    */
 
 } // namespace ifap

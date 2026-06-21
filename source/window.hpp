@@ -6,7 +6,9 @@
 
 #include "context.hpp"
 #include "texture.hpp"
-#include "shaders.hpp"
+#include "render/gl/gl_renderer.hpp"
+
+#include <mango/opengl/opengl.hpp>
 
 namespace ifap
 {
@@ -58,7 +60,10 @@ namespace ifap
     class AppWindow : public OpenGLContext
     {
     protected:
-        Shaders m_shaders;
+        GLRenderer m_renderer;
+        TextureCache m_texture_cache;
+
+        TextureFilter m_texture_filter = TextureFilter::BILINEAR;
         bool m_hdr = false;
 
         MouseCapture m_mouse_translate;
@@ -70,8 +75,7 @@ namespace ifap
         u64 m_left_time = 0;
         u64 m_right_time = 0;
 
-        TextureCache m_texture_cache;
-        Texture m_current_texture;
+        GpuTexture m_current_texture;
         size_t m_current_index = 0;
 
         void setIcon();
@@ -97,4 +101,3 @@ namespace ifap
     };
 
 } // namespace ifap
-

@@ -11,6 +11,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 FILE(GLOB sources
     "source/*.cpp"
     "source/*.hpp"
+    "source/render/*.cpp"
+    "source/render/*.hpp"
+    "source/render/*/*.cpp"
+    "source/render/*/*.hpp"
     "source/resource/ifap.rc"
 )
 
@@ -56,6 +60,7 @@ endif ()
 
 find_package(mango REQUIRED)
 target_link_libraries(ifap PUBLIC mango::mango)
+target_include_directories(ifap PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/source)
 
 if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
