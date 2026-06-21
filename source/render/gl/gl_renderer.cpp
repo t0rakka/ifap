@@ -54,6 +54,11 @@ namespace ifap
         return m_max_texture_dimension;
     }
 
+    float32x2 GLRenderer::imageTexScale(int width, int height) const
+    {
+        return shaders::imageTexScale(width, height, true);
+    }
+
     void GLRenderer::resize(int width, int height)
     {
         glViewport(0, 0, width, height);
@@ -172,7 +177,7 @@ namespace ifap
         glBindTexture(GL_TEXTURE_2D, texture);
         glBindVertexArray(m_vao);
 
-        const float32x2 tex_scale = shaders::imageTexScale(request.width, request.height, true);
+        const float32x2 tex_scale = imageTexScale(request.width, request.height);
         const float32x2& translate = request.translate;
         const float32x2& scale = request.scale;
 
@@ -183,7 +188,7 @@ namespace ifap
                 glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
                 glUseProgram(m_program_bilinear.program);
-                m_program_bilinear.uniform_transform.set(translate.x, -translate.y, scale.x, scale.y);
+                m_program_bilinear.uniform_transform.set(translate.x, translate.y, scale.x, scale.y);
                 m_program_bilinear.uniform_texture.set(0);
                 m_program_bilinear.uniform_texture_scale.set(tex_scale.x, tex_scale.y);
                 m_program_bilinear.uniform_scale.set(request.intensity);
@@ -197,7 +202,7 @@ namespace ifap
                 glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
                 glUseProgram(m_program_bilinear.program);
-                m_program_bilinear.uniform_transform.set(translate.x, -translate.y, scale.x, scale.y);
+                m_program_bilinear.uniform_transform.set(translate.x, translate.y, scale.x, scale.y);
                 m_program_bilinear.uniform_texture.set(0);
                 m_program_bilinear.uniform_texture_scale.set(tex_scale.x, tex_scale.y);
                 m_program_bilinear.uniform_scale.set(request.intensity);
@@ -211,7 +216,7 @@ namespace ifap
                 glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
                 glUseProgram(m_program_bicubic.program);
-                m_program_bicubic.uniform_transform.set(translate.x, -translate.y, scale.x, scale.y);
+                m_program_bicubic.uniform_transform.set(translate.x, translate.y, scale.x, scale.y);
                 m_program_bicubic.uniform_texture.set(0);
                 m_program_bicubic.uniform_texture_scale.set(tex_scale.x, tex_scale.y);
                 m_program_bicubic.uniform_scale.set(request.intensity);

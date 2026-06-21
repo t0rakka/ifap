@@ -103,6 +103,7 @@ namespace ifap
         int32x2 window_size = m_window.getWindowSize();
         window_size.x = std::max(1, window_size.x);
         window_size.y = std::max(1, window_size.y);
+
         float dx = m_mouse_translate.delta.x / float(window_size.x) * 2.0f;
         float dy = m_mouse_translate.delta.y / float(window_size.y) * 2.0f;
         return float32x2(dx, dy);
@@ -112,6 +113,7 @@ namespace ifap
     {
         int32x2 window_size = m_window.getWindowSize();
         window_size.y = std::max(1, window_size.y);
+
         float s = m_scale - m_scale * (m_mouse_scale.delta.y / float(window_size.y) * 4.0f);
         s = std::max(0.3f, s);
         return s;

@@ -82,7 +82,7 @@ namespace ifap::shaders
                 {
                     texcoord.y = 1.0 - texcoord.y;
                 }
-                gl_Position = vec4((inPosition + uTransform.xy) * uTransform.zw, 0.0, 1.0);
+                gl_Position = vec4((inPosition + vec2(uTransform.x, -uTransform.y)) * uTransform.zw, 0.0, 1.0);
             }
         )";
 

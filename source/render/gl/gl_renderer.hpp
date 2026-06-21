@@ -119,6 +119,7 @@ namespace ifap
         void drawImage(const ImageDrawRequest& request) override;
 
         int getMaxTextureDimension() const override;
+        float32x2 imageTexScale(int width, int height) const override;
 
         TextureHandle createTexture(int width, int height, PixelFormat format, const void* initial_data) override;
         void uploadTextureRegion(TextureHandle handle, PixelFormat format,

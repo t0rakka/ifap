@@ -72,6 +72,8 @@ namespace ifap
 
         virtual int getMaxTextureDimension() const = 0;
 
+        virtual float32x2 imageTexScale(int width, int height) const = 0;
+
         virtual TextureHandle createTexture(int width, int height, PixelFormat format, const void* initial_data) = 0;
         virtual void uploadTextureRegion(TextureHandle handle, PixelFormat format,
                                          int x, int y, int width, int height, const void* pixels) = 0;
