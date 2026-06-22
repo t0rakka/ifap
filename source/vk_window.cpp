@@ -64,7 +64,7 @@ namespace ifap
             .applicationVersion = 1,
             .pEngineName = "mango",
             .engineVersion = 1,
-            .apiVersion = VK_MAKE_VERSION(1, 2, 0),
+            .apiVersion = VK_MAKE_VERSION(1, 3, 0),
         };
 
         return Instance(applicationInfo, enabledLayers, enabledExtensions);

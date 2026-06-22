@@ -64,7 +64,7 @@ namespace ifap
             return state;
         }
 
-        VkPipeline createGraphicsPipeline(VkDevice device, VkRenderPass renderPass, VkPipelineLayout layout,
+        VkPipeline createGraphicsPipeline(VkDevice device, VkFormat colorFormat, VkPipelineLayout layout,
                                           VkShaderModule vertexShader, VkShaderModule fragmentShader,
                                           VkExtent2D extent, bool blend)
         {
@@ -160,9 +160,17 @@ namespace ifap
                 .pAttachments = &blendAttachment,
             };
 
+            VkPipelineRenderingCreateInfo renderingCreateInfo =
+            {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+                .colorAttachmentCount = 1,
+                .pColorAttachmentFormats = &colorFormat,
+            };
+
             VkGraphicsPipelineCreateInfo pipelineInfo =
             {
                 .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                .pNext = &renderingCreateInfo,
                 .stageCount = 2,
                 .pStages = stages,
                 .pVertexInputState = &vertexInput,
@@ -172,8 +180,6 @@ namespace ifap
                 .pMultisampleState = &multisampling,
                 .pColorBlendState = &colorBlending,
                 .layout = layout,
-                .renderPass = renderPass,
-                .subpass = 0,
             };
 
             VkPipeline pipeline = VK_NULL_HANDLE;
@@ -194,8 +200,6 @@ namespace ifap
         VkCommandPool m_graphicsCommandPool = VK_NULL_HANDLE;
         VkCommandPool m_transferCommandPool = VK_NULL_HANDLE;
         std::unique_ptr<Swapchain> m_swapchain;
-        VkRenderPass m_renderPass = VK_NULL_HANDLE;
-        std::vector<VkFramebuffer> m_framebuffers;
         std::vector<VkCommandBuffer> m_commandBuffers;
         VkShaderModule m_vertexShader = VK_NULL_HANDLE;
         VkShaderModule m_fragmentShaderBilinear = VK_NULL_HANDLE;
@@ -232,16 +236,14 @@ namespace ifap
         std::vector<std::unique_ptr<GpuTexture>> m_textures;
         Swapchain::Frame m_frame;
         bool m_frame_active = false;
-        bool m_render_pass_active = false;
+        bool m_command_buffer_recording = false;
+        bool m_rendering_active = false;
         bool m_blend_enabled = true;
         bool m_swapchain_srgb_format = false;
         int m_max_texture_dimension = 0;
         float m_clear_color[4] = { 0.06f, 0.06f, 0.06f, 1.0f };
 
         void createDevice(VkInstance instance);
-        void createRenderPass();
-        void createFramebuffers();
-        void destroyFramebuffers();
         void createPipelines();
         void destroyPipelines();
         void createShaders();
@@ -275,7 +277,8 @@ namespace ifap
         void beginUploads();
         void resize(int width, int height);
         void beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend);
-        void startRenderPass();
+        void beginSwapchainRendering();
+        void endSwapchainRendering();
         void drawImage(const ImageDrawRequest& request);
         void endFrame();
         TextureHandle createTexture(int width, int height, PixelFormat format, const void* initial_data);
@@ -350,13 +353,11 @@ namespace ifap
         poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
         vkCreateCommandPool(m_device, &poolInfo, nullptr, &m_transferCommandPool);
 
-        createRenderPass();
         createShaders();
         createSamplers();
         createDescriptorResources();
         createGeometry();
         createPipelines();
-        createFramebuffers();
         createCommandBuffers();
     }
 
@@ -378,7 +379,6 @@ namespace ifap
             m_swapchain.reset();
 
             destroyPipelines();
-            destroyFramebuffers();
 
             if (m_descriptorPool)
             {
@@ -430,11 +430,6 @@ namespace ifap
                 vkDestroySampler(m_device, m_samplerLinear, nullptr);
             }
 
-            if (m_renderPass)
-            {
-                vkDestroyRenderPass(m_device, m_renderPass, nullptr);
-            }
-
             vkDestroyCommandPool(m_device, m_transferCommandPool, nullptr);
             vkDestroyCommandPool(m_device, m_graphicsCommandPool, nullptr);
             vkDestroyDevice(m_device, nullptr);
@@ -481,9 +476,16 @@ namespace ifap
 
         std::vector<const char*> deviceExtensions = requiredDeviceExtensions();
 
+        VkPhysicalDeviceVulkan13Features features13 =
+        {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+            .dynamicRendering = VK_TRUE,
+        };
+
         VkDeviceCreateInfo deviceCreateInfo =
         {
             .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+            .pNext = &features13,
             .queueCreateInfoCount = 1,
             .pQueueCreateInfos = &queueCreateInfo,
             .enabledExtensionCount = u32(deviceExtensions.size()),
@@ -978,89 +980,32 @@ namespace ifap
         m_textures[handle - 1].reset();
     }
 
-    void VKRenderer::Impl::createRenderPass()
+    void VKRenderer::Impl::createPipelines()
     {
-        VkAttachmentDescription colorAttachment =
-        {
-            .format = m_swapchain->getFormat(),
-            .samples = VK_SAMPLE_COUNT_1_BIT,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-            .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-        };
+        destroyPipelines();
 
-        VkAttachmentReference colorRef =
-        {
-            .attachment = 0,
-            .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        };
-
-        VkSubpassDescription subpass =
-        {
-            .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
-            .colorAttachmentCount = 1,
-            .pColorAttachments = &colorRef,
-        };
-
-        VkSubpassDependency dependency =
-        {
-            .srcSubpass = VK_SUBPASS_EXTERNAL,
-            .dstSubpass = 0,
-            .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-            .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-            .srcAccessMask = 0,
-            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-        };
-
-        VkRenderPassCreateInfo renderPassInfo =
-        {
-            .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-            .attachmentCount = 1,
-            .pAttachments = &colorAttachment,
-            .subpassCount = 1,
-            .pSubpasses = &subpass,
-            .dependencyCount = 1,
-            .pDependencies = &dependency,
-        };
-
-        vkCreateRenderPass(m_device, &renderPassInfo, nullptr, &m_renderPass);
-    }
-
-    void VKRenderer::Impl::createFramebuffers()
-    {
-        const u32 imageCount = m_swapchain->getImageCount();
         const VkExtent2D extent = m_swapchain->getExtent();
+        const VkFormat colorFormat = m_swapchain->getFormat();
 
-        m_framebuffers.resize(imageCount);
+        m_pipelineBilinearBlend = createGraphicsPipeline(m_device, colorFormat, m_pipelineLayout,
+            m_vertexShader, m_fragmentShaderBilinear, extent, true);
 
-        for (u32 i = 0; i < imageCount; ++i)
-        {
-            VkImageView attachments[] = { m_swapchain->getImageView(i) };
+        m_pipelineBilinearNoBlend = createGraphicsPipeline(m_device, colorFormat, m_pipelineLayout,
+            m_vertexShader, m_fragmentShaderBilinear, extent, false);
 
-            VkFramebufferCreateInfo framebufferInfo =
-            {
-                .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-                .renderPass = m_renderPass,
-                .attachmentCount = 1,
-                .pAttachments = attachments,
-                .width = extent.width,
-                .height = extent.height,
-                .layers = 1,
-            };
+        m_pipelineBicubicBlend = createGraphicsPipeline(m_device, colorFormat, m_pipelineLayout,
+            m_vertexShader, m_fragmentShaderBicubic, extent, true);
 
-            vkCreateFramebuffer(m_device, &framebufferInfo, nullptr, &m_framebuffers[i]);
-        }
+        m_pipelineBicubicNoBlend = createGraphicsPipeline(m_device, colorFormat, m_pipelineLayout,
+            m_vertexShader, m_fragmentShaderBicubic, extent, false);
     }
 
-    void VKRenderer::Impl::destroyFramebuffers()
+    void VKRenderer::Impl::rebuildSwapchainResources()
     {
-        for (VkFramebuffer framebuffer : m_framebuffers)
-        {
-            vkDestroyFramebuffer(m_device, framebuffer, nullptr);
-        }
+        vkDeviceWaitIdle(m_device);
 
-        m_framebuffers.clear();
+        destroyPipelines();
+        createPipelines();
     }
 
     void VKRenderer::Impl::createCommandBuffers()
@@ -1213,36 +1158,6 @@ namespace ifap
         destroy(m_pipelineBicubicNoBlend);
     }
 
-    void VKRenderer::Impl::createPipelines()
-    {
-        destroyPipelines();
-
-        const VkExtent2D extent = m_swapchain->getExtent();
-
-        m_pipelineBilinearBlend = createGraphicsPipeline(m_device, m_renderPass, m_pipelineLayout,
-            m_vertexShader, m_fragmentShaderBilinear, extent, true);
-
-        m_pipelineBilinearNoBlend = createGraphicsPipeline(m_device, m_renderPass, m_pipelineLayout,
-            m_vertexShader, m_fragmentShaderBilinear, extent, false);
-
-        m_pipelineBicubicBlend = createGraphicsPipeline(m_device, m_renderPass, m_pipelineLayout,
-            m_vertexShader, m_fragmentShaderBicubic, extent, true);
-
-        m_pipelineBicubicNoBlend = createGraphicsPipeline(m_device, m_renderPass, m_pipelineLayout,
-            m_vertexShader, m_fragmentShaderBicubic, extent, false);
-    }
-
-    void VKRenderer::Impl::rebuildSwapchainResources()
-    {
-        vkDeviceWaitIdle(m_device);
-
-        destroyPipelines();
-        destroyFramebuffers();
-
-        createPipelines();
-        createFramebuffers();
-    }
-
     void VKRenderer::Impl::updateSwapchain()
     {
         if (!m_swapchain->recreateSwapchain())
@@ -1287,15 +1202,16 @@ namespace ifap
         m_clear_color[2] = clear_b;
         m_clear_color[3] = clear_a;
         m_blend_enabled = blend;
-        m_render_pass_active = false;
+        m_command_buffer_recording = false;
+        m_rendering_active = false;
 
         m_frame = m_swapchain->beginFrame();
         m_frame_active = bool(m_frame);
     }
 
-    void VKRenderer::Impl::startRenderPass()
+    void VKRenderer::Impl::beginSwapchainRendering()
     {
-        if (!m_frame_active || m_render_pass_active)
+        if (!m_frame_active || m_rendering_active)
         {
             return;
         }
@@ -1303,36 +1219,57 @@ namespace ifap
         const u32 imageIndex = m_frame.imageIndex();
         VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
 
-        vkResetCommandBuffer(commandBuffer, 0);
-
-        VkCommandBufferBeginInfo beginInfo =
+        if (!m_command_buffer_recording)
         {
-            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-        };
+            vkResetCommandBuffer(commandBuffer, 0);
 
-        vkBeginCommandBuffer(commandBuffer, &beginInfo);
-
-        VkClearValue clearValue =
-        {
-            .color = { { m_clear_color[0], m_clear_color[1], m_clear_color[2], m_clear_color[3] } },
-        };
-
-        VkRenderPassBeginInfo renderPassInfo =
-        {
-            .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-            .renderPass = m_renderPass,
-            .framebuffer = m_framebuffers[imageIndex],
-            .renderArea =
+            VkCommandBufferBeginInfo beginInfo =
             {
-                .extent = m_swapchain->getExtent(),
-            },
-            .clearValueCount = 1,
-            .pClearValues = &clearValue,
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            };
+
+            vkBeginCommandBuffer(commandBuffer, &beginInfo);
+            m_command_buffer_recording = true;
+
+            m_swapchain->cmdTransitionImageToColorAttachment(commandBuffer, imageIndex);
+        }
+
+        VkRenderingAttachmentInfo colorAttachment =
+        {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = m_frame.imageView(),
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = { .color = { { m_clear_color[0], m_clear_color[1], m_clear_color[2], m_clear_color[3] } } },
         };
 
-        vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
-        m_render_pass_active = true;
+        VkRenderingInfo renderingInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea = { .extent = m_swapchain->getExtent() },
+            .layerCount = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &colorAttachment,
+        };
+
+        vkCmdBeginRendering(commandBuffer, &renderingInfo);
+        m_rendering_active = true;
+    }
+
+    void VKRenderer::Impl::endSwapchainRendering()
+    {
+        if (!m_frame_active || !m_rendering_active)
+        {
+            return;
+        }
+
+        const u32 imageIndex = m_frame.imageIndex();
+        VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
+
+        vkCmdEndRendering(commandBuffer);
+        m_rendering_active = false;
     }
 
     void VKRenderer::Impl::recordDraw(const ImageDrawRequest& request)
@@ -1366,9 +1303,9 @@ namespace ifap
 
         vkUpdateDescriptorSets(m_device, 1, &descriptorWrite, 0, nullptr);
 
-        startRenderPass();
+        beginSwapchainRendering();
 
-        if (!m_render_pass_active)
+        if (!m_rendering_active)
         {
             return;
         }
@@ -1408,12 +1345,12 @@ namespace ifap
             return;
         }
 
-        if (!m_render_pass_active)
+        if (!m_rendering_active)
         {
-            startRenderPass();
+            beginSwapchainRendering();
         }
 
-        if (!m_render_pass_active)
+        if (!m_rendering_active)
         {
             return;
         }
@@ -1421,13 +1358,11 @@ namespace ifap
         const u32 imageIndex = m_frame.imageIndex();
         VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
 
-        if (m_render_pass_active)
-        {
-            vkCmdEndRenderPass(commandBuffer);
-            m_render_pass_active = false;
-        }
+        endSwapchainRendering();
+        m_swapchain->cmdTransitionImageToPresent(commandBuffer, imageIndex);
 
         vkEndCommandBuffer(commandBuffer);
+        m_command_buffer_recording = false;
 
         m_frame.submitAndPresent(m_graphicsQueue, commandBuffer);
         m_frame_active = false;
