@@ -31,6 +31,7 @@ namespace ifap
         void initialize() override;
         void resize(int width, int height) override;
 
+        void beginUploads() override;
         void beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend) override;
         void drawImage(const ImageDrawRequest& request) override;
         void endFrame() override;

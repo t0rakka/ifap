@@ -47,9 +47,7 @@ namespace ifap
         InstanceExtensionProperties instanceExtensionProperties;
 
         std::vector<const char*> enabledLayers;
-#if defined(DEBUG) || !defined(NDEBUG)
-        enabledLayers.push_back("VK_LAYER_KHRONOS_validation");
-#endif
+        //enabledLayers.push_back("VK_LAYER_KHRONOS_validation");
 
         std::vector<const char*> enabledExtensions = requiredSurfaceExtensions();
 

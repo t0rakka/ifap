@@ -66,6 +66,7 @@ namespace ifap
         virtual void initialize() = 0;
         virtual void resize(int width, int height) = 0;
 
+        virtual void beginUploads() {}
         virtual void beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend) = 0;
         virtual void drawImage(const ImageDrawRequest& request) = 0;
         virtual void endFrame() = 0;

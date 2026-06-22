@@ -242,7 +242,10 @@ namespace ifap
         }
         else
         {
-            // cache miss
+            // Cache miss may create GPU resources and evict cached textures while
+            // the previous frame is still in flight — sync first.
+            m_renderer.beginUploads();
+
             std::shared_ptr<DecodeTask> task = std::make_shared<DecodeTask>(m_renderer);
 
             std::string filename = m_indexer[index];
@@ -343,13 +346,7 @@ namespace ifap
                 texture.sample_width = header.width;
                 texture.sample_height = header.height;
 
-                const void* initial_data = nullptr;
-                if (task->bitmap->image)
-                {
-                    initial_data = task->bitmap->image;
-                }
-
-                texture.handle = m_renderer.createTexture(header.width, header.height, pixel_format, initial_data);
+                texture.handle = m_renderer.createTexture(header.width, header.height, pixel_format, nullptr);
             }
 
             // don't capture the shared_ptr because the callback lambda will hold a reference

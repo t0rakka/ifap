@@ -159,10 +159,10 @@ namespace ifap::shaders
 
             layout(push_constant) uniform Push
             {
-                vec4 uTransform;
-                float uScale;
-                vec2 uTexScale;
-                float uOutputSrgbEncode;
+                layout(offset = 0) vec4 uTransform;
+                layout(offset = 16) float uScale;
+                layout(offset = 24) vec2 uTexScale;
+                layout(offset = 32) float uOutputSrgbEncode;
             } pc;
 
             #define uTransform pc.uTransform
@@ -179,10 +179,10 @@ namespace ifap::shaders
 
             layout(push_constant) uniform Push
             {
-                vec4 uTransform;
-                float uScale;
-                vec2 uTexScale;
-                float uOutputSrgbEncode;
+                layout(offset = 0) vec4 uTransform;
+                layout(offset = 16) float uScale;
+                layout(offset = 24) vec2 uTexScale;
+                layout(offset = 32) float uOutputSrgbEncode;
             } pc;
 
             #define uScale pc.uScale
@@ -199,10 +199,10 @@ namespace ifap::shaders
 
             layout(push_constant) uniform Push
             {
-                vec4 uTransform;
-                float uScale;
-                vec2 uTexScale;
-                float uOutputSrgbEncode;
+                layout(offset = 0) vec4 uTransform;
+                layout(offset = 16) float uScale;
+                layout(offset = 24) vec2 uTexScale;
+                layout(offset = 32) float uOutputSrgbEncode;
             } pc;
 
             #define uScale pc.uScale

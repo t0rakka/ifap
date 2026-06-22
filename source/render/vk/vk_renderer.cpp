@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstddef>
 
 #include <mango/vulkan/vulkan.hpp>
 #include <mango/vulkan/compiler.hpp>
@@ -26,6 +27,11 @@ namespace ifap
             float texScale[2];
             float outputSrgbEncode;
         };
+
+        static_assert(offsetof(PushConstants, scale) == 16);
+        static_assert(offsetof(PushConstants, texScale) == 24);
+        static_assert(offsetof(PushConstants, outputSrgbEncode) == 32);
+        static_assert(sizeof(PushConstants) == 36);
 
         static bool isSrgbSurfaceFormat(VkFormat format)
         {
@@ -215,6 +221,7 @@ namespace ifap
             VkImageView view = VK_NULL_HANDLE;
             VkDescriptorSet descriptor = VK_NULL_HANDLE;
             VkFence upload_fence = VK_NULL_HANDLE;
+            VkCommandBuffer upload_command_buffer = VK_NULL_HANDLE;
             VkBuffer staging_buffer = VK_NULL_HANDLE;
             VkDeviceMemory staging_memory = VK_NULL_HANDLE;
             PixelFormat format = PixelFormat::RGBA8_UNORM;
@@ -227,6 +234,7 @@ namespace ifap
         std::vector<std::unique_ptr<GpuTexture>> m_textures;
         Swapchain::Frame m_frame;
         bool m_frame_active = false;
+        bool m_render_pass_active = false;
         bool m_blend_enabled = true;
         bool m_swapchain_srgb_format = false;
         int m_max_texture_dimension = 0;
@@ -255,6 +263,7 @@ namespace ifap
         void createImage(int width, int height, VkFormat format, VkImage& image, VkDeviceMemory& memory) const;
         void createImageView(VkImage image, VkFormat format, VkImageView& view) const;
         void releaseStaging(GpuTexture& texture);
+        void releaseUploadCommandBuffer(GpuTexture& texture);
         void waitForUpload(GpuTexture& texture);
         void submitUpload(GpuTexture& texture, int x, int y, int width, int height, const void* pixels);
         VkSampler selectSampler(TextureFilter filter) const;
@@ -265,8 +274,10 @@ namespace ifap
         ~Impl();
 
         void initialize();
+        void beginUploads();
         void resize(int width, int height);
         void beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend);
+        void startRenderPass();
         void drawImage(const ImageDrawRequest& request);
         void endFrame();
         TextureHandle createTexture(int width, int height, PixelFormat format, const void* initial_data);
@@ -497,6 +508,14 @@ namespace ifap
     {
     }
 
+    void VKRenderer::Impl::beginUploads()
+    {
+        if (m_device != VK_NULL_HANDLE && m_graphicsQueue != VK_NULL_HANDLE)
+        {
+            vkQueueWaitIdle(m_graphicsQueue);
+        }
+    }
+
     int VKRenderer::Impl::getMaxTextureDimension() const
     {
         return m_max_texture_dimension;
@@ -678,6 +697,15 @@ namespace ifap
         }
     }
 
+    void VKRenderer::Impl::releaseUploadCommandBuffer(GpuTexture& texture)
+    {
+        if (texture.upload_command_buffer != VK_NULL_HANDLE)
+        {
+            vkFreeCommandBuffers(m_device, m_transferCommandPool, 1, &texture.upload_command_buffer);
+            texture.upload_command_buffer = VK_NULL_HANDLE;
+        }
+    }
+
     void VKRenderer::Impl::waitForUpload(GpuTexture& texture)
     {
         if (!texture.upload_pending)
@@ -690,7 +718,12 @@ namespace ifap
 
         if (result == VK_SUCCESS)
         {
+            releaseUploadCommandBuffer(texture);
             releaseStaging(texture);
+        }
+        else if (result != VK_ERROR_DEVICE_LOST)
+        {
+            printLine(Print::Error, "VKRenderer: upload fence wait failed: {}", getString(result));
         }
     }
 
@@ -702,6 +735,20 @@ namespace ifap
         }
 
         waitForUpload(texture);
+
+        if (texture.layout_ready)
+        {
+            vkQueueWaitIdle(m_graphicsQueue);
+        }
+
+        if (x < 0 || y < 0 ||
+            x + width > texture.width ||
+            y + height > texture.height)
+        {
+            printLine(Print::Error, "VKRenderer: upload rect out of bounds ({}x{} at {},{} in {}x{})",
+                width, height, x, y, texture.width, texture.height);
+            return;
+        }
 
         const size_t rowBytes = size_t(width) * bytesPerPixel(texture.format);
         const VkDeviceSize imageSize = rowBytes * size_t(height);
@@ -839,10 +886,9 @@ namespace ifap
         vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, texture.upload_fence);
         texture.upload_pending = true;
         texture.layout_ready = true;
+        texture.upload_command_buffer = commandBuffer;
         texture.staging_buffer = stagingBuffer;
         texture.staging_memory = stagingMemory;
-
-        vkFreeCommandBuffers(m_device, m_transferCommandPool, 1, &commandBuffer);
     }
 
     TextureHandle VKRenderer::Impl::createTexture(int width, int height, PixelFormat format, const void* initial_data)
@@ -909,6 +955,8 @@ namespace ifap
         }
 
         waitForUpload(*texture);
+
+        vkQueueWaitIdle(m_graphicsQueue);
 
         if (texture->descriptor)
         {
@@ -1247,11 +1295,15 @@ namespace ifap
         m_clear_color[2] = clear_b;
         m_clear_color[3] = clear_a;
         m_blend_enabled = blend;
+        m_render_pass_active = false;
 
         m_frame = m_swapchain->beginFrame();
         m_frame_active = bool(m_frame);
+    }
 
-        if (!m_frame_active)
+    void VKRenderer::Impl::startRenderPass()
+    {
+        if (!m_frame_active || m_render_pass_active)
         {
             return;
         }
@@ -1271,7 +1323,7 @@ namespace ifap
 
         VkClearValue clearValue =
         {
-            .color = { { clear_r, clear_g, clear_b, clear_a } },
+            .color = { { m_clear_color[0], m_clear_color[1], m_clear_color[2], m_clear_color[3] } },
         };
 
         VkRenderPassBeginInfo renderPassInfo =
@@ -1288,12 +1340,13 @@ namespace ifap
         };
 
         vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+        m_render_pass_active = true;
     }
 
     void VKRenderer::Impl::recordDraw(const ImageDrawRequest& request)
     {
         GpuTexture* texture = getTexture(request.texture);
-        if (!texture || !m_frame_active)
+        if (!texture || !texture->layout_ready || !m_frame_active)
         {
             return;
         }
@@ -1320,6 +1373,13 @@ namespace ifap
         };
 
         vkUpdateDescriptorSets(m_device, 1, &descriptorWrite, 0, nullptr);
+
+        startRenderPass();
+
+        if (!m_render_pass_active)
+        {
+            return;
+        }
 
         PushConstants push {};
         push.transform[0] = request.translate.x;
@@ -1357,10 +1417,25 @@ namespace ifap
             return;
         }
 
+        if (!m_render_pass_active)
+        {
+            startRenderPass();
+        }
+
+        if (!m_render_pass_active)
+        {
+            return;
+        }
+
         const u32 imageIndex = m_frame.imageIndex();
         VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
 
-        vkCmdEndRenderPass(commandBuffer);
+        if (m_render_pass_active)
+        {
+            vkCmdEndRenderPass(commandBuffer);
+            m_render_pass_active = false;
+        }
+
         vkEndCommandBuffer(commandBuffer);
 
         m_frame.submitAndPresent(m_graphicsQueue, commandBuffer);
@@ -1376,6 +1451,7 @@ namespace ifap
 
     void VKRenderer::initialize() { m_impl->initialize(); }
     void VKRenderer::resize(int width, int height) { m_impl->resize(width, height); }
+    void VKRenderer::beginUploads() { m_impl->beginUploads(); }
     void VKRenderer::beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend) { m_impl->beginFrame(clear_r, clear_g, clear_b, clear_a, blend); }
     void VKRenderer::drawImage(const ImageDrawRequest& request) { m_impl->drawImage(request); }
     void VKRenderer::endFrame() { m_impl->endFrame(); }

@@ -310,9 +310,13 @@ namespace ifap
             }
         }
 
-        // Upload decoded regions first so GPU transfers can overlap with acquire/present work.
+        // Wait until the GPU is done sampling before uploading new texels.
+        m_renderer.beginUploads();
         m_texture_cache.update();
-        m_texture_cache.syncTexture(m_current_index, m_current_texture);
+        if (!m_texture_cache.syncTexture(m_current_index, m_current_texture))
+        {
+            m_current_texture = {};
+        }
 
         const bool blend = !m_window.isKeyPressed(KEYCODE_B);
         m_renderer.beginFrame(0.06f, 0.06f, 0.06f, 1.0f, blend);
