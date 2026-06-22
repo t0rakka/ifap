@@ -25,13 +25,30 @@ namespace ifap
             float scale;
             float pad0;
             float texScale[2];
-            float outputSrgbEncode;
+            float outputTransform;
+            float sdrWhiteNits;
         };
 
         static_assert(offsetof(PushConstants, scale) == 16);
         static_assert(offsetof(PushConstants, texScale) == 24);
-        static_assert(offsetof(PushConstants, outputSrgbEncode) == 32);
-        static_assert(sizeof(PushConstants) == 36);
+        static_assert(offsetof(PushConstants, outputTransform) == 32);
+        static_assert(offsetof(PushConstants, sdrWhiteNits) == 36);
+        static_assert(sizeof(PushConstants) == 40);
+
+        enum class OutputTransform : int
+        {
+            Pass = 0,           // sRGB surface: texture decode is sufficient
+            SrgbEncode = 1,       // float/UNORM SDR: linear BT.709 -> sRGB gamma
+            SdrToHdrPQ = 2,       // HDR10 ST2084: BT.709 -> BT.2020 -> PQ
+            SdrToHdrHLG = 3,      // HDR10 HLG: BT.709 -> BT.2020 -> HLG OETF
+            SdrToAdobeRgb = 4,    // Adobe RGB nonlinear: BT.709 -> Adobe RGB -> gamma 2.2
+            SdrToBt709Nonlinear = 5, // BT.709 float: sRGB gamma encode (passthrough swapchain)
+            SdrToDciP3Nonlinear = 6, // DCI P3 float: desat + sRGB encode + gamma exposure
+            SdrToExtendedSrgbLinear = 7, // EXTENDED_SRGB_LINEAR + sRGB RT: pre-compensate encode
+            SdrToLinearSurface = 8,      // linear color space + UNORM/float: linear passthrough
+            SdrToDisplayP3Linear = 9,    // Display P3 linear float: mild desat + linear out
+            SdrToBt2020Linear = 10,      // BT.2020 linear float: desat + linear out
+        };
 
         static bool isSrgbSurfaceFormat(VkFormat format)
         {
@@ -44,6 +61,353 @@ namespace ifap
                 default:
                     return false;
             }
+        }
+
+        static bool isLinearSdrColorSpace(VkColorSpaceKHR colorSpace)
+        {
+            switch (colorSpace)
+            {
+                case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
+                case VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT:
+                case VK_COLOR_SPACE_BT2020_LINEAR_EXT:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        static bool isHdrColorSpace(VkColorSpaceKHR colorSpace)
+        {
+            switch (colorSpace)
+            {
+                case VK_COLOR_SPACE_HDR10_ST2084_EXT:
+                case VK_COLOR_SPACE_HDR10_HLG_EXT:
+                case VK_COLOR_SPACE_BT2020_LINEAR_EXT:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        static bool surfaceFormatMatches(const VkSurfaceFormatKHR& a, const VkSurfaceFormatKHR& b)
+        {
+            return a.format == b.format && a.colorSpace == b.colorSpace;
+        }
+
+        static bool containsSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& formats, const VkSurfaceFormatKHR& candidate)
+        {
+            for (const VkSurfaceFormatKHR& format : formats)
+            {
+                if (surfaceFormatMatches(format, candidate))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        static OutputTransform selectOutputTransform(const VkSurfaceFormatKHR& surfaceFormat)
+        {
+            if (surfaceFormat.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT)
+            {
+                return OutputTransform::SdrToHdrPQ;
+            }
+
+            if (surfaceFormat.colorSpace == VK_COLOR_SPACE_HDR10_HLG_EXT)
+            {
+                return OutputTransform::SdrToHdrHLG;
+            }
+
+            if (surfaceFormat.colorSpace == VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT)
+            {
+                return OutputTransform::SdrToAdobeRgb;
+            }
+
+            if (surfaceFormat.colorSpace == VK_COLOR_SPACE_BT709_NONLINEAR_EXT)
+            {
+                return OutputTransform::SdrToBt709Nonlinear;
+            }
+
+            if (surfaceFormat.colorSpace == VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT)
+            {
+                return OutputTransform::SdrToDciP3Nonlinear;
+            }
+
+            if (isLinearSdrColorSpace(surfaceFormat.colorSpace))
+            {
+                if (surfaceFormat.colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
+                    && isSrgbSurfaceFormat(surfaceFormat.format))
+                {
+                    return OutputTransform::SdrToExtendedSrgbLinear;
+                }
+
+                if (surfaceFormat.colorSpace == VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT)
+                {
+                    return OutputTransform::SdrToDisplayP3Linear;
+                }
+
+                if (surfaceFormat.colorSpace == VK_COLOR_SPACE_BT2020_LINEAR_EXT)
+                {
+                    return OutputTransform::SdrToBt2020Linear;
+                }
+
+                return OutputTransform::SdrToLinearSurface;
+            }
+
+            if (!isSrgbSurfaceFormat(surfaceFormat.format))
+            {
+                return OutputTransform::SrgbEncode;
+            }
+
+            return OutputTransform::Pass;
+        }
+
+        // Per-color-space output calibration pushed as uSdrWhiteNits (meaning varies by path).
+        static float defaultSdrWhiteNits(VkColorSpaceKHR colorSpace)
+        {
+            switch (colorSpace)
+            {
+                case VK_COLOR_SPACE_HDR10_ST2084_EXT:
+                    // PQ: literal nits in absolute PQ space (shader: linear * nits / 10000).
+                    return 100.0f;
+                case VK_COLOR_SPACE_HDR10_HLG_EXT:
+                    // HLG: dimensionless scale before OETF (shader: linear * nits / 100).
+                    // ~8 maps SDR paper white (~100 nits) into ~8% of HLG headroom; macOS
+                    // presents HLG signal 1.0 near display peak (~1000 nits on typical panels).
+                    return 8.0f;
+                case VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT:
+                    return 112.0f;
+                case VK_COLOR_SPACE_BT709_NONLINEAR_EXT:
+                    return 80.0f;
+                case VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT:
+                    return 104.0f;
+                case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
+                case VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT:
+                    return 96.0f;
+                case VK_COLOR_SPACE_BT2020_LINEAR_EXT:
+                    return 86.0f;
+                default:
+                    return 100.0f;
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Output calibration reference (SDR JPEG baseline: match macOS Preview)
+        // ------------------------------------------------------------------
+        //
+        // VK_COLOR_SPACE_BT2020_LINEAR_EXT  (R16G16B16A16_SFLOAT on macOS)
+        //   Linear BT.2020 — SdrToBt2020Linear
+        //   Pipeline    : bt709ToBt2020 -> exposure -> BT.2020-luma desat
+        //   Matrix      : required; BT.709 codes as BT.2020 primaries skew orange->red, green hot
+        //   Desat         : 0.86 toward BT.2020 luma (mild chroma trim after correct gamut map)
+        //   Knob          : uSdrWhiteNits / 100 (default 86)
+        //
+        // VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT  (R16G16B16A16_SFLOAT on macOS)
+        //   Linear Display P3 — SdrToDisplayP3Linear (desat + linear * exposure)
+        //   Desat         : 0.87 toward Rec.709 luma (P3 tag on BT.709 JPEG = too vibrant)
+        //   Wrong         : SdrToLinearSurface alone — hue/chroma hot, luminance OK
+        //   Note          : DISPLAY_P3_NONLINEAR float OK with plain SrgbEncode
+        //   Knob          : uSdrWhiteNits / 100 (default 96)
+        //
+        // VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
+        //   B8G8R8A8_SRGB : SdrToExtendedSrgbLinear — srgbToLinear pre-compensate (see above)
+        //   B8G8R8A8_UNORM / float : SdrToLinearSurface — linear passthrough * exposure
+        //   Wrong         : SrgbEncode on UNORM — gamma in linear-tagged buffer = too light
+        //   Knob          : uSdrWhiteNits / 100 (default 96)
+        //
+        //   B8G8R8A8_SRGB variant (B8G8R8A8_SRGB on macOS)
+        //   Format trap : B8G8R8A8_SRGB RT auto-applies linearToSrgb on write
+        //   Shader      : srgbToLinear(L) before RT -> stored ≈ L when read as linear
+        //   Wrong       : Pass (linear out) -> RT encodes -> compositor reads gamma as linear
+        //
+        // VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT  (R16G16B16A16_SFLOAT on macOS)
+        //   Primaries : DCI-P3 (more saturated than Display P3); panel is usually Display P3
+        //   Texture   : RGBA8_SRGB — sampler decodes to linear BT.709
+        //   Shader    : SdrToDciP3Nonlinear — toe -> desat -> linearToSrgb -> gamma exposure
+        //   Float16   : passthrough (DISPLAY_P3_NONLINEAR OK with plain SrgbEncode; DCI tag is
+        //               hotter primaries + darker gamma read — needs desat + brighter exposure)
+        //   Toe       : 0.015  Desat: 0.88 toward Rec.709 luma
+        //   Knob      : uSdrWhiteNits / 100 after encode (default 118)
+        //
+        // VK_COLOR_SPACE_BT709_NONLINEAR_EXT  (R16G16B16A16_SFLOAT on macOS)
+        //   Primaries : BT.709 (same as sRGB/JPEG)
+        //   Texture   : RGBA8_SRGB — sampler decodes to linear BT.709
+        //   Shader    : SdrToBt709Nonlinear — toe -> contrast -> linearToSrgb -> gamma exposure
+        //   Float16   : swapchain passthrough (same model as SRGB_NONLINEAR float = OK)
+        //   Toe       : 0.02 linear lift (shadow wall balance)
+        //   Contrast  : 1.04 linear stretch about 0.5 (after toe, before encode)
+        //   Wrong     : linear passthrough — too dark (no gamma in buffer)
+        //   Wrong     : BT.1886 encode — lifted shadows / flat contrast on passthrough
+        //   Wrong     : linear * nits before encode — shadows/highlights diverge
+        //   Knob      : uSdrWhiteNits / 100 applied AFTER sRGB encode (brightness only)
+        //
+        // VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT  (R16G16B16A16_SFLOAT on macOS)
+        //   Primaries : Adobe RGB 1998 tag (container); physical panel is usually Display P3
+        //   EOTF      : gamma 2.2 (pure power, IEC 61966-2.5 / Adobe RGB spec)
+        //   Texture   : RGBA8_SRGB — sampler decodes to linear BT.709
+        //   Shader    : SdrToAdobeRgb — BT.709 linear -> exposure -> mild desat -> gamma 2.2
+        //   No matrix : macOS ColorSync maps tagged surface to panel; a BT.709->Adobe
+        //               matrix here double-converts and pushes red toward yellow-orange
+        //   Desat     : 0.90 chroma mix toward Rec.709 luma (tames vibrancy w/o matrix)
+        //   Knob      : uSdrWhiteNits / 100  (default 112 — do not change without user OK)
+        //
+        //   Wrong path: SrgbEncode alone — BT.709 + sRGB gamma read as Adobe codes
+        //   Wrong path: bt709ToAdobeRgb matrix — red/yellow shift on P3 panels
+        //
+        // VK_COLOR_SPACE_HDR10_HLG_EXT
+        //   See defaultSdrWhiteNits comment above (default 8 — not literal nits).
+        //
+        // VK_COLOR_SPACE_HDR10_ST2084_EXT
+        //   SdrToHdrPQ, literal nits / 10000 (default 100).
+        //
+        // ------------------------------------------------------------------
+        // Development override for swapchain (format, colorSpace) testing.
+        //
+        // >>> ACTIVE TARGET: the single uncommented kDevSurfaceFormat line below.
+        //     Read it before tuning — defaults/calibration apply to THAT color space only.
+        //
+        // VkFormat        — how samples are stored (layout, UNORM/SFLOAT/SRGB, …)
+        // VkColorSpaceKHR — what those values mean at scanout (primaries + EOTF)
+        //
+        // SDR baseline goal: same sRGB JPEG should look identical across every
+        // supported color space once output calibration is tuned per space.
+        // Texture side: Mango decoder sets header.linear → RGBA8_SRGB vs UNORM.
+        // ------------------------------------------------------------------
+
+        constexpr bool kDevForceSurfaceFormat = false;
+
+        constexpr VkSurfaceFormatKHR kDevSurfaceFormat =
+        {
+            // OK
+            //VK_FORMAT_B8G8R8A8_UNORM,      VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+            //VK_FORMAT_B8G8R8A8_SRGB,       VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_DISPLAY_P3_NONLINEAR_EXT
+            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_PASS_THROUGH_EXT
+            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT
+            VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_HDR10_ST2084_EXT
+            //VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_COLOR_SPACE_HDR10_ST2084_EXT
+            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_HDR10_HLG_EXT
+            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT
+            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_BT709_NONLINEAR_EXT
+            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT
+            //VK_FORMAT_B8G8R8A8_SRGB,       VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
+            //VK_FORMAT_B8G8R8A8_UNORM,      VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
+            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT
+            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
+            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_BT2020_LINEAR_EXT
+        };
+
+        static VkSurfaceFormatKHR selectBestFormatForColorSpace(
+            const std::vector<VkSurfaceFormatKHR>& surfaceFormats,
+            VkColorSpaceKHR colorSpace)
+        {
+            static const VkFormat formatPreference[] =
+            {
+                VK_FORMAT_R16G16B16A16_SFLOAT,
+                VK_FORMAT_A2B10G10R10_UNORM_PACK32,
+                VK_FORMAT_A2R10G10B10_UNORM_PACK32,
+                VK_FORMAT_B8G8R8A8_SRGB,
+                VK_FORMAT_B8G8R8A8_UNORM,
+            };
+
+            for (VkFormat format : formatPreference)
+            {
+                const VkSurfaceFormatKHR candidate { format, colorSpace };
+
+                if (containsSurfaceFormat(surfaceFormats, candidate))
+                {
+                    return candidate;
+                }
+            }
+
+            return surfaceFormats.empty()
+                ? VkSurfaceFormatKHR { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR }
+                : surfaceFormats[0];
+        }
+
+        static VkSurfaceFormatKHR selectSurfaceFormat(VkPhysicalDevice physicalDevice, VkSurfaceKHR surface)
+        {
+            // HDR-first auto selection; per-color-space output calibration comes later.
+            static const VkSurfaceFormatKHR preferredFormats[] =
+            {
+                { VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_HDR10_ST2084_EXT },
+                { VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_COLOR_SPACE_HDR10_ST2084_EXT },
+                { VK_FORMAT_A2R10G10B10_UNORM_PACK32, VK_COLOR_SPACE_HDR10_ST2084_EXT },
+
+                { VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_HDR10_HLG_EXT },
+                { VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_COLOR_SPACE_HDR10_HLG_EXT },
+
+                { VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_BT2020_LINEAR_EXT },
+                { VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_COLOR_SPACE_BT2020_LINEAR_EXT },
+
+                { VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT },
+                { VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT },
+                { VK_FORMAT_B8G8R8A8_SRGB, VK_COLOR_SPACE_DISPLAY_P3_NONLINEAR_EXT },
+
+                { VK_FORMAT_B8G8R8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },
+                { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },
+            };
+
+            const std::vector<VkSurfaceFormatKHR> surfaceFormats = getSurfaceFormats(physicalDevice, surface);
+
+            VkSurfaceFormatKHR selectedFormat = preferredFormats[std::size(preferredFormats) - 1];
+            bool forced = false;
+
+            if (kDevForceSurfaceFormat)
+            {
+                if (containsSurfaceFormat(surfaceFormats, kDevSurfaceFormat))
+                {
+                    selectedFormat = kDevSurfaceFormat;
+                    forced = true;
+                }
+                else if (containsSurfaceFormat(surfaceFormats,
+                    selectBestFormatForColorSpace(surfaceFormats, kDevSurfaceFormat.colorSpace)))
+                {
+                    selectedFormat = selectBestFormatForColorSpace(surfaceFormats, kDevSurfaceFormat.colorSpace);
+                    forced = true;
+                    printLine(Print::Warning, "VKRenderer: exact dev format unavailable; using best format for {}",
+                        getString(kDevSurfaceFormat.colorSpace));
+                }
+                else
+                {
+                    printLine(Print::Warning, "VKRenderer: dev color space {} not supported; using auto selection",
+                        getString(kDevSurfaceFormat.colorSpace));
+                }
+            }
+
+            if (!forced && !surfaceFormats.empty())
+            {
+                selectedFormat = surfaceFormats[0];
+
+                for (const VkSurfaceFormatKHR& preferred : preferredFormats)
+                {
+                    if (containsSurfaceFormat(surfaceFormats, preferred))
+                    {
+                        selectedFormat = preferred;
+                        break;
+                    }
+                }
+            }
+
+            printLine(Print::Info, "VKRenderer: PhysicalDeviceSurfaceFormats:");
+
+            for (const VkSurfaceFormatKHR& format : surfaceFormats)
+            {
+                const bool is_selected = surfaceFormatMatches(format, selectedFormat);
+                printLine(Print::Info, "  {} {} | {}",
+                    is_selected ? ">" : " ",
+                    getString(format.format),
+                    getString(format.colorSpace));
+            }
+
+            if (forced)
+            {
+                printLine(Print::Info, "VKRenderer: using dev-forced surface format");
+            }
+
+            return selectedFormat;
         }
 
         VkPipelineColorBlendAttachmentState makeBlendAttachment(bool blend)
@@ -240,6 +604,8 @@ namespace ifap
         bool m_rendering_active = false;
         bool m_blend_enabled = true;
         bool m_swapchain_srgb_format = false;
+        OutputTransform m_output_transform = OutputTransform::Pass;
+        float m_sdr_white_nits = 100.0f;
         int m_max_texture_dimension = 0;
         float m_clear_color[4] = { 0.06f, 0.06f, 0.06f, 1.0f };
 
@@ -293,51 +659,19 @@ namespace ifap
     {
         createDevice(instance);
 
-        const VkSurfaceFormatKHR preferredFormats[] =
-        {
-            {
-                .format = VK_FORMAT_B8G8R8A8_SRGB,
-                .colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
-            },
-            {
-                .format = VK_FORMAT_B8G8R8A8_UNORM,
-                .colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
-            },
-        };
-
-        std::vector<VkSurfaceFormatKHR> surfaceFormats = getSurfaceFormats(m_physicalDevice, surface);
-
-        VkSurfaceFormatKHR selectedFormat = surfaceFormats.empty()
-            ? preferredFormats[1]
-            : surfaceFormats[0];
-
-        bool formatFound = false;
-
-        for (const VkSurfaceFormatKHR& preferred : preferredFormats)
-        {
-            for (const VkSurfaceFormatKHR& format : surfaceFormats)
-            {
-                if (format.format == preferred.format &&
-                    format.colorSpace == preferred.colorSpace)
-                {
-                    selectedFormat = format;
-                    formatFound = true;
-                    break;
-                }
-            }
-
-            if (formatFound)
-            {
-                break;
-            }
-        }
+        const VkSurfaceFormatKHR selectedFormat = selectSurfaceFormat(m_physicalDevice, surface);
 
         m_swapchain_srgb_format = isSrgbSurfaceFormat(selectedFormat.format);
+        m_output_transform = selectOutputTransform(selectedFormat);
+        m_sdr_white_nits = defaultSdrWhiteNits(selectedFormat.colorSpace);
 
-        printLine(Print::Info, "VKRenderer: swapchain {} | {} (sRGB encode on write: {})",
+        printLine(Print::Info, "VKRenderer: selected {} | {} (hardware sRGB: {}, output transform: {}, HDR: {}, SDR white: {} nits)",
             getString(selectedFormat.format),
             getString(selectedFormat.colorSpace),
-            m_swapchain_srgb_format ? "hardware" : "shader");
+            m_swapchain_srgb_format ? "yes" : "no",
+            int(m_output_transform),
+            isHdrColorSpace(selectedFormat.colorSpace) ? "yes" : "no",
+            int(m_sdr_white_nits));
 
         m_swapchain = std::make_unique<Swapchain>(m_device, m_physicalDevice, surface, selectedFormat, m_graphicsQueue, &window);
 
@@ -1318,7 +1652,8 @@ namespace ifap
         push.scale = request.intensity;
         push.texScale[0] = 1.0f / float(std::max(1, request.width));
         push.texScale[1] = 1.0f / float(std::max(1, request.height));
-        push.outputSrgbEncode = m_swapchain_srgb_format ? 0.0f : 1.0f;
+        push.outputTransform = float(m_output_transform);
+        push.sdrWhiteNits = m_sdr_white_nits;
 
         const u32 imageIndex = m_frame.imageIndex();
         VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
