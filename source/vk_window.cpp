@@ -28,6 +28,7 @@ namespace ifap
         {
             m_renderer.initialize();
             m_app.startup(commands);
+            setVisible(true);
         }
 
         ~VKAppWindow() override = default;
