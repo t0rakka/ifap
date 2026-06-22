@@ -24,7 +24,7 @@ namespace ifap
         VKAppWindow(Instance& instance, const CommandLine& commands)
             : VulkanWindow(instance, 1280, 800, 0)
             , m_renderer(*this, instance, m_surface)
-            , m_app(*this, m_renderer, [this] { toggleFullscreen(); })
+            , m_app(*this, m_renderer)
         {
             m_renderer.initialize();
             m_app.startup(commands);
@@ -70,11 +70,11 @@ namespace ifap
         return Instance(applicationInfo, enabledLayers, enabledExtensions);
     }
 
-    void runVulkanApp(const CommandLine& commands)
+    void runApp(const CommandLine& commands)
     {
         Instance instance = createVulkanInstance();
         VKAppWindow window(instance, commands);
-        window.setTitle("iFap Image Viewer (Vulkan)");
+        window.setTitle("iFap Image Viewer");
         window.enterEventLoop();
     }
 

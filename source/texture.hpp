@@ -6,7 +6,7 @@
 
 #include "context.hpp"
 #include "indexer.hpp"
-#include "render/render_backend.hpp"
+#include "render/vk/vk_renderer.hpp"
 
 namespace ifap
 {
@@ -16,7 +16,7 @@ namespace ifap
 
     struct DecodeTask
     {
-        RenderBackend& renderer;
+        VKRenderer& renderer;
 
         std::unique_ptr<File> file;
         std::unique_ptr<ImageDecoder> decoder;
@@ -34,7 +34,7 @@ namespace ifap
         std::vector<ImageDecodeRect> updates;
         float progress = 0.0f;
 
-        explicit DecodeTask(RenderBackend& renderer);
+        explicit DecodeTask(VKRenderer& renderer);
         ~DecodeTask();
 
         std::vector<ImageDecodeRect> getUpdates();
@@ -43,7 +43,7 @@ namespace ifap
     class TextureCache
     {
     protected:
-        RenderBackend& m_renderer;
+        VKRenderer& m_renderer;
 
         LRUCache<size_t, std::shared_ptr<DecodeTask>> m_cache { texture_cache_size };
         ImageFileIndexer m_indexer;
@@ -51,7 +51,7 @@ namespace ifap
         std::shared_ptr<Path> m_current_path;
 
     public:
-        explicit TextureCache(RenderBackend& renderer);
+        explicit TextureCache(VKRenderer& renderer);
         ~TextureCache();
 
         operator const ImageFileIndexer& () const;

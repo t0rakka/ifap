@@ -6,10 +6,9 @@
 
 #include "context.hpp"
 #include "texture.hpp"
-#include "render/render_backend.hpp"
+#include "render/vk/vk_renderer.hpp"
 #include "window.hpp"
 
-#include <functional>
 #include <mango/window/window.hpp>
 
 namespace ifap
@@ -57,8 +56,7 @@ namespace ifap
     {
     protected:
         Window& m_window;
-        RenderBackend& m_renderer;
-        std::function<void()> m_toggle_fullscreen;
+        VKRenderer& m_renderer;
 
         TextureCache m_texture_cache;
 
@@ -87,7 +85,7 @@ namespace ifap
         ImageDrawRequest makeDrawRequest() const;
 
     public:
-        AppView(Window& window, RenderBackend& renderer, std::function<void()> toggle_fullscreen);
+        AppView(Window& window, VKRenderer& renderer);
         ~AppView();
 
         void startup(const CommandLine& commands);

@@ -114,15 +114,13 @@ namespace ifap
                 .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
             };
 
-            // Negative height maps +Y clip space to the top of the framebuffer (OpenGL convention).
             VkViewport viewport =
             {
                 .width = float(extent.width),
-                .height = -float(extent.height),
+                .height = float(extent.height),
                 .minDepth = 0.0f,
                 .maxDepth = 1.0f,
             };
-            viewport.y = float(extent.height);
 
             VkRect2D scissor =
             {
@@ -285,7 +283,6 @@ namespace ifap
                                  int x, int y, int width, int height, const void* pixels);
         void destroyTexture(TextureHandle handle);
         int getMaxTextureDimension() const;
-        float32x2 imageTexScale(int width, int height) const;
     };
 
     VKRenderer::Impl::Impl(VulkanWindow& window, Instance& instance, VkSurfaceKHR surface)
@@ -519,11 +516,6 @@ namespace ifap
     int VKRenderer::Impl::getMaxTextureDimension() const
     {
         return m_max_texture_dimension;
-    }
-
-    float32x2 VKRenderer::Impl::imageTexScale(int width, int height) const
-    {
-        return shaders::imageTexScale(width, height, true);
     }
 
     void VKRenderer::Impl::resize(int width, int height)
@@ -1091,9 +1083,9 @@ namespace ifap
     {
         Compiler compiler;
 
-        const std::string vertexSource = shaders::vkVertexShader();
-        const std::string fragmentBilinearSource = shaders::vkFragmentShaderBilinear();
-        const std::string fragmentBicubicSource = shaders::vkFragmentShaderBicubic();
+        const std::string vertexSource = shaders::vertexShader();
+        const std::string fragmentBilinearSource = shaders::fragmentShaderBilinear();
+        const std::string fragmentBicubicSource = shaders::fragmentShaderBicubic();
 
         Shader vertexShader = compiler.compile(vertexSource.c_str(), ShaderStage::Vertex);
         Shader fragmentBilinear = compiler.compile(fragmentBilinearSource.c_str(), ShaderStage::Fragment);
@@ -1387,9 +1379,8 @@ namespace ifap
         push.transform[2] = request.scale.x;
         push.transform[3] = request.scale.y;
         push.scale = request.intensity;
-        const float32x2 tex_scale = imageTexScale(request.width, request.height);
-        push.texScale[0] = tex_scale.x;
-        push.texScale[1] = tex_scale.y;
+        push.texScale[0] = 1.0f / float(std::max(1, request.width));
+        push.texScale[1] = 1.0f / float(std::max(1, request.height));
         push.outputSrgbEncode = m_swapchain_srgb_format ? 0.0f : 1.0f;
 
         const u32 imageIndex = m_frame.imageIndex();
@@ -1456,7 +1447,6 @@ namespace ifap
     void VKRenderer::drawImage(const ImageDrawRequest& request) { m_impl->drawImage(request); }
     void VKRenderer::endFrame() { m_impl->endFrame(); }
     int VKRenderer::getMaxTextureDimension() const { return m_impl->getMaxTextureDimension(); }
-    float32x2 VKRenderer::imageTexScale(int width, int height) const { return m_impl->imageTexScale(width, height); }
     TextureHandle VKRenderer::createTexture(int width, int height, PixelFormat format, const void* initial_data) { return m_impl->createTexture(width, height, format, initial_data); }
     void VKRenderer::uploadTextureRegion(TextureHandle handle, PixelFormat format, int x, int y, int width, int height, const void* pixels) { m_impl->uploadTextureRegion(handle, format, x, y, width, height, pixels); }
     void VKRenderer::destroyTexture(TextureHandle handle) { m_impl->destroyTexture(handle); }

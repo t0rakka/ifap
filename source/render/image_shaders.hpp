@@ -4,24 +4,14 @@
 */
 #pragma once
 
-#include "context.hpp"
-
-#include <algorithm>
 #include <string>
 
 namespace ifap::shaders
 {
 
-    inline float32x2 imageTexScale(int width, int height, bool flip_y)
-    {
-        const float inv_w = 1.0f / float(std::max(1, width));
-        const float inv_h = 1.0f / float(std::max(1, height));
-        return float32x2(inv_w, flip_y ? -inv_h : inv_h);
-    }
-
     namespace detail
     {
-        inline constexpr const char* g_glsl_cubic = R"(
+        inline constexpr const char* g_cubic = R"(
             vec4 cubic(float v)
             {
                 vec4 n = vec4(1.0, 2.0, 3.0, 4.0) - v;
@@ -34,10 +24,9 @@ namespace ifap::shaders
             }
         )";
 
-        inline constexpr const char* g_glsl_texture_filter = R"(
+        inline constexpr const char* g_texture_filter = R"(
             vec4 texture_filter(sampler2D tex, vec2 uv, vec2 texscale)
             {
-                texscale = abs(texscale);
                 uv /= texscale;
                 uv -= vec2(0.5, 0.5);
 
@@ -65,7 +54,7 @@ namespace ifap::shaders
             }
         )";
 
-        inline constexpr const char* g_glsl_linear_to_srgb = R"(
+        inline constexpr const char* g_linear_to_srgb = R"(
             vec3 linearToSrgb(vec3 linear)
             {
                 vec3 lo = linear * 12.92;
@@ -74,19 +63,15 @@ namespace ifap::shaders
             }
         )";
 
-        inline constexpr const char* g_glsl_vertex_main = R"(
+        inline constexpr const char* g_vertex_main = R"(
             void main()
             {
                 texcoord = inPosition * vec2(0.5, 0.5) + vec2(0.5);
-                if (uTexScale.y < 0.0)
-                {
-                    texcoord.y = 1.0 - texcoord.y;
-                }
-                gl_Position = vec4((inPosition + vec2(uTransform.x, -uTransform.y)) * uTransform.zw, 0.0, 1.0);
+                gl_Position = vec4((inPosition + uTransform.xy) * uTransform.zw, 0.0, 1.0);
             }
         )";
 
-        inline constexpr const char* g_glsl_fragment_bilinear_main = R"(
+        inline constexpr const char* g_fragment_bilinear_main = R"(
             void main()
             {
                 vec4 color = texture(uTexture, texcoord) * uScale;
@@ -98,7 +83,7 @@ namespace ifap::shaders
             }
         )";
 
-        inline constexpr const char* g_glsl_fragment_bicubic_main = R"(
+        inline constexpr const char* g_fragment_bicubic_main = R"(
             void main()
             {
                 vec4 color = texture_filter(uTexture, texcoord, uTexScale) * uScale;
@@ -110,105 +95,51 @@ namespace ifap::shaders
             }
         )";
 
+        inline constexpr const char* g_push_constants = R"(
+            layout(push_constant) uniform Push
+            {
+                layout(offset = 0) vec4 uTransform;
+                layout(offset = 16) float uScale;
+                layout(offset = 24) vec2 uTexScale;
+                layout(offset = 32) float uOutputSrgbEncode;
+            } pc;
+        )";
+
     } // namespace detail
 
-    inline std::string glVertexShader()
-    {
-        return std::string(R"(#version 330
-
-            uniform vec4 uTransform = vec4(0.0, 0.0, 1.0, 1.0);
-            uniform vec2 uTexScale = vec2(1.0, 1.0);
-            in vec2 inPosition;
-
-            out vec2 texcoord;
-        )") + detail::g_glsl_vertex_main;
-    }
-
-    inline std::string glFragmentShaderBilinear()
-    {
-        return std::string(R"(#version 330
-
-            uniform sampler2D uTexture;
-            uniform float uScale;
-            uniform float uOutputSrgbEncode = 0.0;
-            in vec2 texcoord;
-
-            out vec4 outColor;
-        )") + detail::g_glsl_linear_to_srgb + detail::g_glsl_fragment_bilinear_main;
-    }
-
-    inline std::string glFragmentShaderBicubic()
-    {
-        return std::string(R"(#version 330
-
-            uniform sampler2D uTexture;
-            uniform vec2 uTexScale;
-            uniform float uScale;
-            uniform float uOutputSrgbEncode = 0.0;
-            in vec2 texcoord;
-
-            out vec4 outColor;
-        )") + detail::g_glsl_cubic + detail::g_glsl_texture_filter + detail::g_glsl_linear_to_srgb + detail::g_glsl_fragment_bicubic_main;
-    }
-
-    inline std::string vkVertexShader()
+    inline std::string vertexShader()
     {
         return std::string(R"(#version 450
             layout(location = 0) in vec2 inPosition;
             layout(location = 0) out vec2 texcoord;
-
-            layout(push_constant) uniform Push
-            {
-                layout(offset = 0) vec4 uTransform;
-                layout(offset = 16) float uScale;
-                layout(offset = 24) vec2 uTexScale;
-                layout(offset = 32) float uOutputSrgbEncode;
-            } pc;
-
+        )") + detail::g_push_constants + R"(
             #define uTransform pc.uTransform
-            #define uTexScale pc.uTexScale
-        )") + detail::g_glsl_vertex_main;
+        )" + detail::g_vertex_main;
     }
 
-    inline std::string vkFragmentShaderBilinear()
+    inline std::string fragmentShaderBilinear()
     {
         return std::string(R"(#version 450
             layout(set = 0, binding = 0) uniform sampler2D uTexture;
             layout(location = 0) in vec2 texcoord;
             layout(location = 0) out vec4 outColor;
-
-            layout(push_constant) uniform Push
-            {
-                layout(offset = 0) vec4 uTransform;
-                layout(offset = 16) float uScale;
-                layout(offset = 24) vec2 uTexScale;
-                layout(offset = 32) float uOutputSrgbEncode;
-            } pc;
-
+        )") + detail::g_push_constants + R"(
             #define uScale pc.uScale
             #define uOutputSrgbEncode pc.uOutputSrgbEncode
-        )") + detail::g_glsl_linear_to_srgb + detail::g_glsl_fragment_bilinear_main;
+        )" + detail::g_linear_to_srgb + detail::g_fragment_bilinear_main;
     }
 
-    inline std::string vkFragmentShaderBicubic()
+    inline std::string fragmentShaderBicubic()
     {
         return std::string(R"(#version 450
             layout(set = 0, binding = 0) uniform sampler2D uTexture;
             layout(location = 0) in vec2 texcoord;
             layout(location = 0) out vec4 outColor;
-
-            layout(push_constant) uniform Push
-            {
-                layout(offset = 0) vec4 uTransform;
-                layout(offset = 16) float uScale;
-                layout(offset = 24) vec2 uTexScale;
-                layout(offset = 32) float uOutputSrgbEncode;
-            } pc;
-
+        )") + detail::g_push_constants + R"(
             #define uScale pc.uScale
             #define uTexScale pc.uTexScale
             #define uOutputSrgbEncode pc.uOutputSrgbEncode
-        )") + detail::g_glsl_cubic + detail::g_glsl_texture_filter + detail::g_glsl_linear_to_srgb + detail::g_glsl_fragment_bicubic_main;
+        )" + detail::g_cubic + detail::g_texture_filter + detail::g_linear_to_srgb + detail::g_fragment_bicubic_main;
     }
 
 } // namespace ifap::shaders

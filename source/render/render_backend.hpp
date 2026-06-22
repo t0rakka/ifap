@@ -58,27 +58,4 @@ namespace ifap
         TextureFilter filter = TextureFilter::BILINEAR;
     };
 
-    class RenderBackend
-    {
-    public:
-        virtual ~RenderBackend() = default;
-
-        virtual void initialize() = 0;
-        virtual void resize(int width, int height) = 0;
-
-        virtual void beginUploads() {}
-        virtual void beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend) = 0;
-        virtual void drawImage(const ImageDrawRequest& request) = 0;
-        virtual void endFrame() = 0;
-
-        virtual int getMaxTextureDimension() const = 0;
-
-        virtual float32x2 imageTexScale(int width, int height) const = 0;
-
-        virtual TextureHandle createTexture(int width, int height, PixelFormat format, const void* initial_data) = 0;
-        virtual void uploadTextureRegion(TextureHandle handle, PixelFormat format,
-                                         int x, int y, int width, int height, const void* pixels) = 0;
-        virtual void destroyTexture(TextureHandle handle) = 0;
-    };
-
 } // namespace ifap

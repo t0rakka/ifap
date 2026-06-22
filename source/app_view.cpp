@@ -9,10 +9,9 @@
 namespace ifap
 {
 
-    AppView::AppView(Window& window, RenderBackend& renderer, std::function<void()> toggle_fullscreen)
+    AppView::AppView(Window& window, VKRenderer& renderer)
         : m_window(window)
         , m_renderer(renderer)
-        , m_toggle_fullscreen(std::move(toggle_fullscreen))
         , m_texture_cache(renderer)
     {
         resetTransformation();
@@ -170,7 +169,7 @@ namespace ifap
                     break;
 
                 case 2:
-                    m_toggle_fullscreen();
+                    m_window.toggleFullscreen();
                     break;
 
                 default:
@@ -211,7 +210,7 @@ namespace ifap
                 break;
 
             case KEYCODE_F:
-                m_toggle_fullscreen();
+                m_window.toggleFullscreen();
                 break;
 
             case KEYCODE_Q:

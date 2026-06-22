@@ -12,7 +12,6 @@ namespace ifap
 
     using CommandLine = std::vector<std::string_view>;
 
-    void runOpenGLApp(const CommandLine& commands);
-    void runVulkanApp(const CommandLine& commands);
+    void runApp(const CommandLine& commands);
 
 } // namespace ifap

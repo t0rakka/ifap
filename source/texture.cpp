@@ -28,7 +28,7 @@ namespace ifap
                 std::max(1, int(float(height) * scale)));
         }
 
-        void createPlaceholderTexture(DecodeTask& task, RenderBackend& renderer, int width, int height)
+        void createPlaceholderTexture(DecodeTask& task, VKRenderer& renderer, int width, int height)
         {
             static const u8 placeholder_pixel[] = { 32, 32, 32, 255 };
 
@@ -48,7 +48,7 @@ namespace ifap
     // DecodeTask
     // -----------------------------------------------------------------------
 
-    DecodeTask::DecodeTask(RenderBackend& renderer)
+    DecodeTask::DecodeTask(VKRenderer& renderer)
         : renderer(renderer)
     {
     }
@@ -83,7 +83,7 @@ namespace ifap
     // TextureCache
     // -----------------------------------------------------------------------
 
-    TextureCache::TextureCache(RenderBackend& renderer)
+    TextureCache::TextureCache(VKRenderer& renderer)
         : m_renderer(renderer)
     {
     }
