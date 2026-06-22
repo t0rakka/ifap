@@ -60,10 +60,6 @@ namespace ifap
     static OpenGLContext::Config createOpenGLConfig()
     {
         OpenGLContext::Config config;
-        config.red   = 16;
-        config.green = 16;
-        config.blue  = 16;
-        config.alpha = 16;
         return config;
     }
 
