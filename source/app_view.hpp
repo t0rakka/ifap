@@ -61,7 +61,6 @@ namespace ifap
         TextureCache m_texture_cache;
 
         TextureFilter m_texture_filter = TextureFilter::BILINEAR;
-        bool m_hdr = false;
 
         MouseCapture m_mouse_translate;
         MouseCapture m_mouse_scale;

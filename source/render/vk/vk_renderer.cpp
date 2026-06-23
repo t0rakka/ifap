@@ -19,21 +19,23 @@ namespace ifap
 
     namespace
     {
-        struct PushConstants
+        struct ProcessingPushConstants
         {
             float transform[4];
-            float scale;
-            float pad0;
             float texScale[2];
+        };
+
+        struct ResolvePushConstants
+        {
             float outputTransform;
             float sdrWhiteNits;
         };
 
-        static_assert(offsetof(PushConstants, scale) == 16);
-        static_assert(offsetof(PushConstants, texScale) == 24);
-        static_assert(offsetof(PushConstants, outputTransform) == 32);
-        static_assert(offsetof(PushConstants, sdrWhiteNits) == 36);
-        static_assert(sizeof(PushConstants) == 40);
+        static_assert(offsetof(ProcessingPushConstants, texScale) == 16);
+        static_assert(sizeof(ProcessingPushConstants) == 24);
+        static_assert(sizeof(ResolvePushConstants) == 8);
+
+        constexpr VkFormat kProcessingFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 
         enum class OutputTransform : int
         {
@@ -163,106 +165,25 @@ namespace ifap
             return OutputTransform::Pass;
         }
 
-        // Per-color-space output calibration pushed as uSdrWhiteNits (meaning varies by path).
+        // uSdrWhiteNits: literal nits for PQ (shader: linear * nits / 10000);
+        // for HLG, scale before OETF (shader: linear * nits / 100, default 75 ≈ BT.2408 SDR-in-HLG).
         static float defaultSdrWhiteNits(VkColorSpaceKHR colorSpace)
         {
             switch (colorSpace)
             {
                 case VK_COLOR_SPACE_HDR10_ST2084_EXT:
-                    // PQ: literal nits in absolute PQ space (shader: linear * nits / 10000).
                     return 100.0f;
                 case VK_COLOR_SPACE_HDR10_HLG_EXT:
-                    // HLG: dimensionless scale before OETF (shader: linear * nits / 100).
-                    // ~8 maps SDR paper white (~100 nits) into ~8% of HLG headroom; macOS
-                    // presents HLG signal 1.0 near display peak (~1000 nits on typical panels).
-                    return 8.0f;
-                case VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT:
-                    return 112.0f;
-                case VK_COLOR_SPACE_BT709_NONLINEAR_EXT:
-                    return 80.0f;
-                case VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT:
-                    return 104.0f;
-                case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
-                case VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT:
-                    return 96.0f;
-                case VK_COLOR_SPACE_BT2020_LINEAR_EXT:
-                    return 86.0f;
+                    return 75.0f;
                 default:
                     return 100.0f;
             }
         }
 
         // ------------------------------------------------------------------
-        // Output calibration reference (SDR JPEG baseline: match macOS Preview)
+        // Resolve pass: scene-linear BT.709 in -> swapchain colorspace out.
+        // Per-path calibration knobs removed; PQ/HLG use uSdrWhiteNits only.
         // ------------------------------------------------------------------
-        //
-        // VK_COLOR_SPACE_BT2020_LINEAR_EXT  (R16G16B16A16_SFLOAT on macOS)
-        //   Linear BT.2020 — SdrToBt2020Linear
-        //   Pipeline    : bt709ToBt2020 -> exposure -> BT.2020-luma desat
-        //   Matrix      : required; BT.709 codes as BT.2020 primaries skew orange->red, green hot
-        //   Desat         : 0.86 toward BT.2020 luma (mild chroma trim after correct gamut map)
-        //   Knob          : uSdrWhiteNits / 100 (default 86)
-        //
-        // VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT  (R16G16B16A16_SFLOAT on macOS)
-        //   Linear Display P3 — SdrToDisplayP3Linear (desat + linear * exposure)
-        //   Desat         : 0.87 toward Rec.709 luma (P3 tag on BT.709 JPEG = too vibrant)
-        //   Wrong         : SdrToLinearSurface alone — hue/chroma hot, luminance OK
-        //   Note          : DISPLAY_P3_NONLINEAR float OK with plain SrgbEncode
-        //   Knob          : uSdrWhiteNits / 100 (default 96)
-        //
-        // VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
-        //   B8G8R8A8_SRGB : SdrToExtendedSrgbLinear — srgbToLinear pre-compensate (see above)
-        //   B8G8R8A8_UNORM / float : SdrToLinearSurface — linear passthrough * exposure
-        //   Wrong         : SrgbEncode on UNORM — gamma in linear-tagged buffer = too light
-        //   Knob          : uSdrWhiteNits / 100 (default 96)
-        //
-        //   B8G8R8A8_SRGB variant (B8G8R8A8_SRGB on macOS)
-        //   Format trap : B8G8R8A8_SRGB RT auto-applies linearToSrgb on write
-        //   Shader      : srgbToLinear(L) before RT -> stored ≈ L when read as linear
-        //   Wrong       : Pass (linear out) -> RT encodes -> compositor reads gamma as linear
-        //
-        // VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT  (R16G16B16A16_SFLOAT on macOS)
-        //   Primaries : DCI-P3 (more saturated than Display P3); panel is usually Display P3
-        //   Texture   : RGBA8_SRGB — sampler decodes to linear BT.709
-        //   Shader    : SdrToDciP3Nonlinear — toe -> desat -> linearToSrgb -> gamma exposure
-        //   Float16   : passthrough (DISPLAY_P3_NONLINEAR OK with plain SrgbEncode; DCI tag is
-        //               hotter primaries + darker gamma read — needs desat + brighter exposure)
-        //   Toe       : 0.015  Desat: 0.88 toward Rec.709 luma
-        //   Knob      : uSdrWhiteNits / 100 after encode (default 118)
-        //
-        // VK_COLOR_SPACE_BT709_NONLINEAR_EXT  (R16G16B16A16_SFLOAT on macOS)
-        //   Primaries : BT.709 (same as sRGB/JPEG)
-        //   Texture   : RGBA8_SRGB — sampler decodes to linear BT.709
-        //   Shader    : SdrToBt709Nonlinear — toe -> contrast -> linearToSrgb -> gamma exposure
-        //   Float16   : swapchain passthrough (same model as SRGB_NONLINEAR float = OK)
-        //   Toe       : 0.02 linear lift (shadow wall balance)
-        //   Contrast  : 1.04 linear stretch about 0.5 (after toe, before encode)
-        //   Wrong     : linear passthrough — too dark (no gamma in buffer)
-        //   Wrong     : BT.1886 encode — lifted shadows / flat contrast on passthrough
-        //   Wrong     : linear * nits before encode — shadows/highlights diverge
-        //   Knob      : uSdrWhiteNits / 100 applied AFTER sRGB encode (brightness only)
-        //
-        // VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT  (R16G16B16A16_SFLOAT on macOS)
-        //   Primaries : Adobe RGB 1998 tag (container); physical panel is usually Display P3
-        //   EOTF      : gamma 2.2 (pure power, IEC 61966-2.5 / Adobe RGB spec)
-        //   Texture   : RGBA8_SRGB — sampler decodes to linear BT.709
-        //   Shader    : SdrToAdobeRgb — BT.709 linear -> exposure -> mild desat -> gamma 2.2
-        //   No matrix : macOS ColorSync maps tagged surface to panel; a BT.709->Adobe
-        //               matrix here double-converts and pushes red toward yellow-orange
-        //   Desat     : 0.90 chroma mix toward Rec.709 luma (tames vibrancy w/o matrix)
-        //   Knob      : uSdrWhiteNits / 100  (default 112 — do not change without user OK)
-        //
-        //   Wrong path: SrgbEncode alone — BT.709 + sRGB gamma read as Adobe codes
-        //   Wrong path: bt709ToAdobeRgb matrix — red/yellow shift on P3 panels
-        //
-        // VK_COLOR_SPACE_HDR10_HLG_EXT
-        //   See defaultSdrWhiteNits comment above (default 8 — not literal nits).
-        //
-        // VK_COLOR_SPACE_HDR10_ST2084_EXT
-        //   SdrToHdrPQ, literal nits / 10000 (default 100).
-        //
-        // ------------------------------------------------------------------
-        // Development override for swapchain (format, colorSpace) testing.
         //
         // >>> ACTIVE TARGET: the single uncommented kDevSurfaceFormat line below.
         //     Read it before tuning — defaults/calibration apply to THAT color space only.
@@ -275,7 +196,7 @@ namespace ifap
         // Texture side: Mango decoder sets header.linear → RGBA8_SRGB vs UNORM.
         // ------------------------------------------------------------------
 
-        constexpr bool kDevForceSurfaceFormat = false;
+        constexpr bool kDevForceSurfaceFormat = true;
 
         constexpr VkSurfaceFormatKHR kDevSurfaceFormat =
         {
@@ -286,17 +207,18 @@ namespace ifap
             //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_DISPLAY_P3_NONLINEAR_EXT
             //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_PASS_THROUGH_EXT
             //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT
-            VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_HDR10_ST2084_EXT
+            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_HDR10_ST2084_EXT
             //VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_COLOR_SPACE_HDR10_ST2084_EXT
-            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_HDR10_HLG_EXT
-            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT
-            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_BT709_NONLINEAR_EXT
-            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT
             //VK_FORMAT_B8G8R8A8_SRGB,       VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
             //VK_FORMAT_B8G8R8A8_UNORM,      VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
             //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT
             //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
             //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_BT2020_LINEAR_EXT
+
+            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_HDR10_HLG_EXT
+            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT
+            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_BT709_NONLINEAR_EXT
+            VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT
         };
 
         static VkSurfaceFormatKHR selectBestFormatForColorSpace(
@@ -565,16 +487,26 @@ namespace ifap
         VkCommandPool m_transferCommandPool = VK_NULL_HANDLE;
         std::unique_ptr<Swapchain> m_swapchain;
         std::vector<VkCommandBuffer> m_commandBuffers;
-        VkShaderModule m_vertexShader = VK_NULL_HANDLE;
-        VkShaderModule m_fragmentShaderBilinear = VK_NULL_HANDLE;
-        VkShaderModule m_fragmentShaderBicubic = VK_NULL_HANDLE;
-        VkDescriptorSetLayout m_descriptorSetLayout = VK_NULL_HANDLE;
-        VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
+        VkShaderModule m_processingVertexShader = VK_NULL_HANDLE;
+        VkShaderModule m_processingFragmentShaderBilinear = VK_NULL_HANDLE;
+        VkShaderModule m_processingFragmentShaderBicubic = VK_NULL_HANDLE;
+        VkShaderModule m_resolveVertexShader = VK_NULL_HANDLE;
+        VkShaderModule m_resolveFragmentShader = VK_NULL_HANDLE;
+        VkDescriptorSetLayout m_contentDescriptorSetLayout = VK_NULL_HANDLE;
+        VkDescriptorSetLayout m_resolveDescriptorSetLayout = VK_NULL_HANDLE;
+        VkPipelineLayout m_processingPipelineLayout = VK_NULL_HANDLE;
+        VkPipelineLayout m_resolvePipelineLayout = VK_NULL_HANDLE;
         VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet m_resolveDescriptor = VK_NULL_HANDLE;
         VkPipeline m_pipelineBilinearBlend = VK_NULL_HANDLE;
         VkPipeline m_pipelineBilinearNoBlend = VK_NULL_HANDLE;
         VkPipeline m_pipelineBicubicBlend = VK_NULL_HANDLE;
         VkPipeline m_pipelineBicubicNoBlend = VK_NULL_HANDLE;
+        VkPipeline m_resolvePipeline = VK_NULL_HANDLE;
+        VkImage m_processingImage = VK_NULL_HANDLE;
+        VkDeviceMemory m_processingMemory = VK_NULL_HANDLE;
+        VkImageView m_processingView = VK_NULL_HANDLE;
+        VkImageLayout m_processingLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkBuffer m_vertexBuffer = VK_NULL_HANDLE;
         VkDeviceMemory m_vertexBufferMemory = VK_NULL_HANDLE;
         VkSampler m_samplerNearest = VK_NULL_HANDLE;
@@ -602,6 +534,8 @@ namespace ifap
         bool m_frame_active = false;
         bool m_command_buffer_recording = false;
         bool m_rendering_active = false;
+        bool m_processing_rendering_active = false;
+        bool m_content_drawn = false;
         bool m_blend_enabled = true;
         bool m_swapchain_srgb_format = false;
         OutputTransform m_output_transform = OutputTransform::Pass;
@@ -616,9 +550,15 @@ namespace ifap
         void createGeometry();
         void createSamplers();
         void createDescriptorResources();
+        void createProcessingTarget();
+        void destroyProcessingTarget();
         void createCommandBuffers();
         void rebuildSwapchainResources();
         void updateSwapchain();
+        void beginCommandBufferRecording();
+        void beginProcessingRendering();
+        void endProcessingRendering();
+        void recordResolve();
         GpuTexture* getTexture(TextureHandle handle);
         const GpuTexture* getTexture(TextureHandle handle) const;
         static VkFormat toVkFormat(PixelFormat format);
@@ -626,7 +566,8 @@ namespace ifap
         uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
         void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
                           VkBuffer& buffer, VkDeviceMemory& memory) const;
-        void createImage(int width, int height, VkFormat format, VkImage& image, VkDeviceMemory& memory) const;
+        void createImage(int width, int height, VkFormat format, VkImageUsageFlags usage,
+                         VkImage& image, VkDeviceMemory& memory) const;
         void createImageView(VkImage image, VkFormat format, VkImageView& view) const;
         void releaseStaging(GpuTexture& texture);
         void releaseUploadCommandBuffer(GpuTexture& texture);
@@ -693,6 +634,7 @@ namespace ifap
         createGeometry();
         createPipelines();
         createCommandBuffers();
+        createProcessingTarget();
     }
 
     VKRenderer::Impl::~Impl()
@@ -712,6 +654,7 @@ namespace ifap
 
             m_swapchain.reset();
 
+            destroyProcessingTarget();
             destroyPipelines();
 
             if (m_descriptorPool)
@@ -719,29 +662,49 @@ namespace ifap
                 vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
             }
 
-            if (m_descriptorSetLayout)
+            if (m_contentDescriptorSetLayout)
             {
-                vkDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr);
+                vkDestroyDescriptorSetLayout(m_device, m_contentDescriptorSetLayout, nullptr);
             }
 
-            if (m_pipelineLayout)
+            if (m_resolveDescriptorSetLayout)
             {
-                vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
+                vkDestroyDescriptorSetLayout(m_device, m_resolveDescriptorSetLayout, nullptr);
             }
 
-            if (m_vertexShader)
+            if (m_processingPipelineLayout)
             {
-                vkDestroyShaderModule(m_device, m_vertexShader, nullptr);
+                vkDestroyPipelineLayout(m_device, m_processingPipelineLayout, nullptr);
             }
 
-            if (m_fragmentShaderBilinear)
+            if (m_resolvePipelineLayout)
             {
-                vkDestroyShaderModule(m_device, m_fragmentShaderBilinear, nullptr);
+                vkDestroyPipelineLayout(m_device, m_resolvePipelineLayout, nullptr);
             }
 
-            if (m_fragmentShaderBicubic)
+            if (m_processingVertexShader)
             {
-                vkDestroyShaderModule(m_device, m_fragmentShaderBicubic, nullptr);
+                vkDestroyShaderModule(m_device, m_processingVertexShader, nullptr);
+            }
+
+            if (m_processingFragmentShaderBilinear)
+            {
+                vkDestroyShaderModule(m_device, m_processingFragmentShaderBilinear, nullptr);
+            }
+
+            if (m_processingFragmentShaderBicubic)
+            {
+                vkDestroyShaderModule(m_device, m_processingFragmentShaderBicubic, nullptr);
+            }
+
+            if (m_resolveVertexShader)
+            {
+                vkDestroyShaderModule(m_device, m_resolveVertexShader, nullptr);
+            }
+
+            if (m_resolveFragmentShader)
+            {
+                vkDestroyShaderModule(m_device, m_resolveFragmentShader, nullptr);
             }
 
             if (m_vertexBuffer)
@@ -936,7 +899,8 @@ namespace ifap
         vkBindBufferMemory(m_device, buffer, memory, 0);
     }
 
-    void VKRenderer::Impl::createImage(int width, int height, VkFormat format, VkImage& image, VkDeviceMemory& memory) const
+    void VKRenderer::Impl::createImage(int width, int height, VkFormat format, VkImageUsageFlags usage,
+                                       VkImage& image, VkDeviceMemory& memory) const
     {
         VkImageCreateInfo imageInfo =
         {
@@ -948,7 +912,7 @@ namespace ifap
             .arrayLayers = 1,
             .samples = VK_SAMPLE_COUNT_1_BIT,
             .tiling = VK_IMAGE_TILING_OPTIMAL,
-            .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+            .usage = usage,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
         };
@@ -1227,7 +1191,9 @@ namespace ifap
         texture->format = format;
 
         const VkFormat vkFormat = toVkFormat(format);
-        createImage(width, height, vkFormat, texture->image, texture->memory);
+        createImage(width, height, vkFormat,
+                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    texture->image, texture->memory);
         createImageView(texture->image, vkFormat, texture->view);
 
         VkFenceCreateInfo fenceInfo =
@@ -1243,7 +1209,7 @@ namespace ifap
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
             .descriptorPool = m_descriptorPool,
             .descriptorSetCount = 1,
-            .pSetLayouts = &m_descriptorSetLayout,
+            .pSetLayouts = &m_contentDescriptorSetLayout,
         };
 
         vkAllocateDescriptorSets(m_device, &allocInfo, &texture->descriptor);
@@ -1319,19 +1285,107 @@ namespace ifap
         destroyPipelines();
 
         const VkExtent2D extent = m_swapchain->getExtent();
-        const VkFormat colorFormat = m_swapchain->getFormat();
+        const VkFormat swapchainFormat = m_swapchain->getFormat();
 
-        m_pipelineBilinearBlend = createGraphicsPipeline(m_device, colorFormat, m_pipelineLayout,
-            m_vertexShader, m_fragmentShaderBilinear, extent, true);
+        m_pipelineBilinearBlend = createGraphicsPipeline(m_device, kProcessingFormat, m_processingPipelineLayout,
+            m_processingVertexShader, m_processingFragmentShaderBilinear, extent, true);
 
-        m_pipelineBilinearNoBlend = createGraphicsPipeline(m_device, colorFormat, m_pipelineLayout,
-            m_vertexShader, m_fragmentShaderBilinear, extent, false);
+        m_pipelineBilinearNoBlend = createGraphicsPipeline(m_device, kProcessingFormat, m_processingPipelineLayout,
+            m_processingVertexShader, m_processingFragmentShaderBilinear, extent, false);
 
-        m_pipelineBicubicBlend = createGraphicsPipeline(m_device, colorFormat, m_pipelineLayout,
-            m_vertexShader, m_fragmentShaderBicubic, extent, true);
+        m_pipelineBicubicBlend = createGraphicsPipeline(m_device, kProcessingFormat, m_processingPipelineLayout,
+            m_processingVertexShader, m_processingFragmentShaderBicubic, extent, true);
 
-        m_pipelineBicubicNoBlend = createGraphicsPipeline(m_device, colorFormat, m_pipelineLayout,
-            m_vertexShader, m_fragmentShaderBicubic, extent, false);
+        m_pipelineBicubicNoBlend = createGraphicsPipeline(m_device, kProcessingFormat, m_processingPipelineLayout,
+            m_processingVertexShader, m_processingFragmentShaderBicubic, extent, false);
+
+        m_resolvePipeline = createGraphicsPipeline(m_device, swapchainFormat, m_resolvePipelineLayout,
+            m_resolveVertexShader, m_resolveFragmentShader, extent, false);
+    }
+
+    void VKRenderer::Impl::destroyProcessingTarget()
+    {
+        if (m_resolveDescriptor && m_descriptorPool)
+        {
+            vkFreeDescriptorSets(m_device, m_descriptorPool, 1, &m_resolveDescriptor);
+            m_resolveDescriptor = VK_NULL_HANDLE;
+        }
+
+        if (m_processingView)
+        {
+            vkDestroyImageView(m_device, m_processingView, nullptr);
+            m_processingView = VK_NULL_HANDLE;
+        }
+
+        if (m_processingImage)
+        {
+            vkDestroyImage(m_device, m_processingImage, nullptr);
+            m_processingImage = VK_NULL_HANDLE;
+        }
+
+        if (m_processingMemory)
+        {
+            vkFreeMemory(m_device, m_processingMemory, nullptr);
+            m_processingMemory = VK_NULL_HANDLE;
+        }
+
+        m_processingLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    }
+
+    void VKRenderer::Impl::createProcessingTarget()
+    {
+        destroyProcessingTarget();
+
+        if (!m_swapchain)
+        {
+            return;
+        }
+
+        const VkExtent2D extent = m_swapchain->getExtent();
+        if (extent.width == 0 || extent.height == 0)
+        {
+            return;
+        }
+
+        createImage(int(extent.width), int(extent.height), kProcessingFormat,
+                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    m_processingImage, m_processingMemory);
+        createImageView(m_processingImage, kProcessingFormat, m_processingView);
+
+        if (!m_resolveDescriptor && m_descriptorPool && m_resolveDescriptorSetLayout)
+        {
+            VkDescriptorSetAllocateInfo allocInfo =
+            {
+                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                .descriptorPool = m_descriptorPool,
+                .descriptorSetCount = 1,
+                .pSetLayouts = &m_resolveDescriptorSetLayout,
+            };
+
+            vkAllocateDescriptorSets(m_device, &allocInfo, &m_resolveDescriptor);
+        }
+
+        if (m_resolveDescriptor)
+        {
+            VkDescriptorImageInfo imageInfo =
+            {
+                .sampler = m_samplerLinear,
+                .imageView = m_processingView,
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            };
+
+            VkWriteDescriptorSet descriptorWrite =
+            {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = m_resolveDescriptor,
+                .dstBinding = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &imageInfo,
+            };
+
+            vkUpdateDescriptorSets(m_device, 1, &descriptorWrite, 0, nullptr);
+        }
     }
 
     void VKRenderer::Impl::rebuildSwapchainResources()
@@ -1339,6 +1393,7 @@ namespace ifap
         vkDeviceWaitIdle(m_device);
 
         destroyPipelines();
+        createProcessingTarget();
         createPipelines();
     }
 
@@ -1362,23 +1417,30 @@ namespace ifap
     {
         Compiler compiler;
 
-        const std::string vertexSource = shaders::vertexShader();
-        const std::string fragmentBilinearSource = shaders::fragmentShaderBilinear();
-        const std::string fragmentBicubicSource = shaders::fragmentShaderBicubic();
+        const std::string processingVertexSource = shaders::processingVertexShader();
+        const std::string processingBilinearSource = shaders::fragmentShaderProcessingBilinear();
+        const std::string processingBicubicSource = shaders::fragmentShaderProcessingBicubic();
+        const std::string resolveVertexSource = shaders::resolveVertexShader();
+        const std::string resolveFragmentSource = shaders::resolveFragmentShader();
 
-        Shader vertexShader = compiler.compile(vertexSource.c_str(), ShaderStage::Vertex);
-        Shader fragmentBilinear = compiler.compile(fragmentBilinearSource.c_str(), ShaderStage::Fragment);
-        Shader fragmentBicubic = compiler.compile(fragmentBicubicSource.c_str(), ShaderStage::Fragment);
+        Shader processingVertexShader = compiler.compile(processingVertexSource.c_str(), ShaderStage::Vertex);
+        Shader processingBilinear = compiler.compile(processingBilinearSource.c_str(), ShaderStage::Fragment);
+        Shader processingBicubic = compiler.compile(processingBicubicSource.c_str(), ShaderStage::Fragment);
+        Shader resolveVertexShader = compiler.compile(resolveVertexSource.c_str(), ShaderStage::Vertex);
+        Shader resolveFragmentShader = compiler.compile(resolveFragmentSource.c_str(), ShaderStage::Fragment);
 
-        if (!vertexShader.valid() || !fragmentBilinear.valid() || !fragmentBicubic.valid())
+        if (!processingVertexShader.valid() || !processingBilinear.valid() || !processingBicubic.valid()
+            || !resolveVertexShader.valid() || !resolveFragmentShader.valid())
         {
             printLine(Print::Error, "VKRenderer: shader compilation failed.");
             return;
         }
 
-        m_vertexShader = Compiler::createShaderModule(m_device, vertexShader);
-        m_fragmentShaderBilinear = Compiler::createShaderModule(m_device, fragmentBilinear);
-        m_fragmentShaderBicubic = Compiler::createShaderModule(m_device, fragmentBicubic);
+        m_processingVertexShader = Compiler::createShaderModule(m_device, processingVertexShader);
+        m_processingFragmentShaderBilinear = Compiler::createShaderModule(m_device, processingBilinear);
+        m_processingFragmentShaderBicubic = Compiler::createShaderModule(m_device, processingBicubic);
+        m_resolveVertexShader = Compiler::createShaderModule(m_device, resolveVertexShader);
+        m_resolveFragmentShader = Compiler::createShaderModule(m_device, resolveFragmentShader);
     }
 
     void VKRenderer::Impl::createSamplers()
@@ -1402,7 +1464,7 @@ namespace ifap
 
     void VKRenderer::Impl::createDescriptorResources()
     {
-        VkDescriptorSetLayoutBinding samplerBinding =
+        VkDescriptorSetLayoutBinding contentBinding =
         {
             .binding = 0,
             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -1410,44 +1472,79 @@ namespace ifap
             .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
         };
 
-        VkDescriptorSetLayoutCreateInfo layoutInfo =
+        VkDescriptorSetLayoutCreateInfo contentLayoutInfo =
         {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .bindingCount = 1,
-            .pBindings = &samplerBinding,
+            .pBindings = &contentBinding,
         };
 
-        vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_descriptorSetLayout);
+        vkCreateDescriptorSetLayout(m_device, &contentLayoutInfo, nullptr, &m_contentDescriptorSetLayout);
 
-        VkPushConstantRange pushRange =
+        VkDescriptorSetLayoutBinding resolveBinding =
+        {
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        };
+
+        VkDescriptorSetLayoutCreateInfo resolveLayoutInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .bindingCount = 1,
+            .pBindings = &resolveBinding,
+        };
+
+        vkCreateDescriptorSetLayout(m_device, &resolveLayoutInfo, nullptr, &m_resolveDescriptorSetLayout);
+
+        VkPushConstantRange processingPushRange =
         {
             .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
             .offset = 0,
-            .size = sizeof(PushConstants),
+            .size = sizeof(ProcessingPushConstants),
         };
 
-        VkPipelineLayoutCreateInfo pipelineLayoutInfo =
+        VkPipelineLayoutCreateInfo processingLayoutInfo =
         {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
             .setLayoutCount = 1,
-            .pSetLayouts = &m_descriptorSetLayout,
+            .pSetLayouts = &m_contentDescriptorSetLayout,
             .pushConstantRangeCount = 1,
-            .pPushConstantRanges = &pushRange,
+            .pPushConstantRanges = &processingPushRange,
         };
 
-        vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout);
+        vkCreatePipelineLayout(m_device, &processingLayoutInfo, nullptr, &m_processingPipelineLayout);
+
+        VkPushConstantRange resolvePushRange =
+        {
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .offset = 0,
+            .size = sizeof(ResolvePushConstants),
+        };
+
+        VkPipelineLayoutCreateInfo resolvePipelineLayoutInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .setLayoutCount = 1,
+            .pSetLayouts = &m_resolveDescriptorSetLayout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &resolvePushRange,
+        };
+
+        vkCreatePipelineLayout(m_device, &resolvePipelineLayoutInfo, nullptr, &m_resolvePipelineLayout);
 
         VkDescriptorPoolSize poolSize =
         {
             .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount = texture_cache_size * 4,
+            .descriptorCount = texture_cache_size * 4 + 1,
         };
 
         VkDescriptorPoolCreateInfo poolInfo =
         {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-            .maxSets = texture_cache_size * 4,
+            .maxSets = texture_cache_size * 4 + 1,
             .poolSizeCount = 1,
             .pPoolSizes = &poolSize,
         };
@@ -1490,6 +1587,7 @@ namespace ifap
         destroy(m_pipelineBilinearNoBlend);
         destroy(m_pipelineBicubicBlend);
         destroy(m_pipelineBicubicNoBlend);
+        destroy(m_resolvePipeline);
     }
 
     void VKRenderer::Impl::updateSwapchain()
@@ -1538,9 +1636,172 @@ namespace ifap
         m_blend_enabled = blend;
         m_command_buffer_recording = false;
         m_rendering_active = false;
+        m_processing_rendering_active = false;
+        m_content_drawn = false;
 
         m_frame = m_swapchain->beginFrame();
         m_frame_active = bool(m_frame);
+    }
+
+    void VKRenderer::Impl::beginCommandBufferRecording()
+    {
+        if (!m_frame_active || m_command_buffer_recording)
+        {
+            return;
+        }
+
+        const u32 imageIndex = m_frame.imageIndex();
+        VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
+
+        vkResetCommandBuffer(commandBuffer, 0);
+
+        VkCommandBufferBeginInfo beginInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        };
+
+        vkBeginCommandBuffer(commandBuffer, &beginInfo);
+        m_command_buffer_recording = true;
+    }
+
+    void VKRenderer::Impl::beginProcessingRendering()
+    {
+        if (!m_frame_active || m_processing_rendering_active || !m_processingView)
+        {
+            return;
+        }
+
+        beginCommandBufferRecording();
+
+        const u32 imageIndex = m_frame.imageIndex();
+        VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
+
+        const VkPipelineStageFlags srcStage = m_processingLayout == VK_IMAGE_LAYOUT_UNDEFINED
+            ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+            : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+
+        const VkAccessFlags srcAccess = m_processingLayout == VK_IMAGE_LAYOUT_UNDEFINED
+            ? VkAccessFlags(0)
+            : VK_ACCESS_SHADER_READ_BIT;
+
+        VkImageMemoryBarrier processingBarrier =
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = srcAccess,
+            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .oldLayout = m_processingLayout,
+            .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = m_processingImage,
+            .subresourceRange =
+            {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .levelCount = 1,
+                .layerCount = 1,
+            },
+        };
+
+        vkCmdPipelineBarrier(commandBuffer,
+            srcStage,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &processingBarrier);
+
+        m_processingLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        VkRenderingAttachmentInfo colorAttachment =
+        {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = m_processingView,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = { .color = { { m_clear_color[0], m_clear_color[1], m_clear_color[2], m_clear_color[3] } } },
+        };
+
+        VkRenderingInfo renderingInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea = { .extent = m_swapchain->getExtent() },
+            .layerCount = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &colorAttachment,
+        };
+
+        vkCmdBeginRendering(commandBuffer, &renderingInfo);
+        m_processing_rendering_active = true;
+    }
+
+    void VKRenderer::Impl::endProcessingRendering()
+    {
+        if (!m_frame_active || !m_processing_rendering_active)
+        {
+            return;
+        }
+
+        const u32 imageIndex = m_frame.imageIndex();
+        VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
+
+        vkCmdEndRendering(commandBuffer);
+        m_processing_rendering_active = false;
+
+        VkImageMemoryBarrier processingBarrier =
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = m_processingImage,
+            .subresourceRange =
+            {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .levelCount = 1,
+                .layerCount = 1,
+            },
+        };
+
+        vkCmdPipelineBarrier(commandBuffer,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &processingBarrier);
+
+        m_processingLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+
+    void VKRenderer::Impl::recordResolve()
+    {
+        if (!m_frame_active || !m_processingView || !m_resolvePipeline || !m_resolveDescriptor)
+        {
+            return;
+        }
+
+        beginSwapchainRendering();
+
+        if (!m_rendering_active)
+        {
+            return;
+        }
+
+        ResolvePushConstants push {};
+        push.outputTransform = float(m_output_transform);
+        push.sdrWhiteNits = m_sdr_white_nits;
+
+        const u32 imageIndex = m_frame.imageIndex();
+        VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
+
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_resolvePipeline);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_resolvePipelineLayout,
+            0, 1, &m_resolveDescriptor, 0, nullptr);
+        vkCmdPushConstants(commandBuffer, m_resolvePipelineLayout,
+            VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ResolvePushConstants), &push);
+
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(commandBuffer, 0, 1, &m_vertexBuffer, &offset);
+        vkCmdDraw(commandBuffer, 4, 1, 0, 0);
     }
 
     void VKRenderer::Impl::beginSwapchainRendering()
@@ -1550,24 +1811,12 @@ namespace ifap
             return;
         }
 
+        beginCommandBufferRecording();
+
         const u32 imageIndex = m_frame.imageIndex();
         VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
 
-        if (!m_command_buffer_recording)
-        {
-            vkResetCommandBuffer(commandBuffer, 0);
-
-            VkCommandBufferBeginInfo beginInfo =
-            {
-                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-            };
-
-            vkBeginCommandBuffer(commandBuffer, &beginInfo);
-            m_command_buffer_recording = true;
-
-            m_swapchain->cmdTransitionImageToColorAttachment(commandBuffer, imageIndex);
-        }
+        m_swapchain->cmdTransitionImageToColorAttachment(commandBuffer, imageIndex);
 
         VkRenderingAttachmentInfo colorAttachment =
         {
@@ -1637,31 +1886,31 @@ namespace ifap
 
         vkUpdateDescriptorSets(m_device, 1, &descriptorWrite, 0, nullptr);
 
-        beginSwapchainRendering();
+        beginProcessingRendering();
 
-        if (!m_rendering_active)
+        if (!m_processing_rendering_active)
         {
             return;
         }
 
-        PushConstants push {};
+        m_content_drawn = true;
+
+        ProcessingPushConstants push {};
         push.transform[0] = request.translate.x;
         push.transform[1] = request.translate.y;
         push.transform[2] = request.scale.x;
         push.transform[3] = request.scale.y;
-        push.scale = request.intensity;
         push.texScale[0] = 1.0f / float(std::max(1, request.width));
         push.texScale[1] = 1.0f / float(std::max(1, request.height));
-        push.outputTransform = float(m_output_transform);
-        push.sdrWhiteNits = m_sdr_white_nits;
 
         const u32 imageIndex = m_frame.imageIndex();
         VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
 
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, selectPipeline(request));
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout, 0, 1, &texture->descriptor, 0, nullptr);
-        vkCmdPushConstants(commandBuffer, m_pipelineLayout,
-            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PushConstants), &push);
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_processingPipelineLayout,
+            0, 1, &texture->descriptor, 0, nullptr);
+        vkCmdPushConstants(commandBuffer, m_processingPipelineLayout,
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ProcessingPushConstants), &push);
 
         VkDeviceSize offset = 0;
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, &m_vertexBuffer, &offset);
@@ -1680,7 +1929,12 @@ namespace ifap
             return;
         }
 
-        if (!m_rendering_active)
+        if (m_content_drawn)
+        {
+            endProcessingRendering();
+            recordResolve();
+        }
+        else if (!m_rendering_active)
         {
             beginSwapchainRendering();
         }

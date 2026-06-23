@@ -132,12 +132,6 @@ namespace ifap
         request.translate = translate;
         request.scale = scale;
         request.filter = m_texture_filter;
-        request.intensity = 1.0f;
-
-        if (!m_current_texture.linear && m_hdr)
-        {
-            request.intensity = 2.0f;
-        }
 
         return request;
     }
@@ -223,10 +217,6 @@ namespace ifap
             case KEYCODE_RIGHT:
                 m_right_time = mango::Time::ms();
                 nextImage(1);
-                break;
-
-            case KEYCODE_H:
-                m_hdr = !m_hdr;
                 break;
 
             case KEYCODE_1:

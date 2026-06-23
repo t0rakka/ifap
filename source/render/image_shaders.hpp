@@ -119,10 +119,22 @@ namespace ifap::shaders
             }
         )";
 
+        inline constexpr const char* g_bt709_to_display_p3 = R"(
+            vec3 bt709ToDisplayP3(vec3 linear)
+            {
+                const mat3 m = mat3(
+                    vec3(0.8224619287, 0.0335730637, 0.0170815977),
+                    vec3(0.1775380529, 0.9666420745, 0.0723970842),
+                    vec3(0.0000000000, 0.0000000000, 0.9105199182)
+                );
+                return m * linear;
+            }
+        )";
+
+        // BT.709 -> BT.2020; mat3 columns = input channel coefficients
         inline constexpr const char* g_bt709_to_bt2020 = R"(
             vec3 bt709ToBt2020(vec3 linear)
             {
-                // BT.2087 BT.709 -> BT.2020; mat3 columns = input channel coefficients
                 const mat3 m = mat3(
                     vec3(0.6274040, 0.0690970, 0.0163916),
                     vec3(0.3292820, 0.9195400, 0.0880132),
@@ -132,13 +144,15 @@ namespace ifap::shaders
             }
         )";
 
-        // Adobe RGB nonlinear: keep BT.709 linear (macOS ColorSync maps tagged surface
-        // to the panel). Do NOT apply bt709ToAdobeRgb here — the panel is typically
-        // Display P3, and a manual matrix + system conversion shifts red toward yellow.
         inline constexpr const char* g_bt709_to_adobe_rgb = R"(
             vec3 bt709ToAdobeRgb(vec3 linear)
             {
-                return linear;
+                const mat3 m = mat3(
+                    vec3(0.5767309, 0.1855540, 0.1881852),
+                    vec3(0.2973769, 0.6273491, 0.0752741),
+                    vec3(0.0270343, 0.0706872, 0.9911085)
+                );
+                return m * linear;
             }
         )";
 
@@ -149,55 +163,36 @@ namespace ifap::shaders
 
                 if (uOutputTransform > 9.5)
                 {
-                    const float desat = 0.86;
-                    vec3 linear = bt709ToBt2020(color.rgb) * (uSdrWhiteNits / 100.0);
-                    float luma = dot(linear, vec3(0.2627, 0.6780, 0.0593));
-                    color.rgb = mix(vec3(luma), linear, desat);
+                    color.rgb = bt709ToBt2020(color.rgb);
                 }
                 else if (uOutputTransform > 8.5)
                 {
-                    const float desat = 0.87;
-                    vec3 linear = color.rgb * (uSdrWhiteNits / 100.0);
-                    float luma = dot(linear, vec3(0.2126, 0.7152, 0.0722));
-                    color.rgb = mix(vec3(luma), linear, desat);
+                    color.rgb = bt709ToDisplayP3(color.rgb);
                 }
                 else if (uOutputTransform > 7.5)
                 {
-                    color.rgb = color.rgb * (uSdrWhiteNits / 100.0);
+                    // Linear surface: scene-linear passthrough.
                 }
                 else if (uOutputTransform > 6.5)
                 {
-                    vec3 linear = color.rgb * (uSdrWhiteNits / 100.0);
-                    color.rgb = srgbToLinear(linear);
+                    // EXTENDED_SRGB_LINEAR + sRGB swapchain format auto-encodes on write.
+                    color.rgb = srgbToLinear(color.rgb);
                 }
                 else if (uOutputTransform > 5.5)
                 {
-                    const float toe = 0.015;
-                    const float desat = 0.88;
-                    vec3 linear = color.rgb * (1.0 - toe) + toe;
-                    float luma = dot(linear, vec3(0.2126, 0.7152, 0.0722));
-                    linear = mix(vec3(luma), linear, desat);
-                    color.rgb = linearToSrgb(linear) * (uSdrWhiteNits / 100.0);
+                    color.rgb = linearToSrgb(color.rgb);
                 }
                 else if (uOutputTransform > 4.5)
                 {
-                    const float toe = 0.02;
-                    const float contrast = 1.05;
-                    vec3 linear = color.rgb * (1.0 - toe) + toe;
-                    linear = clamp((linear - 0.5) * contrast + 0.5, vec3(0.0), vec3(1.0));
-                    color.rgb = linearToSrgb(linear) * (uSdrWhiteNits / 100.0);
+                    color.rgb = linearToSrgb(color.rgb);
                 }
                 else if (uOutputTransform > 3.5)
                 {
-                    vec3 linear = bt709ToAdobeRgb(color.rgb) * (uSdrWhiteNits / 100.0);
-                    float luma = dot(linear, vec3(0.2126, 0.7152, 0.0722));
-                    linear = mix(vec3(luma), linear, 0.90);
-                    color.rgb = linearToGamma22(linear);
+                    color.rgb = linearToGamma22(bt709ToAdobeRgb(color.rgb));
                 }
                 else if (uOutputTransform > 2.5)
                 {
                     vec3 linear = bt709ToBt2020(color.rgb);
-                    // uSdrWhiteNits is a 0..100 scale knob here, not literal nits (see PQ branch).
                     color.rgb = linearToHLG(linear * (uSdrWhiteNits / 100.0));
                 }
                 else if (uOutputTransform > 1.5)
@@ -222,70 +217,102 @@ namespace ifap::shaders
             }
         )";
 
-        inline constexpr const char* g_fragment_bilinear_main = R"(
+        inline constexpr const char* g_processing_fragment_bilinear_main = R"(
             void main()
             {
-                vec4 color = encodeOutput(texture(uTexture, texcoord) * uScale);
-                outColor = color;
+                outColor = texture(uTexture, texcoord);
             }
         )";
 
-        inline constexpr const char* g_fragment_bicubic_main = R"(
+        inline constexpr const char* g_processing_fragment_bicubic_main = R"(
             void main()
             {
-                vec4 color = encodeOutput(texture_filter(uTexture, texcoord, uTexScale) * uScale);
-                outColor = color;
+                outColor = texture_filter(uTexture, texcoord, uTexScale);
             }
         )";
 
-        inline constexpr const char* g_push_constants = R"(
+        inline constexpr const char* g_resolve_vertex_main = R"(
+            void main()
+            {
+                texcoord = inPosition * vec2(0.5, 0.5) + vec2(0.5);
+                gl_Position = vec4(inPosition, 0.0, 1.0);
+            }
+        )";
+
+        inline constexpr const char* g_resolve_fragment_main = R"(
+            void main()
+            {
+                outColor = encodeOutput(texture(uProcessing, texcoord));
+            }
+        )";
+
+        inline constexpr const char* g_processing_push_constants = R"(
             layout(push_constant) uniform Push
             {
                 layout(offset = 0) vec4 uTransform;
-                layout(offset = 16) float uScale;
-                layout(offset = 24) vec2 uTexScale;
-                layout(offset = 32) float uOutputTransform;
-                layout(offset = 36) float uSdrWhiteNits;
+                layout(offset = 16) vec2 uTexScale;
+            } pc;
+        )";
+
+        inline constexpr const char* g_resolve_push_constants = R"(
+            layout(push_constant) uniform Push
+            {
+                layout(offset = 0) float uOutputTransform;
+                layout(offset = 4) float uSdrWhiteNits;
             } pc;
         )";
 
     } // namespace detail
 
-    inline std::string vertexShader()
+    inline std::string processingVertexShader()
     {
         return std::string(R"(#version 450
             layout(location = 0) in vec2 inPosition;
             layout(location = 0) out vec2 texcoord;
-        )") + detail::g_push_constants + R"(
+        )") + detail::g_processing_push_constants + R"(
             #define uTransform pc.uTransform
         )" + detail::g_vertex_main;
     }
 
-    inline std::string fragmentShaderBilinear()
+    inline std::string fragmentShaderProcessingBilinear()
     {
         return std::string(R"(#version 450
             layout(set = 0, binding = 0) uniform sampler2D uTexture;
             layout(location = 0) in vec2 texcoord;
             layout(location = 0) out vec4 outColor;
-        )") + detail::g_push_constants + R"(
-            #define uScale pc.uScale
-            #define uOutputTransform pc.uOutputTransform
-            #define uSdrWhiteNits pc.uSdrWhiteNits
-        )" + detail::g_linear_to_srgb + detail::g_srgb_to_linear + detail::g_linear_to_bt1886 + detail::g_linear_to_gamma22 + detail::g_linear_to_pq + detail::g_linear_to_hlg + detail::g_bt709_to_bt2020 + detail::g_bt709_to_adobe_rgb + detail::g_encode_output + detail::g_fragment_bilinear_main;
+        )") + detail::g_processing_push_constants + R"(
+        )" + detail::g_processing_fragment_bilinear_main;
     }
 
-    inline std::string fragmentShaderBicubic()
+    inline std::string fragmentShaderProcessingBicubic()
     {
         return std::string(R"(#version 450
             layout(set = 0, binding = 0) uniform sampler2D uTexture;
             layout(location = 0) in vec2 texcoord;
             layout(location = 0) out vec4 outColor;
-        )") + detail::g_push_constants + R"(
-            #define uScale pc.uScale
+        )") + detail::g_processing_push_constants + R"(
             #define uTexScale pc.uTexScale
+        )" + detail::g_cubic + detail::g_texture_filter + detail::g_processing_fragment_bicubic_main;
+    }
+
+    inline std::string resolveVertexShader()
+    {
+        return std::string(R"(#version 450
+            layout(location = 0) in vec2 inPosition;
+            layout(location = 0) out vec2 texcoord;
+        )") + detail::g_resolve_vertex_main;
+    }
+
+    inline std::string resolveFragmentShader()
+    {
+        return std::string(R"(#version 450
+            layout(set = 0, binding = 0) uniform sampler2D uProcessing;
+            layout(location = 0) in vec2 texcoord;
+            layout(location = 0) out vec4 outColor;
+        )") + detail::g_resolve_push_constants + R"(
             #define uOutputTransform pc.uOutputTransform
             #define uSdrWhiteNits pc.uSdrWhiteNits
-        )" + detail::g_cubic + detail::g_texture_filter + detail::g_linear_to_srgb + detail::g_srgb_to_linear + detail::g_linear_to_bt1886 + detail::g_linear_to_gamma22 + detail::g_linear_to_pq + detail::g_linear_to_hlg + detail::g_bt709_to_bt2020 + detail::g_bt709_to_adobe_rgb + detail::g_encode_output + detail::g_fragment_bicubic_main;
+        )" + detail::g_linear_to_srgb + detail::g_srgb_to_linear + detail::g_linear_to_bt1886 + detail::g_linear_to_gamma22 + detail::g_linear_to_pq + detail::g_linear_to_hlg + detail::g_bt709_to_display_p3 + detail::g_bt709_to_bt2020 + detail::g_bt709_to_adobe_rgb + detail::g_encode_output + detail::g_resolve_fragment_main;
     }
 
 } // namespace ifap::shaders

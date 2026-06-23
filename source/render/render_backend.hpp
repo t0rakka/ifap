@@ -53,7 +53,6 @@ namespace ifap
 
         float32x2 translate;
         float32x2 scale;
-        float intensity = 1.0f;
 
         TextureFilter filter = TextureFilter::BILINEAR;
     };
