@@ -42,10 +42,10 @@ namespace ifap
             Pass = 0,           // sRGB surface: texture decode is sufficient
             SrgbEncode = 1,       // float/UNORM SDR: linear BT.709 -> sRGB gamma
             SdrToHdrPQ = 2,       // HDR10 ST2084: BT.709 -> BT.2020 -> PQ
-            SdrToHdrHLG = 3,      // HDR10 HLG: BT.709 -> BT.2020 -> HLG OETF
-            SdrToAdobeRgb = 4,    // Adobe RGB nonlinear: BT.709 -> Adobe RGB -> gamma 2.2
-            SdrToBt709Nonlinear = 5, // BT.709 float: sRGB gamma encode (passthrough swapchain)
-            SdrToDciP3Nonlinear = 6, // DCI P3 float: desat + sRGB encode + gamma exposure
+            SdrToHdrHLG = 3,      // HDR10 HLG: BT.709 -> BT.2020 -> BT.2408 gain -> HLG OETF
+            SdrToAdobeRgb = 4,    // Adobe RGB nonlinear: BT.709 -> Adobe RGB -> Adobe OETF
+            SdrToBt709Nonlinear = 5, // BT.709 nonlinear: SMPTE 170M / ITU OETF
+            SdrToDciP3Nonlinear = 6, // DCI-P3 nonlinear: BT.709 -> P3 -> gamma 2.6
             SdrToExtendedSrgbLinear = 7, // EXTENDED_SRGB_LINEAR + sRGB RT: pre-compensate encode
             SdrToLinearSurface = 8,      // linear color space + UNORM/float: linear passthrough
             SdrToDisplayP3Linear = 9,    // Display P3 linear float: mild desat + linear out
@@ -165,16 +165,16 @@ namespace ifap
             return OutputTransform::Pass;
         }
 
-        // uSdrWhiteNits: literal nits for PQ (shader: linear * nits / 10000);
-        // for HLG, scale before OETF (shader: linear * nits / 100, default 75 ≈ BT.2408 SDR-in-HLG).
+        // uSdrWhiteNits: SDR diffuse white in nits.
+        //   PQ shader:   linear * nits / 10000
+        //   HLG shader:  BT.2408 gain 0.265 * (nits / 203) before OETF
         static float defaultSdrWhiteNits(VkColorSpaceKHR colorSpace)
         {
             switch (colorSpace)
             {
                 case VK_COLOR_SPACE_HDR10_ST2084_EXT:
-                    return 100.0f;
                 case VK_COLOR_SPACE_HDR10_HLG_EXT:
-                    return 75.0f;
+                    return 100.0f;
                 default:
                     return 100.0f;
             }
@@ -182,7 +182,6 @@ namespace ifap
 
         // ------------------------------------------------------------------
         // Resolve pass: scene-linear BT.709 in -> swapchain colorspace out.
-        // Per-path calibration knobs removed; PQ/HLG use uSdrWhiteNits only.
         // ------------------------------------------------------------------
         //
         // >>> ACTIVE TARGET: the single uncommented kDevSurfaceFormat line below.
@@ -191,12 +190,16 @@ namespace ifap
         // VkFormat        — how samples are stored (layout, UNORM/SFLOAT/SRGB, …)
         // VkColorSpaceKHR — what those values mean at scanout (primaries + EOTF)
         //
-        // SDR baseline goal: same sRGB JPEG should look identical across every
-        // supported color space once output calibration is tuned per space.
+        // SDR baseline goal: same sRGB JPEG should look correct per tagged colorspace.
         // Texture side: Mango decoder sets header.linear → RGBA8_SRGB vs UNORM.
+        //
+        // HLG:      BT.709 -> BT.2020, x0.265*(nits/203) (BT.2408), HLG OETF
+        // Adobe:    BT.709 -> Adobe RGB (XYZ-derived matrix), OETF exponent 256/563
+        // BT709:    SMPTE 170M / ITU piecewise OETF (same primaries)
+        // DCI-P3:   BT.709 -> P3 primaries, gamma 2.6
         // ------------------------------------------------------------------
 
-        constexpr bool kDevForceSurfaceFormat = true;
+        constexpr bool kDevForceSurfaceFormat = false;
 
         constexpr VkSurfaceFormatKHR kDevSurfaceFormat =
         {
@@ -214,11 +217,10 @@ namespace ifap
             //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT
             //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
             //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_BT2020_LINEAR_EXT
-
+            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT
             //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_HDR10_HLG_EXT
-            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT
             //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_BT709_NONLINEAR_EXT
-            VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT
+            VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT
         };
 
         static VkSurfaceFormatKHR selectBestFormatForColorSpace(

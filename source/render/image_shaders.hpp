@@ -104,18 +104,32 @@ namespace ifap::shaders
 
         // 0 = pass, 1 = sRGB, 2 = PQ, 3 = HLG, 4 = Adobe, 5 = BT.709, 6 = DCI P3,
         // 7 = ext-sRGB linear+sRGB RT, 8 = linear surface, 9 = Display P3 linear
-        // ITU-R BT.1886 reference (normalized): signal = L^(1/2.4)
-        inline constexpr const char* g_linear_to_bt1886 = R"(
-            vec3 linearToBt1886(vec3 linear)
+        // ITU-R BT.709 / SMPTE 170M OETF (Khronos TRANSFER_ITU, alpha=1.099 beta=0.018)
+        inline constexpr const char* g_linear_to_smpte170m = R"(
+            vec3 linearToSmpte170m(vec3 linear)
             {
-                return pow(max(linear, vec3(0.0)), vec3(1.0 / 2.4));
+                const float alpha = 1.099;
+                const float beta = 0.018;
+                vec3 x = max(linear, vec3(0.0));
+                vec3 lo = x * 4.5;
+                vec3 hi = alpha * pow(x, vec3(0.45)) - (alpha - 1.0);
+                return mix(lo, hi, step(vec3(beta), x));
             }
         )";
 
-        inline constexpr const char* g_linear_to_gamma22 = R"(
-            vec3 linearToGamma22(vec3 linear)
+        // Adobe RGB (1998) OETF: exponent 256/563 per Khronos TRANSFER_ADOBERGB
+        inline constexpr const char* g_linear_to_adobe_rgb = R"(
+            vec3 linearToAdobeRgb(vec3 linear)
             {
-                return pow(max(linear, vec3(0.0)), vec3(1.0 / 2.2));
+                return pow(max(linear, vec3(0.0)), vec3(256.0 / 563.0));
+            }
+        )";
+
+        // DCI-P3 nonlinear (VK_EXT_swapchain_colorspace): gamma 2.6 OETF
+        inline constexpr const char* g_linear_to_gamma26 = R"(
+            vec3 linearToGamma26(vec3 linear)
+            {
+                return pow(max(linear, vec3(0.0)), vec3(1.0 / 2.6));
             }
         )";
 
@@ -144,13 +158,15 @@ namespace ifap::shaders
             }
         )";
 
+        // BT.709 (D65) -> Adobe RGB 1998 (D65); mat3 columns = input channel coefficients
+        // (NOT the Adobe->XYZ matrix — inv(Adobe_to_XYZ) * BT709_to_XYZ)
         inline constexpr const char* g_bt709_to_adobe_rgb = R"(
             vec3 bt709ToAdobeRgb(vec3 linear)
             {
                 const mat3 m = mat3(
-                    vec3(0.5767309, 0.1855540, 0.1881852),
-                    vec3(0.2973769, 0.6273491, 0.0752741),
-                    vec3(0.0270343, 0.0706872, 0.9911085)
+                    vec3(0.7151626, 0.0000000, 0.0000000),
+                    vec3(0.2848372, 1.0000000, 0.0411705),
+                    vec3(0.0000000, 0.0000000, 0.9588295)
                 );
                 return m * linear;
             }
@@ -180,20 +196,26 @@ namespace ifap::shaders
                 }
                 else if (uOutputTransform > 5.5)
                 {
-                    color.rgb = linearToSrgb(color.rgb);
+                    // DCI-P3 primaries (same as Display P3) + gamma 2.6 OETF
+                    color.rgb = linearToGamma26(bt709ToDisplayP3(color.rgb));
                 }
                 else if (uOutputTransform > 4.5)
                 {
-                    color.rgb = linearToSrgb(color.rgb);
+                    // BT.709 primaries + SMPTE 170M / ITU OETF
+                    color.rgb = linearToSmpte170m(color.rgb);
                 }
                 else if (uOutputTransform > 3.5)
                 {
-                    color.rgb = linearToGamma22(bt709ToAdobeRgb(color.rgb));
+                    // Adobe RGB primaries + Adobe RGB OETF (256/563)
+                    color.rgb = linearToAdobeRgb(bt709ToAdobeRgb(color.rgb));
                 }
                 else if (uOutputTransform > 2.5)
                 {
+                    // BT.2020 primaries + HLG OETF; BT.2408 gain scaled to uSdrWhiteNits
+                    const float kBt2408HlgGain = 0.265;
+                    const float kBt2408HlgReferenceNits = 203.0;
                     vec3 linear = bt709ToBt2020(color.rgb);
-                    color.rgb = linearToHLG(linear * (uSdrWhiteNits / 100.0));
+                    color.rgb = linearToHLG(linear * kBt2408HlgGain * (uSdrWhiteNits / kBt2408HlgReferenceNits));
                 }
                 else if (uOutputTransform > 1.5)
                 {
@@ -312,7 +334,7 @@ namespace ifap::shaders
         )") + detail::g_resolve_push_constants + R"(
             #define uOutputTransform pc.uOutputTransform
             #define uSdrWhiteNits pc.uSdrWhiteNits
-        )" + detail::g_linear_to_srgb + detail::g_srgb_to_linear + detail::g_linear_to_bt1886 + detail::g_linear_to_gamma22 + detail::g_linear_to_pq + detail::g_linear_to_hlg + detail::g_bt709_to_display_p3 + detail::g_bt709_to_bt2020 + detail::g_bt709_to_adobe_rgb + detail::g_encode_output + detail::g_resolve_fragment_main;
+        )" + detail::g_linear_to_srgb + detail::g_srgb_to_linear + detail::g_linear_to_smpte170m + detail::g_linear_to_adobe_rgb + detail::g_linear_to_gamma26 + detail::g_linear_to_pq + detail::g_linear_to_hlg + detail::g_bt709_to_display_p3 + detail::g_bt709_to_bt2020 + detail::g_bt709_to_adobe_rgb + detail::g_encode_output + detail::g_resolve_fragment_main;
     }
 
 } // namespace ifap::shaders
