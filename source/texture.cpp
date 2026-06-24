@@ -470,7 +470,7 @@ namespace ifap
             return;
         }
 
-        const bool needs_create = !texture.handle;
+        const bool needs_create = !task.gpu_texture_ready;
         const u64 now = mango::Time::ms();
 
         if (!needs_create && now - task.last_preview_ms < 50)
