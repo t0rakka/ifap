@@ -15,6 +15,7 @@ namespace ifap
 
     static constexpr size_t texture_cache_size = 16;
     static constexpr size_t texture_prefetch_size = 4;
+
     static constexpr u64 repeat_treshold = 420;
     static constexpr u64 repeat_delay = 3;
 

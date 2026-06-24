@@ -48,7 +48,7 @@ namespace ifap
             }
 
             m_current_index = modulo(m_current_index + direction, count);
-            m_current_texture = m_texture_cache.getTexture(m_current_index);
+            m_current_task = m_texture_cache.getTexture(m_current_index);
 
             if (texture_prefetch_size > 0)
             {
@@ -76,8 +76,8 @@ namespace ifap
         window_size.y = std::max(1, window_size.y);
 
         int32x2 image_size;
-        image_size.x = std::max(1, m_current_texture.width);
-        image_size.y = std::max(1, m_current_texture.height);
+        image_size.x = std::max(1, m_current_task ? m_current_task->texture.width : 1);
+        image_size.y = std::max(1, m_current_task ? m_current_task->texture.height : 1);
 
         float32x2 aspect;
         aspect.x = float(window_size.x) / float(image_size.x);
@@ -125,10 +125,14 @@ namespace ifap
         float32x2 translate = m_translate + computeTranslate() / scale;
 
         ImageDrawRequest request;
-        request.texture = m_current_texture.handle;
-        request.width = m_current_texture.sample_width;
-        request.height = m_current_texture.sample_height;
-        request.linear = m_current_texture.linear;
+        if (m_current_task)
+        {
+            const GpuTexture& texture = m_current_task->texture;
+            request.texture = texture.handle;
+            request.width = texture.sample_width;
+            request.height = texture.sample_height;
+            request.linear = texture.linear;
+        }
         request.translate = translate;
         request.scale = scale;
         request.filter = m_texture_filter;
@@ -247,7 +251,7 @@ namespace ifap
         if (index != -1u)
         {
             m_current_index = index;
-            m_current_texture = m_texture_cache.getTexture(m_current_index);
+            m_current_task = m_texture_cache.getTexture(m_current_index);
             resetTransformation();
         }
     }
@@ -302,15 +306,15 @@ namespace ifap
         // Wait until the GPU is done sampling before uploading new texels.
         m_renderer.beginUploads();
         m_texture_cache.update();
-        if (!m_texture_cache.syncTexture(m_current_index, m_current_texture))
+        if (m_current_task)
         {
-            m_current_texture = {};
+            m_texture_cache.updateDecodeTask(*m_current_task);
         }
 
         const bool blend = !m_window.isKeyPressed(KEYCODE_B);
         m_renderer.beginFrame(0.06f, 0.06f, 0.06f, 1.0f, blend);
 
-        if (m_current_texture)
+        if (m_current_task && m_current_task->texture)
         {
             m_renderer.drawImage(makeDrawRequest());
         }

@@ -71,7 +71,7 @@ namespace ifap
         u64 m_left_time = 0;
         u64 m_right_time = 0;
 
-        GpuTexture m_current_texture;
+        std::shared_ptr<DecodeTask> m_current_task;
         size_t m_current_index = 0;
 
         void nextImage(int direction);

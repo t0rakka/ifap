@@ -231,14 +231,12 @@ namespace ifap
         return m_current_index;
     }
 
-    GpuTexture TextureCache::getTexture(size_t index)
+    std::shared_ptr<DecodeTask> TextureCache::getTexture(size_t index)
     {
         auto entry = m_cache.get(index);
         if (entry)
         {
-            // cache hit
-            const DecodeTask& task = *entry.value();
-            return task.texture;
+            return entry.value();
         }
         else
         {
@@ -272,7 +270,7 @@ namespace ifap
                 createPlaceholderTexture(*task, m_renderer, header.width, header.height);
 
                 m_cache.insert(index, task);
-                return task->texture;
+                return task;
             }
 
             GpuTexture& texture = task->texture;
@@ -358,68 +356,60 @@ namespace ifap
             }, *task->bitmap);
 
             m_cache.insert(index, task);
-            return task->texture;
+            return task;
         }
     }
 
-    bool TextureCache::syncTexture(size_t index, GpuTexture& texture)
+    void TextureCache::updateDecodeTask(DecodeTask& task)
     {
-        auto entry = m_cache.get(index);
-        if (!entry)
+        GpuTexture& texture = task.texture;
+
+        if (!task.bitmap)
         {
-            return false;
+            return;
         }
 
-        texture = entry.value()->texture;
-        return true;
+        const std::vector<ImageDecodeRect> updates = task.getUpdates();
+
+        if (task.downscale)
+        {
+            if (!updates.empty() || !texture.handle)
+            {
+                uploadDownscaledPreview(task);
+            }
+
+            return;
+        }
+
+        if (!texture.handle)
+        {
+            return;
+        }
+
+        for (auto rect : updates)
+        {
+            if (task.bitmap->width == rect.width)
+            {
+                u8* image = task.bitmap->address(rect.x, rect.y);
+                m_renderer.uploadTextureRegion(texture.handle, texture.format,
+                    rect.x, rect.y, rect.width, rect.height, image);
+            }
+            else
+            {
+                Surface source(*task.bitmap, rect.x, rect.y, rect.width, rect.height);
+                Bitmap temp(source);
+                m_renderer.uploadTextureRegion(texture.handle, texture.format,
+                    rect.x, rect.y, rect.width, rect.height, temp.image);
+            }
+        }
     }
 
     void TextureCache::update()
     {
-        for (auto& value : m_cache)
+        m_cache.for_each([this] (size_t /*index*/, std::shared_ptr<DecodeTask>& task_ptr)
         {
-            DecodeTask& task = *value.second;
-            GpuTexture& texture = task.texture;
-
-            if (!task.bitmap)
-            {
-                continue;
-            }
-
-            const std::vector<ImageDecodeRect> updates = task.getUpdates();
-
-            if (task.downscale)
-            {
-                if (!updates.empty() || !texture.handle)
-                {
-                    uploadDownscaledPreview(task);
-                }
-
-                continue;
-            }
-
-            if (!texture.handle)
-            {
-                continue;
-            }
-
-            for (auto rect : updates)
-            {
-                if (task.bitmap->width == rect.width)
-                {
-                    u8* image = task.bitmap->address(rect.x, rect.y);
-                    m_renderer.uploadTextureRegion(texture.handle, texture.format,
-                        rect.x, rect.y, rect.width, rect.height, image);
-                }
-                else
-                {
-                    Surface source(*task.bitmap, rect.x, rect.y, rect.width, rect.height);
-                    Bitmap temp(source);
-                    m_renderer.uploadTextureRegion(texture.handle, texture.format,
-                        rect.x, rect.y, rect.width, rect.height, temp.image);
-                }
-            }
-        }
+            updateDecodeTask(*task_ptr);
+        });
     }
 
 } // namespace ifap

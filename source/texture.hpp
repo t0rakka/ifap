@@ -45,7 +45,8 @@ namespace ifap
     protected:
         VKRenderer& m_renderer;
 
-        LRUCache<size_t, std::shared_ptr<DecodeTask>> m_cache { texture_cache_size };
+        //LRUCache<size_t, std::shared_ptr<DecodeTask>> m_cache { texture_cache_size };
+        ARCCache<size_t, std::shared_ptr<DecodeTask>> m_cache { texture_cache_size };
         ImageFileIndexer m_indexer;
 
         std::shared_ptr<Path> m_current_path;
@@ -57,8 +58,8 @@ namespace ifap
         operator const ImageFileIndexer& () const;
 
         size_t setCurrentPath(const std::string& name);
-        GpuTexture getTexture(size_t index);
-        bool syncTexture(size_t index, GpuTexture& texture);
+        std::shared_ptr<DecodeTask> getTexture(size_t index);
+        void updateDecodeTask(DecodeTask& task);
         void update();
 
     protected:
