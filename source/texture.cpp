@@ -38,9 +38,8 @@ namespace ifap
             texture.height = height;
             texture.sample_width = 1;
             texture.sample_height = 1;
-            texture.format = PixelFormat::RGBA8_UNORM;
-            texture.linear = true;
-            texture.handle = renderer.createTexture(1, 1, PixelFormat::RGBA8_UNORM, placeholder_pixel);
+            // format and linear come from selectPixelFormat() — do not clobber them here
+            texture.handle = renderer.createTexture(1, 1, texture.format, placeholder_pixel);
         }
 
         PixelFormat selectPixelFormat(const ImageHeader& header, bool& linear)
