@@ -31,8 +31,7 @@ namespace ifap
         void initialize();
         void resize(int width, int height);
 
-        void beginUploads();
-        void beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend);
+        bool beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend);
         void drawImage(const ImageDrawRequest& request);
         void endFrame();
 

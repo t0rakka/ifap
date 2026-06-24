@@ -583,9 +583,8 @@ namespace ifap
         ~Impl();
 
         void initialize();
-        void beginUploads();
         void resize(int width, int height);
-        void beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend);
+        bool beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend);
         void beginSwapchainRendering();
         void endSwapchainRendering();
         void drawImage(const ImageDrawRequest& request);
@@ -806,14 +805,6 @@ namespace ifap
     {
     }
 
-    void VKRenderer::Impl::beginUploads()
-    {
-        if (m_device != VK_NULL_HANDLE && m_graphicsQueue != VK_NULL_HANDLE)
-        {
-            vkQueueWaitIdle(m_graphicsQueue);
-        }
-    }
-
     int VKRenderer::Impl::getMaxTextureDimension() const
     {
         return m_max_texture_dimension;
@@ -1029,11 +1020,6 @@ namespace ifap
         }
 
         waitForUpload(texture);
-
-        if (texture.layout_ready)
-        {
-            vkQueueWaitIdle(m_graphicsQueue);
-        }
 
         if (x < 0 || y < 0 ||
             x + width > texture.width ||
@@ -1394,8 +1380,15 @@ namespace ifap
     {
         vkDeviceWaitIdle(m_device);
 
+        if (!m_commandBuffers.empty())
+        {
+            vkFreeCommandBuffers(m_device, m_graphicsCommandPool, u32(m_commandBuffers.size()), m_commandBuffers.data());
+            m_commandBuffers.clear();
+        }
+
         destroyPipelines();
         createProcessingTarget();
+        createCommandBuffers();
         createPipelines();
     }
 
@@ -1629,8 +1622,10 @@ namespace ifap
         return bicubic ? m_pipelineBicubicNoBlend : m_pipelineBilinearNoBlend;
     }
 
-    void VKRenderer::Impl::beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend)
+    bool VKRenderer::Impl::beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend)
     {
+        updateSwapchain();
+
         m_clear_color[0] = clear_r;
         m_clear_color[1] = clear_g;
         m_clear_color[2] = clear_b;
@@ -1643,6 +1638,7 @@ namespace ifap
 
         m_frame = m_swapchain->beginFrame();
         m_frame_active = bool(m_frame);
+        return m_frame_active;
     }
 
     void VKRenderer::Impl::beginCommandBufferRecording()
@@ -1936,9 +1932,20 @@ namespace ifap
             endProcessingRendering();
             recordResolve();
         }
-        else if (!m_rendering_active)
+        else
         {
-            beginSwapchainRendering();
+            // Scene-linear clear must go through the resolve pass so empty-window
+            // background matches the encoded grey used when an image is shown.
+            beginProcessingRendering();
+            if (m_processing_rendering_active)
+            {
+                endProcessingRendering();
+                recordResolve();
+            }
+            else if (!m_rendering_active)
+            {
+                beginSwapchainRendering();
+            }
         }
 
         if (!m_rendering_active)
@@ -1968,8 +1975,7 @@ namespace ifap
 
     void VKRenderer::initialize() { m_impl->initialize(); }
     void VKRenderer::resize(int width, int height) { m_impl->resize(width, height); }
-    void VKRenderer::beginUploads() { m_impl->beginUploads(); }
-    void VKRenderer::beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend) { m_impl->beginFrame(clear_r, clear_g, clear_b, clear_a, blend); }
+    bool VKRenderer::beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend) { return m_impl->beginFrame(clear_r, clear_g, clear_b, clear_a, blend); }
     void VKRenderer::drawImage(const ImageDrawRequest& request) { m_impl->drawImage(request); }
     void VKRenderer::endFrame() { m_impl->endFrame(); }
     int VKRenderer::getMaxTextureDimension() const { return m_impl->getMaxTextureDimension(); }

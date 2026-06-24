@@ -303,18 +303,19 @@ namespace ifap
             }
         }
 
-        // Wait until the GPU is done sampling before uploading new texels.
-        m_renderer.beginUploads();
+        // Acquire first: swapchain waits the in-flight frame fence, then uploads
+        // queue on the graphics queue before this frame's draw (submission order
+        // serializes with the previous frame's render).
+        const bool blend = !m_window.isKeyPressed(KEYCODE_B);
+        const bool frame_active = m_renderer.beginFrame(0.06f, 0.06f, 0.06f, 1.0f, blend);
+
         m_texture_cache.update();
         if (m_current_task)
         {
             m_texture_cache.updateDecodeTask(*m_current_task);
         }
 
-        const bool blend = !m_window.isKeyPressed(KEYCODE_B);
-        m_renderer.beginFrame(0.06f, 0.06f, 0.06f, 1.0f, blend);
-
-        if (m_current_task && m_current_task->texture)
+        if (frame_active && m_current_task && m_current_task->texture)
         {
             m_renderer.drawImage(makeDrawRequest());
         }
