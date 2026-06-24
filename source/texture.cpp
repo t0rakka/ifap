@@ -124,15 +124,20 @@ namespace ifap
     // TextureCache
     // -----------------------------------------------------------------------
 
-    TextureCache::TextureCache(VKRenderer& renderer, std::function<void()> on_content_changed)
+    TextureCache::TextureCache(VKRenderer& renderer,
+                               std::function<void()> on_content_changed,
+                               std::function<bool()> should_abort)
         : m_renderer(renderer)
         , m_on_content_changed(std::move(on_content_changed))
+        , m_should_abort(std::move(should_abort))
     {
         m_worker = std::thread([this] { workerThreadMain(); });
     }
 
     TextureCache::~TextureCache()
     {
+        shutdown();
+
         m_cache.clear();
 
         {
@@ -155,6 +160,56 @@ namespace ifap
     TextureCache::operator const ImageFileIndexer& () const
     {
         return m_indexer;
+    }
+
+    void TextureCache::shutdown()
+    {
+        if (m_shutdown.exchange(true))
+        {
+            return;
+        }
+
+        m_indexer.stop();
+
+        m_cache.for_each([] (size_t /*index*/, std::shared_ptr<DecodeTask>& task)
+        {
+            if (task && task->decoder)
+            {
+                task->decoder->cancel();
+            }
+        });
+
+        std::deque<TextureHandle> pending_destroy;
+
+        {
+            std::lock_guard lock(m_worker_mutex);
+
+            while (!m_worker_jobs.empty())
+            {
+                WorkerJob job = std::move(m_worker_jobs.front());
+                m_worker_jobs.pop_front();
+
+                if (job.type == WorkerJob::Type::Prepare && job.task && job.task->decoder)
+                {
+                    job.task->decoder->cancel();
+                }
+                else if (job.type == WorkerJob::Type::Dispose && job.gpu_handle)
+                {
+                    pending_destroy.push_back(job.gpu_handle);
+                }
+            }
+        }
+
+        if (!pending_destroy.empty())
+        {
+            std::lock_guard lock(m_gpu_destroy_mutex);
+            for (TextureHandle handle : pending_destroy)
+            {
+                m_gpu_destroy_queue.push_back(handle);
+            }
+        }
+
+        m_worker_cv.notify_all();
     }
 
     std::shared_ptr<DecodeTask> TextureCache::makeTask()
@@ -214,6 +269,16 @@ namespace ifap
                 m_worker_jobs.pop_front();
             }
 
+            if (m_shutdown)
+            {
+                if (job.type == WorkerJob::Type::Dispose)
+                {
+                    runDispose(std::move(job));
+                }
+
+                continue;
+            }
+
             switch (job.type)
             {
                 case WorkerJob::Type::Prepare:
@@ -229,7 +294,7 @@ namespace ifap
 
     void TextureCache::runPrepare(const std::shared_ptr<DecodeTask>& task)
     {
-        if (!task || !task->decoder)
+        if (!task || !task->decoder || m_shutdown || (m_should_abort && m_should_abort()))
         {
             return;
         }
@@ -247,6 +312,11 @@ namespace ifap
 
             task->future = task->decoder->launch([this, task = task.get()] (const ImageDecodeRect& rect)
             {
+                if (m_shutdown || (m_should_abort && m_should_abort()))
+                {
+                    return;
+                }
+
                 {
                     std::lock_guard lock(task->mutex);
                     task->updates.push_back(rect);
@@ -258,6 +328,12 @@ namespace ifap
                     m_on_content_changed();
                 }
             }, *task->bitmap);
+
+            if (m_shutdown || (m_should_abort && m_should_abort()))
+            {
+                task->decoder->cancel();
+                return;
+            }
 
             task->prepare_state = PrepareState::Ready;
 
@@ -359,7 +435,8 @@ namespace ifap
 
     void TextureCache::tickPrefetch(size_t priority_index)
     {
-        if (!m_prefetch_direction || texture_prefetch_size == 0)
+        if (m_shutdown || (m_should_abort && m_should_abort()) ||
+            !m_prefetch_direction || texture_prefetch_size == 0)
         {
             return;
         }
@@ -476,6 +553,11 @@ namespace ifap
 
                 while (!done)
                 {
+                    if (m_should_abort && m_should_abort())
+                    {
+                        return -1u;
+                    }
+
                     if (m_indexer.size() > 0)
                     {
                         return 0;
@@ -503,6 +585,11 @@ namespace ifap
 
                 while (!done)
                 {
+                    if (m_should_abort && m_should_abort())
+                    {
+                        return -1u;
+                    }
+
                     for ( ; position < m_indexer.size(); ++position)
                     {
                         if (m_indexer[position] == filename)
@@ -680,6 +767,11 @@ namespace ifap
 
     bool TextureCache::update(size_t priority_index)
     {
+        if (m_shutdown || (m_should_abort && m_should_abort()))
+        {
+            return false;
+        }
+
         bool progress = false;
 
         drainGpuDestroys(2);

@@ -66,6 +66,9 @@ namespace ifap
     protected:
         VKRenderer& m_renderer;
         std::function<void()> m_on_content_changed;
+        std::function<bool()> m_should_abort;
+
+        std::atomic<bool> m_shutdown { false };
 
         ARCCache<size_t, std::shared_ptr<DecodeTask>> m_cache { texture_cache_size };
         ImageFileIndexer m_indexer;
@@ -108,8 +111,12 @@ namespace ifap
         void tickPrefetch(size_t priority_index);
 
     public:
-        explicit TextureCache(VKRenderer& renderer, std::function<void()> on_content_changed = {});
+        explicit TextureCache(VKRenderer& renderer,
+                              std::function<void()> on_content_changed = {},
+                              std::function<bool()> should_abort = {});
         ~TextureCache();
+
+        void shutdown();
 
         operator const ImageFileIndexer& () const;
 

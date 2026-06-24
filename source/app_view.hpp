@@ -74,6 +74,9 @@ namespace ifap
         std::shared_ptr<DecodeTask> m_current_task;
         size_t m_current_index = 0;
 
+        bool m_loop_active = false;
+        bool m_shutdown = false;
+
         void nextImage(int direction);
         void resetTransformation();
 
@@ -85,6 +88,8 @@ namespace ifap
 
         void requestRedraw();
         bool needsContinuousUpdate() const;
+        bool isExitRequested() const;
+        void shutdown();
 
     public:
         AppView(Window& window, VKRenderer& renderer);

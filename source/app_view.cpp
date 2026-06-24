@@ -14,13 +14,32 @@ namespace ifap
     AppView::AppView(Window& window, VKRenderer& renderer)
         : m_window(window)
         , m_renderer(renderer)
-        , m_texture_cache(renderer, [this] { requestRedraw(); })
+        , m_texture_cache(renderer,
+            [this] { requestRedraw(); },
+            [this] { return isExitRequested(); })
     {
         resetTransformation();
     }
 
     AppView::~AppView()
     {
+        shutdown();
+    }
+
+    bool AppView::isExitRequested() const
+    {
+        return m_shutdown || (m_loop_active && !m_window.isRunning());
+    }
+
+    void AppView::shutdown()
+    {
+        if (m_shutdown)
+        {
+            return;
+        }
+
+        m_shutdown = true;
+        m_texture_cache.shutdown();
     }
 
     void AppView::startup(const CommandLine& commands)
@@ -136,15 +155,26 @@ namespace ifap
 
     void AppView::onClose()
     {
+        shutdown();
     }
 
     void AppView::requestRedraw()
     {
+        if (isExitRequested())
+        {
+            return;
+        }
+
         m_window.invalidate();
     }
 
     bool AppView::needsContinuousUpdate() const
     {
+        if (isExitRequested())
+        {
+            return false;
+        }
+
         if (m_mouse_translate.enable || m_mouse_scale.enable)
         {
             return true;
@@ -248,7 +278,8 @@ namespace ifap
         switch (code)
         {
             case KEYCODE_ESC:
-                m_window.breakEventLoop();
+                shutdown();
+                m_window.requestQuit();
                 break;
 
             case KEYCODE_F:
@@ -314,6 +345,14 @@ namespace ifap
     void AppView::onFrame(const FrameInfo& info)
     {
         MANGO_UNREFERENCED(info);
+
+        m_loop_active = true;
+
+        if (!m_window.isRunning())
+        {
+            shutdown();
+            return;
+        }
 
         const ImageFileIndexer& indexer = m_texture_cache;
 
