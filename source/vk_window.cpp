@@ -38,9 +38,8 @@ namespace ifap
         void onMouseClick(int x, int y, MouseButton button, int count) override { m_app.onMouseClick(x, y, button, count); }
         void onKeyPress(Keycode code, u32 mask) override { m_app.onKeyPress(code, mask); }
         void onDropFiles(const FileIndex& index) override { m_app.onDropFiles(index); }
-        void onIdle() override { m_app.onIdle(); }
         void onResize(int width, int height) override { m_app.onResize(width, height); }
-        void onDraw() override { m_app.onDraw(); }
+        void onFrame(const FrameInfo& info) override { m_app.onFrame(info); }
     };
 
     static Instance createVulkanInstance()
@@ -75,7 +74,12 @@ namespace ifap
         Instance instance = createVulkanInstance();
         VKAppWindow window(instance, commands);
         window.setTitle("iFap Image Viewer");
-        window.enterEventLoop();
+
+        EventLoopConfig config;
+        config.mode = FrameMode::OnDemand;
+        config.waitForFrame = true;
+
+        window.enterEventLoop(config);
     }
 
 } // namespace ifap

@@ -83,6 +83,9 @@ namespace ifap
 
         ImageDrawRequest makeDrawRequest() const;
 
+        void requestRedraw();
+        bool needsContinuousUpdate() const;
+
     public:
         AppView(Window& window, VKRenderer& renderer);
         ~AppView();
@@ -94,9 +97,8 @@ namespace ifap
         void onMouseClick(int x, int y, MouseButton button, int count);
         void onKeyPress(Keycode code, u32 mask);
         void onDropFiles(const FileIndex& index);
-        void onIdle();
         void onResize(int width, int height);
-        void onDraw();
+        void onFrame(const FrameInfo& info);
     };
 
 } // namespace ifap

@@ -4,6 +4,8 @@
 */
 #include "app_view.hpp"
 
+#include <chrono>
+#include <future>
 #include <string>
 
 namespace ifap
@@ -12,7 +14,7 @@ namespace ifap
     AppView::AppView(Window& window, VKRenderer& renderer)
         : m_window(window)
         , m_renderer(renderer)
-        , m_texture_cache(renderer)
+        , m_texture_cache(renderer, [this] { requestRedraw(); })
     {
         resetTransformation();
     }
@@ -136,10 +138,55 @@ namespace ifap
     {
     }
 
+    void AppView::requestRedraw()
+    {
+        m_window.invalidate();
+    }
+
+    bool AppView::needsContinuousUpdate() const
+    {
+        if (m_mouse_translate.enable || m_mouse_scale.enable)
+        {
+            return true;
+        }
+
+        if (m_window.isKeyPressed(KEYCODE_LEFT) || m_window.isKeyPressed(KEYCODE_Q) ||
+            m_window.isKeyPressed(KEYCODE_RIGHT) || m_window.isKeyPressed(KEYCODE_W))
+        {
+            return true;
+        }
+
+        if (m_current_task)
+        {
+            if (m_current_task->prepare_state != PrepareState::Ready)
+            {
+                return true;
+            }
+
+            if (!m_current_task->gpu_texture_ready || m_current_task->hasPendingUpdates())
+            {
+                return true;
+            }
+
+            if (m_current_task->future.valid() &&
+                m_current_task->future.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     void AppView::onMouseMove(int x, int y)
     {
         m_mouse_translate.update(x, y);
         m_mouse_scale.update(x, y);
+
+        if (m_mouse_translate.enable || m_mouse_scale.enable)
+        {
+            requestRedraw();
+        }
     }
 
     void AppView::onMouseClick(int x, int y, MouseButton button, int count)
@@ -152,10 +199,12 @@ namespace ifap
                 case 0:
                     m_translate += computeTranslate() / (computeAspect() * computeScale());
                     m_mouse_translate.end();
+                    requestRedraw();
                     break;
 
                 case 1:
                     m_mouse_translate.begin(x, y);
+                    requestRedraw();
                     break;
 
                 case 2:
@@ -171,17 +220,20 @@ namespace ifap
                 if (count)
                 {
                     m_mouse_scale.begin(x, y);
+                    requestRedraw();
                 }
                 else
                 {
                     m_scale = computeScale();
                     m_mouse_scale.end();
+                    requestRedraw();
                 }
                 break;
 
             case MOUSEBUTTON_WHEEL:
                 m_scale += count / 120.0f * m_scale / 6.0f;
                 m_scale = std::max(0.3f, m_scale);
+                requestRedraw();
                 break;
 
             default:
@@ -207,22 +259,27 @@ namespace ifap
             case KEYCODE_LEFT:
                 m_left_time = mango::Time::ms();
                 nextImage(-1);
+                requestRedraw();
                 break;
 
             case KEYCODE_W:
             case KEYCODE_RIGHT:
                 m_right_time = mango::Time::ms();
                 nextImage(1);
+                requestRedraw();
                 break;
 
             case KEYCODE_1:
                 m_texture_filter = TextureFilter::NEAREST;
+                requestRedraw();
                 break;
             case KEYCODE_2:
                 m_texture_filter = TextureFilter::BILINEAR;
+                requestRedraw();
                 break;
             case KEYCODE_3:
                 m_texture_filter = TextureFilter::BICUBIC;
+                requestRedraw();
                 break;
 
             default:
@@ -245,11 +302,19 @@ namespace ifap
             m_current_index = index;
             m_current_task = m_texture_cache.getTexture(m_current_index);
             resetTransformation();
+            requestRedraw();
         }
     }
 
-    void AppView::onIdle()
+    void AppView::onResize(int width, int height)
     {
+        m_renderer.resize(width, height);
+    }
+
+    void AppView::onFrame(const FrameInfo& info)
+    {
+        MANGO_UNREFERENCED(info);
+
         const ImageFileIndexer& indexer = m_texture_cache;
 
         if (indexer.size() > 0)
@@ -264,17 +329,6 @@ namespace ifap
             m_window.setTitle("iFap Image Viewer");
         }
 
-        onDraw();
-        std::this_thread::sleep_for(std::chrono::milliseconds(4));
-    }
-
-    void AppView::onResize(int width, int height)
-    {
-        m_renderer.resize(width, height);
-    }
-
-    void AppView::onDraw()
-    {
         u64 current_time = mango::Time::ms();
 
         if (m_window.isKeyPressed(KEYCODE_LEFT) || m_window.isKeyPressed(KEYCODE_Q))
@@ -297,7 +351,7 @@ namespace ifap
 
         // Input and texture work before swapchain acquire so event handling stays
         // responsive even when the GPU is busy decoding/uploading.
-        m_texture_cache.update(m_current_index);
+        const bool texture_progress = m_texture_cache.update(m_current_index);
 
         const bool blend = !m_window.isKeyPressed(KEYCODE_B);
         const bool frame_active = m_renderer.beginFrame(0.06f, 0.06f, 0.06f, 1.0f, blend);
@@ -308,6 +362,11 @@ namespace ifap
         }
 
         m_renderer.endFrame();
+
+        if (texture_progress || needsContinuousUpdate())
+        {
+            requestRedraw();
+        }
     }
 
 } // namespace ifap

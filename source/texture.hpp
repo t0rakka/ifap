@@ -11,6 +11,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <thread>
 
@@ -64,6 +65,7 @@ namespace ifap
     {
     protected:
         VKRenderer& m_renderer;
+        std::function<void()> m_on_content_changed;
 
         ARCCache<size_t, std::shared_ptr<DecodeTask>> m_cache { texture_cache_size };
         ImageFileIndexer m_indexer;
@@ -106,7 +108,7 @@ namespace ifap
         void tickPrefetch(size_t priority_index);
 
     public:
-        explicit TextureCache(VKRenderer& renderer);
+        explicit TextureCache(VKRenderer& renderer, std::function<void()> on_content_changed = {});
         ~TextureCache();
 
         operator const ImageFileIndexer& () const;
@@ -115,7 +117,7 @@ namespace ifap
         std::shared_ptr<DecodeTask> getTexture(size_t index);
         void setPrefetchDirection(int direction);
         bool updateDecodeTask(DecodeTask& task);
-        void update(size_t priority_index);
+        bool update(size_t priority_index);
 
     protected:
         void uploadDownscaledPreview(DecodeTask& task);

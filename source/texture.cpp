@@ -124,8 +124,9 @@ namespace ifap
     // TextureCache
     // -----------------------------------------------------------------------
 
-    TextureCache::TextureCache(VKRenderer& renderer)
+    TextureCache::TextureCache(VKRenderer& renderer, std::function<void()> on_content_changed)
         : m_renderer(renderer)
+        , m_on_content_changed(std::move(on_content_changed))
     {
         m_worker = std::thread([this] { workerThreadMain(); });
     }
@@ -244,14 +245,26 @@ namespace ifap
             task->bitmap = std::make_unique<Bitmap>(
                 task->texture.width, task->texture.height, task->bitmap_format);
 
-            task->future = task->decoder->launch([task = task.get()] (const ImageDecodeRect& rect)
+            task->future = task->decoder->launch([this, task = task.get()] (const ImageDecodeRect& rect)
             {
-                std::lock_guard lock(task->mutex);
-                task->updates.push_back(rect);
-                task->progress += rect.progress;
+                {
+                    std::lock_guard lock(task->mutex);
+                    task->updates.push_back(rect);
+                    task->progress += rect.progress;
+                }
+
+                if (m_on_content_changed)
+                {
+                    m_on_content_changed();
+                }
             }, *task->bitmap);
 
             task->prepare_state = PrepareState::Ready;
+
+            if (m_on_content_changed)
+            {
+                m_on_content_changed();
+            }
         }
         catch (...)
         {
@@ -665,26 +678,34 @@ namespace ifap
         return submitted > 0;
     }
 
-    void TextureCache::update(size_t priority_index)
+    bool TextureCache::update(size_t priority_index)
     {
+        bool progress = false;
+
         drainGpuDestroys(2);
         tickPrefetch(priority_index);
 
         static constexpr int kBackgroundUploadBudget = 1;
 
-        m_cache.for_each([this] (size_t /*index*/, std::shared_ptr<DecodeTask>& task_ptr)
+        m_cache.for_each([this, &progress] (size_t /*index*/, std::shared_ptr<DecodeTask>& task_ptr)
         {
-            finishGpuSetup(*task_ptr);
+            if (finishGpuSetup(*task_ptr))
+            {
+                progress = true;
+            }
         });
 
         if (auto entry = m_cache.get(priority_index))
         {
-            updateDecodeTask(*entry.value());
+            if (updateDecodeTask(*entry.value()))
+            {
+                progress = true;
+            }
         }
 
         int budget = kBackgroundUploadBudget;
 
-        m_cache.for_each([this, priority_index, &budget] (size_t index, std::shared_ptr<DecodeTask>& task_ptr)
+        m_cache.for_each([this, priority_index, &budget, &progress] (size_t index, std::shared_ptr<DecodeTask>& task_ptr)
         {
             if (index == priority_index || budget <= 0)
             {
@@ -698,9 +719,12 @@ namespace ifap
 
             if (updateDecodeTask(*task_ptr))
             {
+                progress = true;
                 --budget;
             }
         });
+
+        return progress;
     }
 
 } // namespace ifap
