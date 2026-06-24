@@ -48,16 +48,8 @@ namespace ifap
             }
 
             m_current_index = modulo(m_current_index + direction, count);
+            m_texture_cache.setPrefetchDirection(direction);
             m_current_task = m_texture_cache.getTexture(m_current_index);
-
-            if (texture_prefetch_size > 0)
-            {
-                for (size_t i = 0; i < texture_prefetch_size; ++i)
-                {
-                    size_t index = modulo(m_current_index + (i + 1) * direction, count);
-                    m_texture_cache.getTexture(index);
-                }
-            }
 
             resetTransformation();
         }
@@ -303,17 +295,12 @@ namespace ifap
             }
         }
 
-        // Acquire first: swapchain waits the in-flight frame fence, then uploads
-        // queue on the graphics queue before this frame's draw (submission order
-        // serializes with the previous frame's render).
+        // Input and texture work before swapchain acquire so event handling stays
+        // responsive even when the GPU is busy decoding/uploading.
+        m_texture_cache.update(m_current_index);
+
         const bool blend = !m_window.isKeyPressed(KEYCODE_B);
         const bool frame_active = m_renderer.beginFrame(0.06f, 0.06f, 0.06f, 1.0f, blend);
-
-        m_texture_cache.update();
-        if (m_current_task)
-        {
-            m_texture_cache.updateDecodeTask(*m_current_task);
-        }
 
         if (frame_active && m_current_task && m_current_task->texture)
         {

@@ -57,4 +57,13 @@ namespace ifap
         TextureFilter filter = TextureFilter::BILINEAR;
     };
 
+    struct TextureRegionUpload
+    {
+        int x = 0;
+        int y = 0;
+        int width = 0;
+        int height = 0;
+        const void* pixels = nullptr;
+    };
+
 } // namespace ifap

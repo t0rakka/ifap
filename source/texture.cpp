@@ -7,6 +7,7 @@
 #include <mango/image/bicubic.hpp>
 
 #include <algorithm>
+#include <memory>
 
 namespace ifap
 {
@@ -42,6 +43,45 @@ namespace ifap
             texture.handle = renderer.createTexture(1, 1, PixelFormat::RGBA8_UNORM, placeholder_pixel);
         }
 
+        PixelFormat selectPixelFormat(const ImageHeader& header, bool& linear)
+        {
+            if (header.format.isFloat())
+            {
+                linear = true;
+
+                if (header.format.bits <= 64)
+                {
+                    return PixelFormat::RGBA16F;
+                }
+
+                return PixelFormat::RGBA32F;
+            }
+
+            linear = header.linear;
+
+            if (header.linear)
+            {
+                return PixelFormat::RGBA8_UNORM;
+            }
+
+            return PixelFormat::RGBA8_SRGB;
+        }
+
+        Format selectBitmapFormat(const ImageHeader& header)
+        {
+            if (header.format.isFloat())
+            {
+                if (header.format.bits <= 64)
+                {
+                    return Format(64, Format::FLOAT16, Format::RGBA, 16, 16, 16, 16);
+                }
+
+                return Format(128, Format::FLOAT32, Format::RGBA, 32, 32, 32, 32);
+            }
+
+            return Format(32, Format::UNORM, Format::RGBA, 8, 8, 8, 8);
+        }
+
     } // namespace
 
     // -----------------------------------------------------------------------
@@ -60,15 +100,16 @@ namespace ifap
             decoder->cancel();
         }
 
-        if (future.valid())
-        {
-            future.get();
-        }
-
         if (texture.handle)
         {
             renderer.destroyTexture(texture.handle);
         }
+    }
+
+    bool DecodeTask::hasPendingUpdates() const
+    {
+        std::lock_guard lock(mutex);
+        return !updates.empty();
     }
 
     std::vector<ImageDecodeRect> DecodeTask::getUpdates()
@@ -86,15 +127,248 @@ namespace ifap
     TextureCache::TextureCache(VKRenderer& renderer)
         : m_renderer(renderer)
     {
+        m_worker = std::thread([this] { workerThreadMain(); });
     }
 
     TextureCache::~TextureCache()
     {
+        m_cache.clear();
+
+        {
+            std::lock_guard lock(m_worker_mutex);
+            m_worker_running = false;
+        }
+
+        m_worker_cv.notify_all();
+        m_worker.join();
+
+        drainGpuDestroys(1024);
+
+        while (!m_gpu_destroy_queue.empty())
+        {
+            m_renderer.destroyTexture(m_gpu_destroy_queue.front());
+            m_gpu_destroy_queue.pop_front();
+        }
     }
 
     TextureCache::operator const ImageFileIndexer& () const
     {
         return m_indexer;
+    }
+
+    std::shared_ptr<DecodeTask> TextureCache::makeTask()
+    {
+        return std::shared_ptr<DecodeTask>(new DecodeTask(m_renderer),
+            [this] (DecodeTask* task)
+            {
+                deferDispose(task);
+            });
+    }
+
+    void TextureCache::deferDispose(DecodeTask* raw_task)
+    {
+        if (!raw_task)
+        {
+            return;
+        }
+
+        WorkerJob job;
+        job.type = WorkerJob::Type::Dispose;
+        job.gpu_handle = raw_task->texture.handle;
+        raw_task->texture.handle = 0;
+        job.task = std::shared_ptr<DecodeTask>(raw_task, [](DecodeTask*) {});
+        enqueueWorker(std::move(job));
+    }
+
+    void TextureCache::enqueueWorker(WorkerJob job)
+    {
+        {
+            std::lock_guard lock(m_worker_mutex);
+            m_worker_jobs.push_back(std::move(job));
+        }
+
+        m_worker_cv.notify_one();
+    }
+
+    void TextureCache::workerThreadMain()
+    {
+        for (;;)
+        {
+            WorkerJob job;
+
+            {
+                std::unique_lock lock(m_worker_mutex);
+
+                m_worker_cv.wait(lock, [this]
+                {
+                    return !m_worker_running || !m_worker_jobs.empty();
+                });
+
+                if (!m_worker_running && m_worker_jobs.empty())
+                {
+                    return;
+                }
+
+                job = std::move(m_worker_jobs.front());
+                m_worker_jobs.pop_front();
+            }
+
+            switch (job.type)
+            {
+                case WorkerJob::Type::Prepare:
+                    runPrepare(job.task);
+                    break;
+
+                case WorkerJob::Type::Dispose:
+                    runDispose(std::move(job));
+                    break;
+            }
+        }
+    }
+
+    void TextureCache::runPrepare(const std::shared_ptr<DecodeTask>& task)
+    {
+        if (!task || !task->decoder)
+        {
+            return;
+        }
+
+        try
+        {
+            if (task->downscale)
+            {
+                task->scaled_bitmap = std::make_unique<Bitmap>(
+                    task->downscale_width, task->downscale_height, task->bitmap_format);
+            }
+
+            task->bitmap = std::make_unique<Bitmap>(
+                task->texture.width, task->texture.height, task->bitmap_format);
+
+            task->future = task->decoder->launch([task = task.get()] (const ImageDecodeRect& rect)
+            {
+                std::lock_guard lock(task->mutex);
+                task->updates.push_back(rect);
+                task->progress += rect.progress;
+            }, *task->bitmap);
+
+            task->prepare_state = PrepareState::Ready;
+        }
+        catch (...)
+        {
+            task->prepare_state = PrepareState::Failed;
+        }
+    }
+
+    void TextureCache::runDispose(WorkerJob job)
+    {
+        DecodeTask* raw = job.task.get();
+
+        if (raw)
+        {
+            if (raw->decoder)
+            {
+                raw->decoder->cancel();
+            }
+
+            raw->future = ImageDecodeFuture();
+            raw->bitmap.reset();
+            raw->scaled_bitmap.reset();
+            raw->decoder.reset();
+            raw->file.reset();
+        }
+
+        job.task.reset();
+        delete raw;
+
+        if (job.gpu_handle)
+        {
+            std::lock_guard lock(m_gpu_destroy_mutex);
+            m_gpu_destroy_queue.push_back(job.gpu_handle);
+        }
+    }
+
+    void TextureCache::drainGpuDestroys(int budget)
+    {
+        while (budget-- > 0)
+        {
+            TextureHandle handle = 0;
+
+            {
+                std::lock_guard lock(m_gpu_destroy_mutex);
+                if (m_gpu_destroy_queue.empty())
+                {
+                    return;
+                }
+
+                handle = m_gpu_destroy_queue.front();
+                m_gpu_destroy_queue.pop_front();
+            }
+
+            m_renderer.destroyTexture(handle);
+        }
+    }
+
+    bool TextureCache::finishGpuSetup(DecodeTask& task)
+    {
+        if (task.gpu_texture_ready || task.downscale)
+        {
+            return false;
+        }
+
+        if (task.prepare_state != PrepareState::Ready || !task.bitmap)
+        {
+            return false;
+        }
+
+        TextureHandle placeholder = task.texture.handle;
+        task.texture.handle = 0;
+
+        task.texture.handle = m_renderer.createTexture(
+            task.texture.width, task.texture.height, task.texture.format, nullptr);
+
+        task.texture.sample_width = task.texture.width;
+        task.texture.sample_height = task.texture.height;
+        task.gpu_texture_ready = true;
+
+        if (placeholder)
+        {
+            std::lock_guard lock(m_gpu_destroy_mutex);
+            m_gpu_destroy_queue.push_back(placeholder);
+        }
+
+        return true;
+    }
+
+    void TextureCache::setPrefetchDirection(int direction)
+    {
+        m_prefetch_direction = direction;
+    }
+
+    void TextureCache::tickPrefetch(size_t priority_index)
+    {
+        if (!m_prefetch_direction || texture_prefetch_size == 0)
+        {
+            return;
+        }
+
+        const size_t count = m_indexer.size();
+        if (!count)
+        {
+            return;
+        }
+
+        for (size_t i = 0; i < texture_prefetch_size; ++i)
+        {
+            const size_t index = modulo(priority_index + (i + 1) * size_t(m_prefetch_direction), count);
+
+            if (m_cache.get(index))
+            {
+                continue;
+            }
+
+            getTexture(index);
+            return;
+        }
     }
 
     void TextureCache::uploadDownscaledPreview(DecodeTask& task)
@@ -106,15 +380,34 @@ namespace ifap
             return;
         }
 
+        const bool needs_create = !texture.handle;
+        const u64 now = mango::Time::ms();
+
+        if (!needs_create && now - task.last_preview_ms < 50)
+        {
+            return;
+        }
+
+        task.last_preview_ms = now;
+
         const int dw = task.downscale_width;
         const int dh = task.downscale_height;
 
         u32_bicubic_blit(*task.scaled_bitmap, *task.bitmap,
             0.5f, 0.5f, float(dw) - 1.0f, float(dh) - 1.0f);
 
-        if (!texture.handle)
+        if (needs_create)
         {
+            TextureHandle placeholder = texture.handle;
             texture.handle = m_renderer.createTexture(dw, dh, texture.format, task.scaled_bitmap->image);
+            task.gpu_texture_ready = true;
+
+            if (placeholder)
+            {
+                std::lock_guard lock(m_gpu_destroy_mutex);
+                m_gpu_destroy_queue.push_back(placeholder);
+            }
+
             return;
         }
 
@@ -133,7 +426,6 @@ namespace ifap
         {
             if (Mapper::isCustomMapper(filename))
             {
-                // the object was container file
                 std::string pathname = filename + "/";
                 m_current_path = std::make_shared<Path>(pathname);
                 m_indexer.start(pathname);
@@ -141,10 +433,8 @@ namespace ifap
             }
             else
             {
-                // the object was a regular file
                 if (!mango::image::isImageDecoder(filename))
                 {
-                    // not supported fileformat
                     return -1u;
                 }
 
@@ -175,19 +465,15 @@ namespace ifap
                 {
                     if (m_indexer.size() > 0)
                     {
-                        // found a file in the path; that's the chosen one
                         return 0;
                     }
 
                     mango::Sleep::ms(50);
 
-                    // this way we run extra iteration after the indexer is not running
-                    // to get any last-moment writes the indexer might have done
                     done = last;
                     last = !m_indexer.isRunning();
                 }
 
-                // no files in current path
                 return -1u;
             };
 
@@ -208,20 +494,16 @@ namespace ifap
                     {
                         if (m_indexer[position] == filename)
                         {
-                            // found a file with matching name in current path
                             return position;
                         }
                     }
 
                     mango::Sleep::ms(5);
 
-                    // this way we run extra iteration after the indexer is not running
-                    // to get any last-moment writes the indexer might have done
                     done = last;
                     last = !m_indexer.isRunning();
                 }
 
-                // no files in current path
                 return -1u;
             };
 
@@ -238,176 +520,186 @@ namespace ifap
         {
             return entry.value();
         }
-        else
+
+        std::shared_ptr<DecodeTask> task = makeTask();
+        std::string filename = m_indexer[index];
+
+        task->file = std::make_unique<File>(*m_current_path, filename);
+        task->decoder = std::make_unique<ImageDecoder>(*task->file, filename);
+        ImageHeader header = task->decoder->header();
+
+        printLine("{}: {} x {}", filename, header.width, header.height);
+        if (!header.width || !header.height)
         {
-            // Cache miss may create GPU resources and evict cached textures while
-            // the previous frame is still in flight — uploads are ordered on the
-            // graphics queue after the prior frame's submit.
-            std::shared_ptr<DecodeTask> task = std::make_shared<DecodeTask>(m_renderer);
+            return {};
+        }
 
-            std::string filename = m_indexer[index];
+        const int max_texture_dimension = m_renderer.getMaxTextureDimension();
+        const bool needs_downscale = max_texture_dimension > 0 &&
+            (header.width > max_texture_dimension || header.height > max_texture_dimension);
 
-            task->file = std::make_unique<File>(*m_current_path, filename);
-            task->decoder = std::make_unique<ImageDecoder>(*task->file, filename);
-            ImageHeader header = task->decoder->header();
+        if (needs_downscale && header.format.isFloat())
+        {
+            printLine(Print::Error, "{}: {} x {} exceeds GPU texture limit (max dimension: {}); float preview not supported yet",
+                filename, header.width, header.height, max_texture_dimension);
 
-            printLine("{}: {} x {}", filename, header.width, header.height);
-            if (!header.width || !header.height)
-            {
-                return {};
-            }
-
-            const int max_texture_dimension = m_renderer.getMaxTextureDimension();
-            const bool needs_downscale = max_texture_dimension > 0 &&
-                (header.width > max_texture_dimension || header.height > max_texture_dimension);
-
-            if (needs_downscale && header.format.isFloat())
-            {
-                printLine(Print::Error, "{}: {} x {} exceeds GPU texture limit (max dimension: {}); float preview not supported yet",
-                    filename, header.width, header.height, max_texture_dimension);
-
-                createPlaceholderTexture(*task, m_renderer, header.width, header.height);
-
-                m_cache.insert(index, task);
-                return task;
-            }
-
-            GpuTexture& texture = task->texture;
-
-            Format format;
-            PixelFormat pixel_format;
-
-            if (header.format.isFloat())
-            {
-                // TODO: check the extensions that the driver can do float/half
-                if (header.format.bits <= 64)
-                {
-                    format = Format(64, Format::FLOAT16, Format::RGBA, 16, 16, 16, 16);
-                    pixel_format = PixelFormat::RGBA16F;
-                    texture.linear = true;
-                }
-                else
-                {
-                    format = Format(128, Format::FLOAT32, Format::RGBA, 32, 32, 32, 32);
-                    pixel_format = PixelFormat::RGBA32F;
-                    texture.linear = true;
-                }
-            }
-            else
-            {
-                format = Format(32, Format::UNORM, Format::RGBA, 8, 8, 8, 8);
-
-                if (header.linear)
-                {
-                    pixel_format = PixelFormat::RGBA8_UNORM;
-                    texture.linear = true;
-                }
-                else
-                {
-                    pixel_format = PixelFormat::RGBA8_SRGB;
-                    texture.linear = false;
-                }
-            }
-
-            if (needs_downscale)
-            {
-                const math::int32x2 preview_size = computeDownscaleDimensions(
-                    header.width, header.height, max_texture_dimension);
-
-                task->downscale = true;
-                task->downscale_width = preview_size.x;
-                task->downscale_height = preview_size.y;
-
-                printLine(Print::Info, "{}: {} x {} exceeds GPU limit ({}), preview {} x {}",
-                    filename, header.width, header.height, max_texture_dimension,
-                    task->downscale_width, task->downscale_height);
-
-                task->scaled_bitmap = std::make_unique<Bitmap>(task->downscale_width, task->downscale_height, format);
-            }
-
-            task->bitmap = std::make_unique<Bitmap>(header.width, header.height, format);
-            task->updates.clear();
-            task->progress = 0.0f;
-
-            texture.width = header.width;
-            texture.height = header.height;
-            texture.format = pixel_format;
-
-            if (needs_downscale)
-            {
-                texture.sample_width = task->downscale_width;
-                texture.sample_height = task->downscale_height;
-            }
-            else
-            {
-                texture.sample_width = header.width;
-                texture.sample_height = header.height;
-
-                texture.handle = m_renderer.createTexture(header.width, header.height, pixel_format, nullptr);
-            }
-
-            // don't capture the shared_ptr because the callback lambda will hold a reference
-            task->future = task->decoder->launch([task = task.get()] (const ImageDecodeRect& rect)
-            {
-                std::lock_guard lock(task->mutex);
-                task->updates.push_back(rect);
-                task->progress += rect.progress;
-            }, *task->bitmap);
+            createPlaceholderTexture(*task, m_renderer, header.width, header.height);
+            task->prepare_state = PrepareState::Failed;
 
             m_cache.insert(index, task);
             return task;
         }
+
+        GpuTexture& texture = task->texture;
+        task->bitmap_format = selectBitmapFormat(header);
+        texture.format = selectPixelFormat(header, texture.linear);
+
+        if (needs_downscale)
+        {
+            const math::int32x2 preview_size = computeDownscaleDimensions(
+                header.width, header.height, max_texture_dimension);
+
+            task->downscale = true;
+            task->downscale_width = preview_size.x;
+            task->downscale_height = preview_size.y;
+
+            printLine(Print::Info, "{}: {} x {} exceeds GPU limit ({}), preview {} x {}",
+                filename, header.width, header.height, max_texture_dimension,
+                task->downscale_width, task->downscale_height);
+
+            texture.sample_width = task->downscale_width;
+            texture.sample_height = task->downscale_height;
+        }
+        else
+        {
+            texture.sample_width = header.width;
+            texture.sample_height = header.height;
+        }
+
+        texture.width = header.width;
+        texture.height = header.height;
+        task->updates.clear();
+        task->progress = 0.0f;
+
+        createPlaceholderTexture(*task, m_renderer, header.width, header.height);
+
+        task->prepare_state = PrepareState::Preparing;
+
+        WorkerJob job;
+        job.type = WorkerJob::Type::Prepare;
+        job.task = task;
+        enqueueWorker(std::move(job));
+
+        m_cache.insert(index, task);
+        return task;
     }
 
-    void TextureCache::updateDecodeTask(DecodeTask& task)
+    bool TextureCache::updateDecodeTask(DecodeTask& task)
     {
+        finishGpuSetup(task);
+
         GpuTexture& texture = task.texture;
 
-        if (!task.bitmap)
+        if (task.prepare_state != PrepareState::Ready || !task.bitmap)
         {
-            return;
+            return false;
         }
 
         const std::vector<ImageDecodeRect> updates = task.getUpdates();
 
         if (task.downscale)
         {
-            if (!updates.empty() || !texture.handle)
+            if (!updates.empty() || !task.gpu_texture_ready)
             {
                 uploadDownscaledPreview(task);
+                return true;
             }
 
-            return;
+            return false;
         }
 
-        if (!texture.handle)
+        if (!texture.handle || updates.empty())
         {
-            return;
+            return false;
         }
 
-        for (auto rect : updates)
+        std::vector<TextureRegionUpload> regions;
+        regions.reserve(updates.size());
+        std::vector<std::unique_ptr<Bitmap>> temps;
+
+        for (const ImageDecodeRect& rect : updates)
         {
+            TextureRegionUpload region =
+            {
+                .x = rect.x,
+                .y = rect.y,
+                .width = rect.width,
+                .height = rect.height,
+            };
+
             if (task.bitmap->width == rect.width)
             {
-                u8* image = task.bitmap->address(rect.x, rect.y);
-                m_renderer.uploadTextureRegion(texture.handle, texture.format,
-                    rect.x, rect.y, rect.width, rect.height, image);
+                region.pixels = task.bitmap->address(rect.x, rect.y);
             }
             else
             {
-                Surface source(*task.bitmap, rect.x, rect.y, rect.width, rect.height);
-                Bitmap temp(source);
-                m_renderer.uploadTextureRegion(texture.handle, texture.format,
-                    rect.x, rect.y, rect.width, rect.height, temp.image);
+                temps.push_back(std::make_unique<Bitmap>(Surface(*task.bitmap, rect.x, rect.y, rect.width, rect.height)));
+                region.pixels = temps.back()->image;
+            }
+
+            regions.push_back(region);
+        }
+
+        const size_t submitted = m_renderer.uploadTextureRegions(texture.handle, texture.format,
+            regions.data(), regions.size());
+
+        if (submitted < updates.size())
+        {
+            std::lock_guard lock(task.mutex);
+            for (size_t i = submitted; i < updates.size(); ++i)
+            {
+                task.updates.push_back(updates[i]);
             }
         }
+
+        return submitted > 0;
     }
 
-    void TextureCache::update()
+    void TextureCache::update(size_t priority_index)
     {
+        drainGpuDestroys(2);
+        tickPrefetch(priority_index);
+
+        static constexpr int kBackgroundUploadBudget = 1;
+
         m_cache.for_each([this] (size_t /*index*/, std::shared_ptr<DecodeTask>& task_ptr)
         {
-            updateDecodeTask(*task_ptr);
+            finishGpuSetup(*task_ptr);
+        });
+
+        if (auto entry = m_cache.get(priority_index))
+        {
+            updateDecodeTask(*entry.value());
+        }
+
+        int budget = kBackgroundUploadBudget;
+
+        m_cache.for_each([this, priority_index, &budget] (size_t index, std::shared_ptr<DecodeTask>& task_ptr)
+        {
+            if (index == priority_index || budget <= 0)
+            {
+                return;
+            }
+
+            if (!task_ptr->hasPendingUpdates() && task_ptr->gpu_texture_ready)
+            {
+                return;
+            }
+
+            if (updateDecodeTask(*task_ptr))
+            {
+                --budget;
+            }
         });
     }
 

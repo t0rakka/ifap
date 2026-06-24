@@ -40,6 +40,9 @@ namespace ifap
         TextureHandle createTexture(int width, int height, PixelFormat format, const void* initial_data);
         void uploadTextureRegion(TextureHandle handle, PixelFormat format,
                                  int x, int y, int width, int height, const void* pixels);
+        // Returns the number of regions submitted (0 when upload slots are busy).
+        size_t uploadTextureRegions(TextureHandle handle, PixelFormat format,
+                                    const TextureRegionUpload* regions, size_t count);
         void destroyTexture(TextureHandle handle);
     };
 

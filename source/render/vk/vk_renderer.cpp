@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstddef>
+#include <vector>
 
 #include <mango/vulkan/vulkan.hpp>
 #include <mango/vulkan/compiler.hpp>
@@ -514,20 +515,27 @@ namespace ifap
         VkSampler m_samplerNearest = VK_NULL_HANDLE;
         VkSampler m_samplerLinear = VK_NULL_HANDLE;
 
+        static constexpr int kUploadSlotCount = 2;
+
+        struct UploadSlot
+        {
+            VkFence fence = VK_NULL_HANDLE;
+            VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+            std::vector<VkBuffer> staging_buffers;
+            std::vector<VkDeviceMemory> staging_memories;
+            bool pending = false;
+        };
+
         struct GpuTexture
         {
             VkImage image = VK_NULL_HANDLE;
             VkDeviceMemory memory = VK_NULL_HANDLE;
             VkImageView view = VK_NULL_HANDLE;
             VkDescriptorSet descriptor = VK_NULL_HANDLE;
-            VkFence upload_fence = VK_NULL_HANDLE;
-            VkCommandBuffer upload_command_buffer = VK_NULL_HANDLE;
-            VkBuffer staging_buffer = VK_NULL_HANDLE;
-            VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+            UploadSlot upload_slots[kUploadSlotCount] = {};
             PixelFormat format = PixelFormat::RGBA8_UNORM;
             int width = 0;
             int height = 0;
-            bool upload_pending = false;
             bool layout_ready = false;
         };
 
@@ -571,10 +579,10 @@ namespace ifap
         void createImage(int width, int height, VkFormat format, VkImageUsageFlags usage,
                          VkImage& image, VkDeviceMemory& memory) const;
         void createImageView(VkImage image, VkFormat format, VkImageView& view) const;
-        void releaseStaging(GpuTexture& texture);
-        void releaseUploadCommandBuffer(GpuTexture& texture);
-        void waitForUpload(GpuTexture& texture);
-        void submitUpload(GpuTexture& texture, int x, int y, int width, int height, const void* pixels);
+        void releaseUploadSlot(UploadSlot& slot);
+        void recycleUploadSlots(GpuTexture& texture, bool wait);
+        UploadSlot* acquireUploadSlot(GpuTexture& texture);
+        size_t submitUploadRegions(GpuTexture& texture, const TextureRegionUpload* regions, size_t count);
         VkSampler selectSampler(TextureFilter filter) const;
         VkPipeline selectPipeline(const ImageDrawRequest& request) const;
         void recordDraw(const ImageDrawRequest& request);
@@ -592,6 +600,8 @@ namespace ifap
         TextureHandle createTexture(int width, int height, PixelFormat format, const void* initial_data);
         void uploadTextureRegion(TextureHandle handle, PixelFormat format,
                                  int x, int y, int width, int height, const void* pixels);
+        size_t uploadTextureRegions(TextureHandle handle, PixelFormat format,
+                                    const TextureRegionUpload* regions, size_t count);
         void destroyTexture(TextureHandle handle);
         int getMaxTextureDimension() const;
     };
@@ -967,99 +977,139 @@ namespace ifap
         return m_textures[handle - 1].get();
     }
 
-    void VKRenderer::Impl::releaseStaging(GpuTexture& texture)
+    void VKRenderer::Impl::releaseUploadSlot(UploadSlot& slot)
     {
-        if (texture.staging_buffer)
+        if (slot.command_buffer != VK_NULL_HANDLE)
         {
-            vkDestroyBuffer(m_device, texture.staging_buffer, nullptr);
-            texture.staging_buffer = VK_NULL_HANDLE;
+            vkFreeCommandBuffers(m_device, m_transferCommandPool, 1, &slot.command_buffer);
+            slot.command_buffer = VK_NULL_HANDLE;
         }
 
-        if (texture.staging_memory)
+        for (VkBuffer buffer : slot.staging_buffers)
         {
-            vkFreeMemory(m_device, texture.staging_memory, nullptr);
-            texture.staging_memory = VK_NULL_HANDLE;
-        }
-    }
-
-    void VKRenderer::Impl::releaseUploadCommandBuffer(GpuTexture& texture)
-    {
-        if (texture.upload_command_buffer != VK_NULL_HANDLE)
-        {
-            vkFreeCommandBuffers(m_device, m_transferCommandPool, 1, &texture.upload_command_buffer);
-            texture.upload_command_buffer = VK_NULL_HANDLE;
-        }
-    }
-
-    void VKRenderer::Impl::waitForUpload(GpuTexture& texture)
-    {
-        if (!texture.upload_pending)
-        {
-            return;
-        }
-
-        VkResult result = vkWaitForFences(m_device, 1, &texture.upload_fence, VK_TRUE, UINT64_MAX);
-        texture.upload_pending = false;
-
-        if (result == VK_SUCCESS)
-        {
-            releaseUploadCommandBuffer(texture);
-            releaseStaging(texture);
-        }
-        else if (result != VK_ERROR_DEVICE_LOST)
-        {
-            printLine(Print::Error, "VKRenderer: upload fence wait failed: {}", getString(result));
-        }
-    }
-
-    void VKRenderer::Impl::submitUpload(GpuTexture& texture, int x, int y, int width, int height, const void* pixels)
-    {
-        if (!pixels || width <= 0 || height <= 0)
-        {
-            return;
-        }
-
-        waitForUpload(texture);
-
-        if (x < 0 || y < 0 ||
-            x + width > texture.width ||
-            y + height > texture.height)
-        {
-            printLine(Print::Error, "VKRenderer: upload rect out of bounds ({}x{} at {},{} in {}x{})",
-                width, height, x, y, texture.width, texture.height);
-            return;
-        }
-
-        const size_t rowBytes = size_t(width) * bytesPerPixel(texture.format);
-        const VkDeviceSize imageSize = rowBytes * size_t(height);
-
-        VkBuffer stagingBuffer = VK_NULL_HANDLE;
-        VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-        createBuffer(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     stagingBuffer, stagingMemory);
-
-        void* mapped = nullptr;
-        vkMapMemory(m_device, stagingMemory, 0, imageSize, 0, &mapped);
-
-        const size_t srcStride = rowBytes;
-        const size_t dstStride = rowBytes;
-        const u8* src = static_cast<const u8*>(pixels);
-
-        if (srcStride == dstStride)
-        {
-            std::memcpy(mapped, src, imageSize);
-        }
-        else
-        {
-            u8* dst = static_cast<u8*>(mapped);
-            for (int row = 0; row < height; ++row)
+            if (buffer)
             {
-                std::memcpy(dst + row * dstStride, src + row * srcStride, rowBytes);
+                vkDestroyBuffer(m_device, buffer, nullptr);
             }
         }
 
-        vkUnmapMemory(m_device, stagingMemory);
+        for (VkDeviceMemory memory : slot.staging_memories)
+        {
+            if (memory)
+            {
+                vkFreeMemory(m_device, memory, nullptr);
+            }
+        }
+
+        slot.staging_buffers.clear();
+        slot.staging_memories.clear();
+        slot.pending = false;
+    }
+
+    void VKRenderer::Impl::recycleUploadSlots(GpuTexture& texture, bool wait)
+    {
+        for (UploadSlot& slot : texture.upload_slots)
+        {
+            if (!slot.pending || !slot.fence)
+            {
+                continue;
+            }
+
+            VkResult result = wait
+                ? vkWaitForFences(m_device, 1, &slot.fence, VK_TRUE, UINT64_MAX)
+                : vkGetFenceStatus(m_device, slot.fence);
+
+            if (result == VK_SUCCESS)
+            {
+                releaseUploadSlot(slot);
+            }
+            else if (wait && result != VK_ERROR_DEVICE_LOST)
+            {
+                printLine(Print::Error, "VKRenderer: upload fence wait failed: {}", getString(result));
+            }
+        }
+    }
+
+    VKRenderer::Impl::UploadSlot* VKRenderer::Impl::acquireUploadSlot(GpuTexture& texture)
+    {
+        recycleUploadSlots(texture, false);
+
+        for (UploadSlot& slot : texture.upload_slots)
+        {
+            if (!slot.pending)
+            {
+                return &slot;
+            }
+        }
+
+        return nullptr;
+    }
+
+    size_t VKRenderer::Impl::submitUploadRegions(GpuTexture& texture, const TextureRegionUpload* regions, size_t count)
+    {
+        if (!regions || count == 0)
+        {
+            return 0;
+        }
+
+        UploadSlot* slot = acquireUploadSlot(texture);
+        if (!slot)
+        {
+            return 0;
+        }
+
+        static constexpr size_t kMaxUploadBytesPerBatch = 8 * 1024 * 1024;
+
+        size_t submitted = 0;
+        size_t bytes_used = 0;
+
+        for (size_t i = 0; i < count; ++i)
+        {
+            const TextureRegionUpload& region = regions[i];
+
+            if (!region.pixels || region.width <= 0 || region.height <= 0)
+            {
+                continue;
+            }
+
+            if (region.x < 0 || region.y < 0 ||
+                region.x + region.width > texture.width ||
+                region.y + region.height > texture.height)
+            {
+                printLine(Print::Error, "VKRenderer: upload rect out of bounds ({}x{} at {},{} in {}x{})",
+                    region.width, region.height, region.x, region.y, texture.width, texture.height);
+                continue;
+            }
+
+            const size_t rowBytes = size_t(region.width) * bytesPerPixel(texture.format);
+            const VkDeviceSize imageSize = rowBytes * size_t(region.height);
+
+            if (submitted > 0 && bytes_used + size_t(imageSize) > kMaxUploadBytesPerBatch)
+            {
+                break;
+            }
+
+            VkBuffer stagingBuffer = VK_NULL_HANDLE;
+            VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+            createBuffer(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         stagingBuffer, stagingMemory);
+
+            void* mapped = nullptr;
+            vkMapMemory(m_device, stagingMemory, 0, imageSize, 0, &mapped);
+            std::memcpy(mapped, region.pixels, size_t(imageSize));
+            vkUnmapMemory(m_device, stagingMemory);
+
+            slot->staging_buffers.push_back(stagingBuffer);
+            slot->staging_memories.push_back(stagingMemory);
+            bytes_used += size_t(imageSize);
+            ++submitted;
+        }
+
+        if (submitted == 0)
+        {
+            return 0;
+        }
 
         VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 
@@ -1110,24 +1160,43 @@ namespace ifap
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             0, 0, nullptr, 0, nullptr, 1, &toTransfer);
 
-        VkBufferImageCopy region =
+        size_t stagingIndex = 0;
+        for (size_t i = 0; i < count && stagingIndex < submitted; ++i)
         {
-            .bufferOffset = 0,
-            .bufferRowLength = 0,
-            .bufferImageHeight = 0,
-            .imageSubresource =
-            {
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .mipLevel = 0,
-                .baseArrayLayer = 0,
-                .layerCount = 1,
-            },
-            .imageOffset = { x, y, 0 },
-            .imageExtent = { u32(width), u32(height), 1 },
-        };
+            const TextureRegionUpload& region = regions[i];
 
-        vkCmdCopyBufferToImage(commandBuffer, stagingBuffer, texture.image,
-                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            if (!region.pixels || region.width <= 0 || region.height <= 0)
+            {
+                continue;
+            }
+
+            if (region.x < 0 || region.y < 0 ||
+                region.x + region.width > texture.width ||
+                region.y + region.height > texture.height)
+            {
+                continue;
+            }
+
+            VkBufferImageCopy copyRegion =
+            {
+                .bufferOffset = 0,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource =
+                {
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .mipLevel = 0,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+                .imageOffset = { region.x, region.y, 0 },
+                .imageExtent = { u32(region.width), u32(region.height), 1 },
+            };
+
+            vkCmdCopyBufferToImage(commandBuffer, slot->staging_buffers[stagingIndex], texture.image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+            ++stagingIndex;
+        }
 
         VkImageMemoryBarrier toShader =
         {
@@ -1154,7 +1223,7 @@ namespace ifap
 
         vkEndCommandBuffer(commandBuffer);
 
-        vkResetFences(m_device, 1, &texture.upload_fence);
+        vkResetFences(m_device, 1, &slot->fence);
 
         VkSubmitInfo submitInfo =
         {
@@ -1163,12 +1232,12 @@ namespace ifap
             .pCommandBuffers = &commandBuffer,
         };
 
-        vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, texture.upload_fence);
-        texture.upload_pending = true;
+        vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, slot->fence);
+        slot->command_buffer = commandBuffer;
+        slot->pending = true;
         texture.layout_ready = true;
-        texture.upload_command_buffer = commandBuffer;
-        texture.staging_buffer = stagingBuffer;
-        texture.staging_memory = stagingMemory;
+
+        return submitted;
     }
 
     TextureHandle VKRenderer::Impl::createTexture(int width, int height, PixelFormat format, const void* initial_data)
@@ -1190,7 +1259,10 @@ namespace ifap
             .flags = VK_FENCE_CREATE_SIGNALED_BIT,
         };
 
-        vkCreateFence(m_device, &fenceInfo, nullptr, &texture->upload_fence);
+        for (UploadSlot& slot : texture->upload_slots)
+        {
+            vkCreateFence(m_device, &fenceInfo, nullptr, &slot.fence);
+        }
 
         VkDescriptorSetAllocateInfo allocInfo =
         {
@@ -1209,7 +1281,16 @@ namespace ifap
 
         if (initial_data)
         {
-            submitUpload(gpu, 0, 0, width, height, initial_data);
+            TextureRegionUpload region =
+            {
+                .x = 0,
+                .y = 0,
+                .width = width,
+                .height = height,
+                .pixels = initial_data,
+            };
+
+            submitUploadRegions(gpu, &region, 1);
         }
 
         return handle;
@@ -1218,14 +1299,29 @@ namespace ifap
     void VKRenderer::Impl::uploadTextureRegion(TextureHandle handle, PixelFormat format,
                                          int x, int y, int width, int height, const void* pixels)
     {
+        TextureRegionUpload region =
+        {
+            .x = x,
+            .y = y,
+            .width = width,
+            .height = height,
+            .pixels = pixels,
+        };
+
+        uploadTextureRegions(handle, format, &region, 1);
+    }
+
+    size_t VKRenderer::Impl::uploadTextureRegions(TextureHandle handle, PixelFormat format,
+                                            const TextureRegionUpload* regions, size_t count)
+    {
         GpuTexture* texture = getTexture(handle);
         if (!texture)
         {
-            return;
+            return 0;
         }
 
         MANGO_UNREFERENCED(format);
-        submitUpload(*texture, x, y, width, height, pixels);
+        return submitUploadRegions(*texture, regions, count);
     }
 
     void VKRenderer::Impl::destroyTexture(TextureHandle handle)
@@ -1236,9 +1332,7 @@ namespace ifap
             return;
         }
 
-        waitForUpload(*texture);
-
-        vkQueueWaitIdle(m_graphicsQueue);
+        recycleUploadSlots(*texture, true);
 
         if (texture->descriptor)
         {
@@ -1260,9 +1354,14 @@ namespace ifap
             vkFreeMemory(m_device, texture->memory, nullptr);
         }
 
-        if (texture->upload_fence)
+        for (UploadSlot& slot : texture->upload_slots)
         {
-            vkDestroyFence(m_device, texture->upload_fence, nullptr);
+            if (slot.fence)
+            {
+                vkDestroyFence(m_device, slot.fence, nullptr);
+            }
+
+            releaseUploadSlot(slot);
         }
 
         m_textures[handle - 1].reset();
@@ -1856,12 +1955,17 @@ namespace ifap
     void VKRenderer::Impl::recordDraw(const ImageDrawRequest& request)
     {
         GpuTexture* texture = getTexture(request.texture);
-        if (!texture || !texture->layout_ready || !m_frame_active)
+        if (!texture || !m_frame_active)
         {
             return;
         }
 
-        waitForUpload(*texture);
+        recycleUploadSlots(*texture, false);
+
+        if (!texture->layout_ready)
+        {
+            return;
+        }
 
         VkSampler sampler = selectSampler(request.filter);
 
@@ -1981,6 +2085,7 @@ namespace ifap
     int VKRenderer::getMaxTextureDimension() const { return m_impl->getMaxTextureDimension(); }
     TextureHandle VKRenderer::createTexture(int width, int height, PixelFormat format, const void* initial_data) { return m_impl->createTexture(width, height, format, initial_data); }
     void VKRenderer::uploadTextureRegion(TextureHandle handle, PixelFormat format, int x, int y, int width, int height, const void* pixels) { m_impl->uploadTextureRegion(handle, format, x, y, width, height, pixels); }
+    size_t VKRenderer::uploadTextureRegions(TextureHandle handle, PixelFormat format, const TextureRegionUpload* regions, size_t count) { return m_impl->uploadTextureRegions(handle, format, regions, count); }
     void VKRenderer::destroyTexture(TextureHandle handle) { m_impl->destroyTexture(handle); }
 
 } // namespace ifap
