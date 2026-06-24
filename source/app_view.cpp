@@ -342,6 +342,19 @@ namespace ifap
         m_renderer.resize(width, height);
     }
 
+    void AppView::renderFrame()
+    {
+        const bool blend = !m_window.isKeyPressed(KEYCODE_B);
+        const bool frame_active = m_renderer.beginFrame(0.06f, 0.06f, 0.06f, 1.0f, blend);
+
+        if (frame_active && m_current_task && m_current_task->texture)
+        {
+            m_renderer.drawImage(makeDrawRequest());
+        }
+
+        m_renderer.endFrame();
+    }
+
     void AppView::onFrame(const FrameInfo& info)
     {
         MANGO_UNREFERENCED(info);
@@ -392,15 +405,7 @@ namespace ifap
         // responsive even when the GPU is busy decoding/uploading.
         const bool texture_progress = m_texture_cache.update(m_current_index);
 
-        const bool blend = !m_window.isKeyPressed(KEYCODE_B);
-        const bool frame_active = m_renderer.beginFrame(0.06f, 0.06f, 0.06f, 1.0f, blend);
-
-        if (frame_active && m_current_task && m_current_task->texture)
-        {
-            m_renderer.drawImage(makeDrawRequest());
-        }
-
-        m_renderer.endFrame();
+        renderFrame();
 
         if (texture_progress || needsContinuousUpdate())
         {

@@ -200,6 +200,26 @@ namespace ifap
         // DCI-P3:   BT.709 -> P3 primaries, gamma 2.6
         // ------------------------------------------------------------------
 
+        // KNOWN ISSUE (Hyprland/Wayland, June 2026): an HDR / wide-gamut *windowed*
+        // swapchain flickers on resize (cleared frame shown before content). This is a
+        // compositor-side limitation, not an ifap rendering bug. HDR-first selection
+        // works great on Windows 11 and macOS/MoltenVK; only Hyprland/Wayland misbehaves.
+        //
+        // Diagnosis: vkbasic with an SDR swapchain does not flicker, and forcing ifap to
+        // the same SDR format (B8G8R8A8_UNORM / SRGB_NONLINEAR) makes resize smooth in
+        // both OnDemand and Continuous modes. Frame mode is NOT the cause.
+        //
+        // Wayland quirk: in windowed mode the HDR10 colorspace is effectively SDR anyway
+        // (the compositor tonemaps HDR10 -> SDR display), so we lose nothing by shipping
+        // HDR-first here. Going fullscreen flips the display into real HDR (gorgeous), but
+        // exiting fullscreen leaves it stuck in HDR — hyprctl can't recover it; only a
+        // logout does. Their HDR pipeline is simply not there yet.
+        //
+        // Decision: keep HDR-first auto ON by default (kDevForceSurfaceFormat = false) so
+        // ifap is ready to "just work" once a Wayland compositor ships a correct HDR impl.
+        // Set this to true (with the SDR entry below) to force SDR for flicker-free
+        // testing. Intended long-term mitigation: fullscreen-gated HDR (SDR windowed,
+        // HDR-first in fullscreen).
         constexpr bool kDevForceSurfaceFormat = false;
 
         constexpr VkSurfaceFormatKHR kDevSurfaceFormat =
@@ -212,7 +232,7 @@ namespace ifap
             //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_PASS_THROUGH_EXT
             //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT
             //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_HDR10_ST2084_EXT
-            //VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_COLOR_SPACE_HDR10_ST2084_EXT
+            VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_COLOR_SPACE_HDR10_ST2084_EXT
             //VK_FORMAT_B8G8R8A8_SRGB,       VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
             //VK_FORMAT_B8G8R8A8_UNORM,      VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
             //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT
@@ -221,7 +241,7 @@ namespace ifap
             //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT
             //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_HDR10_HLG_EXT
             //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_BT709_NONLINEAR_EXT
-            VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT
+            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT
         };
 
         static VkSurfaceFormatKHR selectBestFormatForColorSpace(
@@ -355,7 +375,7 @@ namespace ifap
 
         VkPipeline createGraphicsPipeline(VkDevice device, VkFormat colorFormat, VkPipelineLayout layout,
                                           VkShaderModule vertexShader, VkShaderModule fragmentShader,
-                                          VkExtent2D extent, bool blend)
+                                          bool blend)
         {
             VkPipelineShaderStageCreateInfo stages[] =
             {
@@ -403,26 +423,26 @@ namespace ifap
                 .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
             };
 
-            VkViewport viewport =
-            {
-                .width = float(extent.width),
-                .height = float(extent.height),
-                .minDepth = 0.0f,
-                .maxDepth = 1.0f,
-            };
-
-            VkRect2D scissor =
-            {
-                .extent = extent,
-            };
-
+            // Viewport and scissor are dynamic so a window resize never triggers a
+            // pipeline rebuild; the live extent is set per command buffer instead.
             VkPipelineViewportStateCreateInfo viewportState =
             {
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
                 .viewportCount = 1,
-                .pViewports = &viewport,
                 .scissorCount = 1,
-                .pScissors = &scissor,
+            };
+
+            VkDynamicState dynamicStates[] =
+            {
+                VK_DYNAMIC_STATE_VIEWPORT,
+                VK_DYNAMIC_STATE_SCISSOR,
+            };
+
+            VkPipelineDynamicStateCreateInfo dynamicState =
+            {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                .dynamicStateCount = 2,
+                .pDynamicStates = dynamicStates,
             };
 
             VkPipelineRasterizationStateCreateInfo rasterizer =
@@ -468,6 +488,7 @@ namespace ifap
                 .pRasterizationState = &rasterizer,
                 .pMultisampleState = &multisampling,
                 .pColorBlendState = &colorBlending,
+                .pDynamicState = &dynamicState,
                 .layout = layout,
             };
 
@@ -568,6 +589,7 @@ namespace ifap
         void beginCommandBufferRecording();
         void beginProcessingRendering();
         void endProcessingRendering();
+        void setDynamicViewportScissor(VkCommandBuffer commandBuffer) const;
         void recordResolve();
         GpuTexture* getTexture(TextureHandle handle);
         const GpuTexture* getTexture(TextureHandle handle) const;
@@ -824,7 +846,15 @@ namespace ifap
     {
         MANGO_UNREFERENCED(width);
         MANGO_UNREFERENCED(height);
-        updateSwapchain();
+
+        // Swapchain recreation is intentionally NOT done here. It is deferred to
+        // beginFrame()'s updateSwapchain() so the recreate (which destroys the old
+        // swapchain still holding the on-screen image) is immediately followed by
+        // acquire + draw + present in the same callback, with nothing in between.
+        // This mirrors the vkbasic reference render() and avoids the resize flash
+        // caused by destroying the in-use swapchain in onResize, separate from the
+        // present. mango already calls invalidate() after onResize on every
+        // platform, so the redraw is scheduled even in OnDemand mode.
     }
 
     VkFormat VKRenderer::Impl::toVkFormat(PixelFormat format)
@@ -1371,23 +1401,22 @@ namespace ifap
     {
         destroyPipelines();
 
-        const VkExtent2D extent = m_swapchain->getExtent();
         const VkFormat swapchainFormat = m_swapchain->getFormat();
 
         m_pipelineBilinearBlend = createGraphicsPipeline(m_device, kProcessingFormat, m_processingPipelineLayout,
-            m_processingVertexShader, m_processingFragmentShaderBilinear, extent, true);
+            m_processingVertexShader, m_processingFragmentShaderBilinear, true);
 
         m_pipelineBilinearNoBlend = createGraphicsPipeline(m_device, kProcessingFormat, m_processingPipelineLayout,
-            m_processingVertexShader, m_processingFragmentShaderBilinear, extent, false);
+            m_processingVertexShader, m_processingFragmentShaderBilinear, false);
 
         m_pipelineBicubicBlend = createGraphicsPipeline(m_device, kProcessingFormat, m_processingPipelineLayout,
-            m_processingVertexShader, m_processingFragmentShaderBicubic, extent, true);
+            m_processingVertexShader, m_processingFragmentShaderBicubic, true);
 
         m_pipelineBicubicNoBlend = createGraphicsPipeline(m_device, kProcessingFormat, m_processingPipelineLayout,
-            m_processingVertexShader, m_processingFragmentShaderBicubic, extent, false);
+            m_processingVertexShader, m_processingFragmentShaderBicubic, false);
 
         m_resolvePipeline = createGraphicsPipeline(m_device, swapchainFormat, m_resolvePipelineLayout,
-            m_resolveVertexShader, m_resolveFragmentShader, extent, false);
+            m_resolveVertexShader, m_resolveFragmentShader, false);
     }
 
     void VKRenderer::Impl::destroyProcessingTarget()
@@ -1485,10 +1514,12 @@ namespace ifap
             m_commandBuffers.clear();
         }
 
-        destroyPipelines();
+        // Pipelines are NOT rebuilt: viewport/scissor are dynamic and the swapchain
+        // format is stable across resize, so a resize only swaps the extent-sized
+        // processing target and re-allocates command buffers. This removes the
+        // per-resize-step pipeline rebuild that produced the gap/flicker.
         createProcessingTarget();
         createCommandBuffers();
-        createPipelines();
     }
 
     void VKRenderer::Impl::createCommandBuffers()
@@ -1827,6 +1858,7 @@ namespace ifap
         };
 
         vkCmdBeginRendering(commandBuffer, &renderingInfo);
+        setDynamicViewportScissor(commandBuffer);
         m_processing_rendering_active = true;
     }
 
@@ -1867,6 +1899,30 @@ namespace ifap
             0, 0, nullptr, 0, nullptr, 1, &processingBarrier);
 
         m_processingLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+
+    void VKRenderer::Impl::setDynamicViewportScissor(VkCommandBuffer commandBuffer) const
+    {
+        const VkExtent2D extent = m_swapchain->getExtent();
+
+        VkViewport viewport =
+        {
+            .x = 0.0f,
+            .y = 0.0f,
+            .width = float(extent.width),
+            .height = float(extent.height),
+            .minDepth = 0.0f,
+            .maxDepth = 1.0f,
+        };
+
+        VkRect2D scissor =
+        {
+            .offset = { 0, 0 },
+            .extent = extent,
+        };
+
+        vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+        vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
     }
 
     void VKRenderer::Impl::recordResolve()
@@ -1935,6 +1991,7 @@ namespace ifap
         };
 
         vkCmdBeginRendering(commandBuffer, &renderingInfo);
+        setDynamicViewportScissor(commandBuffer);
         m_rendering_active = true;
     }
 

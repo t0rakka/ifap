@@ -86,6 +86,7 @@ namespace ifap
 
         ImageDrawRequest makeDrawRequest() const;
 
+        void renderFrame();
         void requestRedraw();
         bool needsContinuousUpdate() const;
         bool isExitRequested() const;
