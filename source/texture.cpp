@@ -7,6 +7,7 @@
 #include <mango/image/bicubic.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <memory>
 
 namespace ifap
@@ -119,6 +120,19 @@ namespace ifap
         return temp;
     }
 
+    bool DecodeTask::isDecoding() const
+    {
+        if (prepare_state.load() != PrepareState::Ready)
+        {
+            // Still pending/preparing: the decode either has not launched yet or is
+            // about to. Treat as in-flight so it counts against the concurrency cap.
+            return prepare_state.load() == PrepareState::Preparing;
+        }
+
+        return future.valid() &&
+            future.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
+    }
+
     // -----------------------------------------------------------------------
     // TextureCache
     // -----------------------------------------------------------------------
@@ -131,6 +145,7 @@ namespace ifap
         , m_should_abort(std::move(should_abort))
     {
         m_worker = std::thread([this] { workerThreadMain(); });
+        m_reaper = std::thread([this] { reaperThreadMain(); });
     }
 
     TextureCache::~TextureCache()
@@ -143,9 +158,15 @@ namespace ifap
             std::lock_guard lock(m_worker_mutex);
             m_worker_running = false;
         }
-
         m_worker_cv.notify_all();
         m_worker.join();
+
+        {
+            std::lock_guard lock(m_reaper_mutex);
+            m_reaper_running = false;
+        }
+        m_reaper_cv.notify_all();
+        m_reaper.join();
 
         drainGpuDestroys(1024);
 
@@ -178,37 +199,34 @@ namespace ifap
             }
         });
 
-        std::deque<TextureHandle> pending_destroy;
-
         {
             std::lock_guard lock(m_worker_mutex);
 
-            while (!m_worker_jobs.empty())
+            for (WorkerJob& job : m_worker_jobs)
             {
-                WorkerJob job = std::move(m_worker_jobs.front());
-                m_worker_jobs.pop_front();
-
-                if (job.type == WorkerJob::Type::Prepare && job.task && job.task->decoder)
+                if (job.task && job.task->decoder)
                 {
                     job.task->decoder->cancel();
-                }
-                else if (job.type == WorkerJob::Type::Dispose && job.gpu_handle)
-                {
-                    pending_destroy.push_back(job.gpu_handle);
                 }
             }
         }
 
-        if (!pending_destroy.empty())
+        // Cancel decoders of queued disposals up front so the reaper's future join
+        // returns immediately instead of waiting out a full decode during teardown.
         {
-            std::lock_guard lock(m_gpu_destroy_mutex);
-            for (TextureHandle handle : pending_destroy)
+            std::lock_guard lock(m_reaper_mutex);
+
+            for (WorkerJob& job : m_reaper_jobs)
             {
-                m_gpu_destroy_queue.push_back(handle);
+                if (job.task && job.task->decoder)
+                {
+                    job.task->decoder->cancel();
+                }
             }
         }
 
         m_worker_cv.notify_all();
+        m_reaper_cv.notify_all();
     }
 
     std::shared_ptr<DecodeTask> TextureCache::makeTask()
@@ -232,10 +250,10 @@ namespace ifap
         job.gpu_handle = raw_task->texture.handle;
         raw_task->texture.handle = 0;
         job.task = std::shared_ptr<DecodeTask>(raw_task, [](DecodeTask*) {});
-        enqueueWorker(std::move(job));
+        enqueueDispose(std::move(job));
     }
 
-    void TextureCache::enqueueWorker(WorkerJob job)
+    void TextureCache::enqueuePrepare(WorkerJob job)
     {
         {
             std::lock_guard lock(m_worker_mutex);
@@ -245,8 +263,21 @@ namespace ifap
         m_worker_cv.notify_one();
     }
 
+    void TextureCache::enqueueDispose(WorkerJob job)
+    {
+        {
+            std::lock_guard lock(m_reaper_mutex);
+            m_reaper_jobs.push_back(std::move(job));
+        }
+
+        m_reaper_cv.notify_one();
+    }
+
     void TextureCache::workerThreadMain()
     {
+        // Prepare lane only: allocate target bitmaps and launch the async decode.
+        // Each job returns quickly (the decode itself runs on its own std::async
+        // thread), so navigation jobs queued here are picked up promptly.
         for (;;)
         {
             WorkerJob job;
@@ -270,24 +301,47 @@ namespace ifap
 
             if (m_shutdown)
             {
-                if (job.type == WorkerJob::Type::Dispose)
+                // Drop pending prepares during teardown; cancel just in case the
+                // decoder somehow already launched.
+                if (job.task && job.task->decoder)
                 {
-                    runDispose(std::move(job));
+                    job.task->decoder->cancel();
                 }
 
                 continue;
             }
 
-            switch (job.type)
-            {
-                case WorkerJob::Type::Prepare:
-                    runPrepare(job.task);
-                    break;
+            runPrepare(job.task);
+        }
+    }
 
-                case WorkerJob::Type::Dispose:
-                    runDispose(std::move(job));
-                    break;
+    void TextureCache::reaperThreadMain()
+    {
+        // Disposal lane only: joining the decode future can block until the decode
+        // finishes (or honours cancellation). Isolating it here guarantees a blocking
+        // join never stalls prepare/navigation on the worker thread.
+        for (;;)
+        {
+            WorkerJob job;
+
+            {
+                std::unique_lock lock(m_reaper_mutex);
+
+                m_reaper_cv.wait(lock, [this]
+                {
+                    return !m_reaper_running || !m_reaper_jobs.empty();
+                });
+
+                if (!m_reaper_running && m_reaper_jobs.empty())
+                {
+                    return;
+                }
+
+                job = std::move(m_reaper_jobs.front());
+                m_reaper_jobs.pop_front();
             }
+
+            runDispose(std::move(job));
         }
     }
 
@@ -309,6 +363,8 @@ namespace ifap
             task->bitmap = std::make_unique<Bitmap>(
                 task->texture.width, task->texture.height, task->bitmap_format);
 
+            task->decode_start_ms.store(mango::Time::ms());
+
             task->future = task->decoder->launch([this, task = task.get()] (const ImageDecodeRect& rect)
             {
                 if (m_shutdown || (m_should_abort && m_should_abort()))
@@ -318,6 +374,10 @@ namespace ifap
 
                 {
                     std::lock_guard lock(task->mutex);
+                    if (!task->decode_first_ms.load())
+                    {
+                        task->decode_first_ms.store(mango::Time::ms());
+                    }
                     task->updates.push_back(rect);
                     task->progress += rect.progress;
                 }
@@ -392,7 +452,13 @@ namespace ifap
                 m_gpu_destroy_queue.pop_front();
             }
 
-            m_renderer.destroyTexture(handle);
+            // Non-blocking: if uploads are still in flight, requeue for a later frame
+            // rather than stalling the main thread on a fence.
+            if (!m_renderer.tryDestroyTexture(handle))
+            {
+                std::lock_guard lock(m_gpu_destroy_mutex);
+                m_gpu_destroy_queue.push_back(handle);
+            }
         }
     }
 
@@ -432,10 +498,65 @@ namespace ifap
         m_prefetch_direction = direction;
     }
 
+    void TextureCache::logDecodeTiming(DecodeTask& task)
+    {
+        if (task.decode_logged)
+        {
+            return;
+        }
+
+        // The future becomes ready when decode() has fully returned.
+        if (!task.future.valid() ||
+            task.future.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        {
+            return;
+        }
+
+        task.decode_logged = true;
+
+        const u64 start = task.decode_start_ms.load();
+        const u64 first = task.decode_first_ms.load();
+        const u64 end = mango::Time::ms();
+
+        if (!start)
+        {
+            return;
+        }
+
+        printLine(Print::Error, "[decode] {}: total {} ms, first pixels {} ms ({} x {})",
+            task.name,
+            end - start,
+            first ? (first - start) : 0,
+            task.texture.width, task.texture.height);
+    }
+
+    size_t TextureCache::countActiveDecodes() const
+    {
+        size_t active = 0;
+
+        m_cache.for_each([&active] (size_t /*index*/, const std::shared_ptr<DecodeTask>& task)
+        {
+            if (task && task->isDecoding())
+            {
+                ++active;
+            }
+        });
+
+        return active;
+    }
+
     void TextureCache::tickPrefetch(size_t priority_index)
     {
         if (m_shutdown || (m_should_abort && m_should_abort()) ||
             !m_prefetch_direction || texture_prefetch_size == 0)
+        {
+            return;
+        }
+
+        // Don't pile on more decodes while the pipeline is already saturated. This
+        // keeps the visible image's decode from being starved by prefetch and bounds
+        // the number of full-resolution bitmaps held in memory at once.
+        if (countActiveDecodes() >= texture_inflight_decode_limit)
         {
             return;
         }
@@ -623,6 +744,7 @@ namespace ifap
         std::shared_ptr<DecodeTask> task = makeTask();
         std::string filename = m_indexer[index];
 
+        task->name = filename;
         task->file = std::make_unique<File>(*m_current_path, filename);
         task->decoder = std::make_unique<ImageDecoder>(*task->file, filename);
         ImageHeader header = task->decoder->header();
@@ -687,7 +809,7 @@ namespace ifap
         WorkerJob job;
         job.type = WorkerJob::Type::Prepare;
         job.task = task;
-        enqueueWorker(std::move(job));
+        enqueuePrepare(std::move(job));
 
         m_cache.insert(index, task);
         return task;
@@ -752,13 +874,27 @@ namespace ifap
         const size_t submitted = m_renderer.uploadTextureRegions(texture.handle, texture.format,
             regions.data(), regions.size());
 
-        if (submitted < updates.size())
+        bool all_uploaded = false;
+
         {
             std::lock_guard lock(task.mutex);
             for (size_t i = submitted; i < updates.size(); ++i)
             {
                 task.updates.push_back(updates[i]);
             }
+            all_uploaded = task.updates.empty();
+        }
+
+        // Once the decode has fully finished and every region has been uploaded to the
+        // GPU, the full-resolution CPU bitmap is dead weight (no re-uploads happen).
+        // Releasing it here keeps host RAM bounded while browsing many huge images;
+        // the memcpy into the staging buffer already happened during the upload above.
+        const bool decode_finished = !task.future.valid() ||
+            task.future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+
+        if (all_uploaded && task.gpu_texture_ready && decode_finished)
+        {
+            task.bitmap.reset();
         }
 
         return submitted > 0;
@@ -777,15 +913,17 @@ namespace ifap
         tickPrefetch(priority_index);
 
         static constexpr int kBackgroundUploadBudget = 1;
+        static constexpr int kBackgroundSetupBudget = 1;
 
-        m_cache.for_each([this, &progress] (size_t /*index*/, std::shared_ptr<DecodeTask>& task_ptr)
+        // Decode-timing logging only; GPU texture creation is budgeted below so a burst
+        // of finished prefetch decodes can't fire several large allocations in one frame.
+        m_cache.for_each([this] (size_t /*index*/, std::shared_ptr<DecodeTask>& task_ptr)
         {
-            if (finishGpuSetup(*task_ptr))
-            {
-                progress = true;
-            }
+            logDecodeTiming(*task_ptr);
         });
 
+        // Priority image: always set up and uploaded immediately so the visible image
+        // keeps progressing without waiting on a budget.
         if (auto entry = m_cache.get(priority_index))
         {
             if (updateDecodeTask(*entry.value()))
@@ -794,11 +932,32 @@ namespace ifap
             }
         }
 
-        int budget = kBackgroundUploadBudget;
+        int upload_budget = kBackgroundUploadBudget;
+        int setup_budget = kBackgroundSetupBudget;
 
-        m_cache.for_each([this, priority_index, &budget, &progress] (size_t index, std::shared_ptr<DecodeTask>& task_ptr)
+        m_cache.for_each([this, priority_index, &upload_budget, &setup_budget, &progress]
+            (size_t index, std::shared_ptr<DecodeTask>& task_ptr)
         {
-            if (index == priority_index || budget <= 0)
+            if (index == priority_index)
+            {
+                return;
+            }
+
+            // Bound large GPU allocations: create at most one prefetched texture per
+            // frame. createTexture() for a full-resolution image is a heavyweight
+            // vkAllocateMemory; doing several in one frame is what stalled the main
+            // thread (the OpenGL backend let the driver manage this lazily).
+            if (!task_ptr->gpu_texture_ready)
+            {
+                if (setup_budget <= 0)
+                {
+                    return;
+                }
+
+                --setup_budget;
+            }
+
+            if (upload_budget <= 0)
             {
                 return;
             }
@@ -811,7 +970,7 @@ namespace ifap
             if (updateDecodeTask(*task_ptr))
             {
                 progress = true;
-                --budget;
+                --upload_budget;
             }
         });
 

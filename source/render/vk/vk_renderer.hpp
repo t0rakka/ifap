@@ -44,6 +44,11 @@ namespace ifap
         size_t uploadTextureRegions(TextureHandle handle, PixelFormat format,
                                     const TextureRegionUpload* regions, size_t count);
         void destroyTexture(TextureHandle handle);
+
+        // Non-blocking destroy: if the texture still has GPU uploads in flight it is
+        // left intact and false is returned (caller should retry later). Never waits
+        // on a fence, so it is safe to call every frame on the main thread.
+        bool tryDestroyTexture(TextureHandle handle);
     };
 
 } // namespace ifap

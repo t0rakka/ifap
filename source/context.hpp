@@ -16,6 +16,11 @@ namespace ifap
     static constexpr size_t texture_cache_size = 16;
     static constexpr size_t texture_prefetch_size = 4;
 
+    // Upper bound on decodes running at once (the visible image plus prefetch).
+    // Bounds peak RAM (each in-flight decode owns a full-resolution bitmap) and
+    // keeps the shared decode thread pool from thrashing across huge images.
+    static constexpr size_t texture_inflight_decode_limit = 3;
+
     static constexpr u64 repeat_treshold = 420;
     static constexpr u64 repeat_delay = 3;
 

@@ -543,8 +543,13 @@ namespace ifap
         {
             VkFence fence = VK_NULL_HANDLE;
             VkCommandBuffer command_buffer = VK_NULL_HANDLE;
-            std::vector<VkBuffer> staging_buffers;
-            std::vector<VkDeviceMemory> staging_memories;
+            // Persistent, persistently-mapped staging buffer reused across uploads.
+            // Avoids a vkAllocateMemory per region per frame (the OpenGL backend let
+            // the driver manage staging; doing it by hand here was a regression).
+            VkBuffer staging_buffer = VK_NULL_HANDLE;
+            VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+            VkDeviceSize staging_capacity = 0;
+            void* staging_mapped = nullptr;
             bool pending = false;
         };
 
@@ -602,6 +607,8 @@ namespace ifap
                          VkImage& image, VkDeviceMemory& memory) const;
         void createImageView(VkImage image, VkFormat format, VkImageView& view) const;
         void releaseUploadSlot(UploadSlot& slot);
+        void destroyUploadSlotStaging(UploadSlot& slot);
+        void ensureStagingCapacity(UploadSlot& slot, VkDeviceSize size);
         void recycleUploadSlots(GpuTexture& texture, bool wait);
         UploadSlot* acquireUploadSlot(GpuTexture& texture);
         size_t submitUploadRegions(GpuTexture& texture, const TextureRegionUpload* regions, size_t count);
@@ -625,6 +632,8 @@ namespace ifap
         size_t uploadTextureRegions(TextureHandle handle, PixelFormat format,
                                     const TextureRegionUpload* regions, size_t count);
         void destroyTexture(TextureHandle handle);
+        bool tryDestroyTexture(TextureHandle handle);
+        void freeTextureResources(GpuTexture& texture, TextureHandle handle);
         int getMaxTextureDimension() const;
     };
 
@@ -1000,31 +1009,67 @@ namespace ifap
 
     void VKRenderer::Impl::releaseUploadSlot(UploadSlot& slot)
     {
+        // Frees the transient command buffer and marks the slot idle. The persistent
+        // staging buffer is intentionally kept for reuse (destroyed only with the
+        // texture, in destroyUploadSlotStaging()).
         if (slot.command_buffer != VK_NULL_HANDLE)
         {
             vkFreeCommandBuffers(m_device, m_transferCommandPool, 1, &slot.command_buffer);
             slot.command_buffer = VK_NULL_HANDLE;
         }
 
-        for (VkBuffer buffer : slot.staging_buffers)
-        {
-            if (buffer)
-            {
-                vkDestroyBuffer(m_device, buffer, nullptr);
-            }
-        }
-
-        for (VkDeviceMemory memory : slot.staging_memories)
-        {
-            if (memory)
-            {
-                vkFreeMemory(m_device, memory, nullptr);
-            }
-        }
-
-        slot.staging_buffers.clear();
-        slot.staging_memories.clear();
         slot.pending = false;
+    }
+
+    void VKRenderer::Impl::destroyUploadSlotStaging(UploadSlot& slot)
+    {
+        if (slot.staging_mapped)
+        {
+            vkUnmapMemory(m_device, slot.staging_memory);
+            slot.staging_mapped = nullptr;
+        }
+
+        if (slot.staging_buffer != VK_NULL_HANDLE)
+        {
+            vkDestroyBuffer(m_device, slot.staging_buffer, nullptr);
+            slot.staging_buffer = VK_NULL_HANDLE;
+        }
+
+        if (slot.staging_memory != VK_NULL_HANDLE)
+        {
+            vkFreeMemory(m_device, slot.staging_memory, nullptr);
+            slot.staging_memory = VK_NULL_HANDLE;
+        }
+
+        slot.staging_capacity = 0;
+    }
+
+    void VKRenderer::Impl::ensureStagingCapacity(UploadSlot& slot, VkDeviceSize size)
+    {
+        if (slot.staging_buffer != VK_NULL_HANDLE && slot.staging_capacity >= size)
+        {
+            return;
+        }
+
+        // Round up so repeated similar-sized batches don't reallocate (a full-image
+        // slot settles at the 8 MB batch size; a 1x1 placeholder stays at 1 MB).
+        static constexpr VkDeviceSize kGranularity = 1 * 1024 * 1024;
+        VkDeviceSize capacity = ((size + (kGranularity - 1)) / kGranularity) * kGranularity;
+        if (capacity == 0)
+        {
+            capacity = kGranularity;
+        }
+
+        // The caller only ever grows an idle slot (acquireUploadSlot returns slots
+        // whose fence has signalled), so replacing the buffer here is safe.
+        destroyUploadSlotStaging(slot);
+
+        createBuffer(capacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     slot.staging_buffer, slot.staging_memory);
+
+        vkMapMemory(m_device, slot.staging_memory, 0, capacity, 0, &slot.staging_mapped);
+        slot.staging_capacity = capacity;
     }
 
     void VKRenderer::Impl::recycleUploadSlots(GpuTexture& texture, bool wait)
@@ -1079,17 +1124,34 @@ namespace ifap
             return 0;
         }
 
-        static constexpr size_t kMaxUploadBytesPerBatch = 8 * 1024 * 1024;
+        static constexpr VkDeviceSize kMaxUploadBytesPerBatch = 8 * 1024 * 1024;
+        // Buffer copy offsets must be a multiple of the texel block size and of 4;
+        // 16 satisfies RGBA8 (4), RGBA16F (8) and RGBA32F (16).
+        static constexpr VkDeviceSize kBufferOffsetAlign = 16;
 
-        size_t submitted = 0;
-        size_t bytes_used = 0;
+        const VkDeviceSize bpp = bytesPerPixel(texture.format);
 
+        struct BatchEntry
+        {
+            size_t index;
+            VkDeviceSize offset;
+            VkDeviceSize size;
+        };
+
+        std::vector<BatchEntry> batch;
+        batch.reserve(count);
+
+        VkDeviceSize cursor = 0;
+        size_t consumed = 0;
+
+        // Select a contiguous run of regions and pack them into one staging buffer.
         for (size_t i = 0; i < count; ++i)
         {
             const TextureRegionUpload& region = regions[i];
 
             if (!region.pixels || region.width <= 0 || region.height <= 0)
             {
+                consumed = i + 1;
                 continue;
             }
 
@@ -1099,37 +1161,39 @@ namespace ifap
             {
                 printLine(Print::Error, "VKRenderer: upload rect out of bounds ({}x{} at {},{} in {}x{})",
                     region.width, region.height, region.x, region.y, texture.width, texture.height);
+                consumed = i + 1;
                 continue;
             }
 
-            const size_t rowBytes = size_t(region.width) * bytesPerPixel(texture.format);
-            const VkDeviceSize imageSize = rowBytes * size_t(region.height);
+            const VkDeviceSize rowBytes = VkDeviceSize(region.width) * bpp;
+            const VkDeviceSize imageSize = rowBytes * VkDeviceSize(region.height);
+            const VkDeviceSize offset = (cursor + (kBufferOffsetAlign - 1)) & ~(kBufferOffsetAlign - 1);
 
-            if (submitted > 0 && bytes_used + size_t(imageSize) > kMaxUploadBytesPerBatch)
+            // Always accept the first region (even if it exceeds the budget); stop
+            // once adding another would push the batch past the per-frame budget.
+            if (!batch.empty() && offset + imageSize > kMaxUploadBytesPerBatch)
             {
                 break;
             }
 
-            VkBuffer stagingBuffer = VK_NULL_HANDLE;
-            VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-            createBuffer(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                         stagingBuffer, stagingMemory);
-
-            void* mapped = nullptr;
-            vkMapMemory(m_device, stagingMemory, 0, imageSize, 0, &mapped);
-            std::memcpy(mapped, region.pixels, size_t(imageSize));
-            vkUnmapMemory(m_device, stagingMemory);
-
-            slot->staging_buffers.push_back(stagingBuffer);
-            slot->staging_memories.push_back(stagingMemory);
-            bytes_used += size_t(imageSize);
-            ++submitted;
+            batch.push_back({ i, offset, imageSize });
+            cursor = offset + imageSize;
+            consumed = i + 1;
         }
 
-        if (submitted == 0)
+        if (batch.empty())
         {
-            return 0;
+            return consumed;
+        }
+
+        // Reuse the slot's persistent staging buffer; grow only if a batch ever needs
+        // more (then it stays at that size). No per-region allocation.
+        ensureStagingCapacity(*slot, cursor);
+
+        u8* base = reinterpret_cast<u8*>(slot->staging_mapped);
+        for (const BatchEntry& entry : batch)
+        {
+            std::memcpy(base + entry.offset, regions[entry.index].pixels, size_t(entry.size));
         }
 
         VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
@@ -1181,26 +1245,13 @@ namespace ifap
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             0, 0, nullptr, 0, nullptr, 1, &toTransfer);
 
-        size_t stagingIndex = 0;
-        for (size_t i = 0; i < count && stagingIndex < submitted; ++i)
+        for (const BatchEntry& entry : batch)
         {
-            const TextureRegionUpload& region = regions[i];
-
-            if (!region.pixels || region.width <= 0 || region.height <= 0)
-            {
-                continue;
-            }
-
-            if (region.x < 0 || region.y < 0 ||
-                region.x + region.width > texture.width ||
-                region.y + region.height > texture.height)
-            {
-                continue;
-            }
+            const TextureRegionUpload& region = regions[entry.index];
 
             VkBufferImageCopy copyRegion =
             {
-                .bufferOffset = 0,
+                .bufferOffset = entry.offset,
                 .bufferRowLength = 0,
                 .bufferImageHeight = 0,
                 .imageSubresource =
@@ -1214,9 +1265,8 @@ namespace ifap
                 .imageExtent = { u32(region.width), u32(region.height), 1 },
             };
 
-            vkCmdCopyBufferToImage(commandBuffer, slot->staging_buffers[stagingIndex], texture.image,
+            vkCmdCopyBufferToImage(commandBuffer, slot->staging_buffer, texture.image,
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
-            ++stagingIndex;
         }
 
         VkImageMemoryBarrier toShader =
@@ -1258,7 +1308,7 @@ namespace ifap
         slot->pending = true;
         texture.layout_ready = true;
 
-        return submitted;
+        return consumed;
     }
 
     TextureHandle VKRenderer::Impl::createTexture(int width, int height, PixelFormat format, const void* initial_data)
@@ -1345,6 +1395,43 @@ namespace ifap
         return submitUploadRegions(*texture, regions, count);
     }
 
+    void VKRenderer::Impl::freeTextureResources(GpuTexture& texture, TextureHandle handle)
+    {
+        if (texture.descriptor)
+        {
+            vkFreeDescriptorSets(m_device, m_descriptorPool, 1, &texture.descriptor);
+        }
+
+        if (texture.view)
+        {
+            vkDestroyImageView(m_device, texture.view, nullptr);
+        }
+
+        if (texture.image)
+        {
+            vkDestroyImage(m_device, texture.image, nullptr);
+        }
+
+        if (texture.memory)
+        {
+            vkFreeMemory(m_device, texture.memory, nullptr);
+        }
+
+        for (UploadSlot& slot : texture.upload_slots)
+        {
+            if (slot.fence)
+            {
+                vkDestroyFence(m_device, slot.fence, nullptr);
+                slot.fence = VK_NULL_HANDLE;
+            }
+
+            releaseUploadSlot(slot);
+            destroyUploadSlotStaging(slot);
+        }
+
+        m_textures[handle - 1].reset();
+    }
+
     void VKRenderer::Impl::destroyTexture(TextureHandle handle)
     {
         GpuTexture* texture = getTexture(handle);
@@ -1353,39 +1440,34 @@ namespace ifap
             return;
         }
 
+        // Blocking variant: used at teardown where waiting out in-flight uploads is
+        // acceptable and guarantees the GPU no longer references the image/memory.
         recycleUploadSlots(*texture, true);
+        freeTextureResources(*texture, handle);
+    }
 
-        if (texture->descriptor)
+    bool VKRenderer::Impl::tryDestroyTexture(TextureHandle handle)
+    {
+        GpuTexture* texture = getTexture(handle);
+        if (!texture)
         {
-            vkFreeDescriptorSets(m_device, m_descriptorPool, 1, &texture->descriptor);
+            return true;
         }
 
-        if (texture->view)
-        {
-            vkDestroyImageView(m_device, texture->view, nullptr);
-        }
+        // Reclaim any slots whose fence has already signalled, without waiting.
+        recycleUploadSlots(*texture, false);
 
-        if (texture->image)
+        for (const UploadSlot& slot : texture->upload_slots)
         {
-            vkDestroyImage(m_device, texture->image, nullptr);
-        }
-
-        if (texture->memory)
-        {
-            vkFreeMemory(m_device, texture->memory, nullptr);
-        }
-
-        for (UploadSlot& slot : texture->upload_slots)
-        {
-            if (slot.fence)
+            if (slot.pending)
             {
-                vkDestroyFence(m_device, slot.fence, nullptr);
+                // An upload is still referencing this image; defer destruction.
+                return false;
             }
-
-            releaseUploadSlot(slot);
         }
 
-        m_textures[handle - 1].reset();
+        freeTextureResources(*texture, handle);
+        return true;
     }
 
     void VKRenderer::Impl::createPipelines()
@@ -2147,5 +2229,6 @@ namespace ifap
     void VKRenderer::uploadTextureRegion(TextureHandle handle, PixelFormat format, int x, int y, int width, int height, const void* pixels) { m_impl->uploadTextureRegion(handle, format, x, y, width, height, pixels); }
     size_t VKRenderer::uploadTextureRegions(TextureHandle handle, PixelFormat format, const TextureRegionUpload* regions, size_t count) { return m_impl->uploadTextureRegions(handle, format, regions, count); }
     void VKRenderer::destroyTexture(TextureHandle handle) { m_impl->destroyTexture(handle); }
+    bool VKRenderer::tryDestroyTexture(TextureHandle handle) { return m_impl->tryDestroyTexture(handle); }
 
 } // namespace ifap
