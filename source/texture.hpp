@@ -15,6 +15,8 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 
 namespace ifap
 {
@@ -57,6 +59,7 @@ namespace ifap
 
         // Timing instrumentation.
         std::string name;
+        size_t index = 0;                        // position in the indexer (for tracing)
         std::atomic<u64> decode_start_ms { 0 };  // set on worker just before launch()
         std::atomic<u64> decode_first_ms { 0 };  // first decode callback (first pixels)
         bool decode_logged = false;              // main thread only
@@ -86,7 +89,24 @@ namespace ifap
         size_t m_last_priority_index = size_t(-1);
         int m_upload_settle_frames = 0;
 
+        // Decode-trace transition tracking (avoids logging every poll-rate frame).
+        size_t m_trace_last_index = size_t(-1);
+        int m_trace_last_state = -2;
+
+        // Evictable background store for images outside the active window. The
+        // eviction policy here is a swappable detail (ARCCache / LRUCache / ...):
+        // the visible image and its prefetch window are NOT kept here, they live
+        // in m_pinned and are immune to eviction, so the cache policy can never
+        // strand the on-screen image regardless of its retention heuristics.
         ARCCache<size_t, std::shared_ptr<DecodeTask>> m_cache { texture_cache_size };
+
+        // Pinned overlay: the current image plus the prefetch window. Entries here
+        // are never evicted. As navigation moves the window, entries that fall out
+        // are migrated back into m_cache (still resident, now evictable) and ones
+        // that enter are pulled out of m_cache. A task lives in exactly one store.
+        std::unordered_map<size_t, std::shared_ptr<DecodeTask>> m_pinned;
+        std::vector<size_t> m_pin_set;
+
         ImageFileIndexer m_indexer;
 
         std::shared_ptr<Path> m_current_path;
@@ -128,8 +148,17 @@ namespace ifap
 
         std::shared_ptr<DecodeTask> makeTask();
         void deferDispose(DecodeTask* task);
-        void enqueuePrepare(WorkerJob job);
+        void enqueuePrepare(WorkerJob job, bool front = false);
         void enqueueDispose(WorkerJob job);
+        void cancelStaleDecodes(size_t priority_index);
+
+        // Pinned-overlay helpers (see m_pinned).
+        bool isPinIndex(size_t index) const;
+        std::shared_ptr<DecodeTask> lookupTask(size_t index);
+        void storeTask(size_t index, const std::shared_ptr<DecodeTask>& task);
+        void repin(size_t priority_index);
+        void forEachTask(const std::function<void(size_t, std::shared_ptr<DecodeTask>&)>& fn);
+
         void workerThreadMain();
         void reaperThreadMain();
         void runPrepare(const std::shared_ptr<DecodeTask>& task);
@@ -151,7 +180,7 @@ namespace ifap
         operator const ImageFileIndexer& () const;
 
         size_t setCurrentPath(const std::string& name);
-        std::shared_ptr<DecodeTask> getTexture(size_t index);
+        std::shared_ptr<DecodeTask> getTexture(size_t index, bool priority = false);
         void setPrefetchDirection(int direction);
         bool updateDecodeTask(DecodeTask& task);
         bool update(size_t priority_index);

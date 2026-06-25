@@ -1,6 +1,6 @@
 /*
     iFap Image Viewer Example for MANGO
-    Copyright 2013-2025 Twilight 3D Finland Oy. All rights reserved.
+    Copyright 2013-2026 Twilight 3D Finland Oy. All rights reserved.
 */
 #pragma once
 
@@ -13,7 +13,7 @@ namespace ifap
     using mango::u64;
     using mango::math::float32x2;
 
-    static constexpr size_t texture_cache_size = 16;
+    static constexpr size_t texture_cache_size = 20;
     static constexpr size_t texture_prefetch_size = 4;
 
     // Upper bound on decodes running at once (the visible image plus prefetch).

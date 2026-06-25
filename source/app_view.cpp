@@ -68,7 +68,7 @@ namespace ifap
 
             m_current_index = modulo(m_current_index + direction, count);
             m_texture_cache.setPrefetchDirection(direction);
-            m_current_task = m_texture_cache.getTexture(m_current_index);
+            m_current_task = m_texture_cache.getTexture(m_current_index, true);
 
             resetTransformation();
         }
@@ -329,7 +329,7 @@ namespace ifap
         if (index != -1u)
         {
             m_current_index = index;
-            m_current_task = m_texture_cache.getTexture(m_current_index);
+            m_current_task = m_texture_cache.getTexture(m_current_index, true);
             resetTransformation();
             requestRedraw();
         }

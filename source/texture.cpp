@@ -13,6 +13,9 @@
 namespace ifap
 {
 
+    // Flip to false to silence the decode lifecycle trace.
+    static constexpr bool trace_decode = false;
+
     namespace
     {
         math::int32x2 computeDownscaleDimensions(int width, int height, int max_dimension)
@@ -153,6 +156,8 @@ namespace ifap
         shutdown();
 
         m_cache.clear();
+        m_pinned.clear();
+        m_pin_set.clear();
 
         {
             std::lock_guard lock(m_worker_mutex);
@@ -191,7 +196,7 @@ namespace ifap
 
         m_indexer.stop();
 
-        m_cache.for_each([] (size_t /*index*/, std::shared_ptr<DecodeTask>& task)
+        forEachTask([] (size_t /*index*/, std::shared_ptr<DecodeTask>& task)
         {
             if (task && task->decoder)
             {
@@ -253,11 +258,21 @@ namespace ifap
         enqueueDispose(std::move(job));
     }
 
-    void TextureCache::enqueuePrepare(WorkerJob job)
+    void TextureCache::enqueuePrepare(WorkerJob job, bool front)
     {
         {
             std::lock_guard lock(m_worker_mutex);
-            m_worker_jobs.push_back(std::move(job));
+
+            // Navigation (the visible image) jumps the queue so a fast scroll always
+            // prepares the latest target first; prefetch stays FIFO at the back.
+            if (front)
+            {
+                m_worker_jobs.push_front(std::move(job));
+            }
+            else
+            {
+                m_worker_jobs.push_back(std::move(job));
+            }
         }
 
         m_worker_cv.notify_one();
@@ -352,6 +367,18 @@ namespace ifap
             return;
         }
 
+        // Evicted before we reached it: the user scrolled past while this prepare sat
+        // in the queue, so only this job still references the task. Skip the expensive
+        // bitmap allocation + decode launch instead of doing work nobody will use.
+        if (task.use_count() <= 1)
+        {
+            if (trace_decode)
+            {
+                printLine("[trace] #{} skip-orphan (use_count={})", task->index, task.use_count());
+            }
+            return;
+        }
+
         try
         {
             if (task->downscale)
@@ -365,6 +392,11 @@ namespace ifap
 
             task->decode_start_ms.store(mango::Time::ms());
 
+            if (trace_decode)
+            {
+                printLine("[trace] #{} launch", task->index);
+            }
+
             task->future = task->decoder->launch([this, task = task.get()] (const ImageDecodeRect& rect)
             {
                 if (m_shutdown || (m_should_abort && m_should_abort()))
@@ -372,14 +404,22 @@ namespace ifap
                     return;
                 }
 
+                bool first = false;
+
                 {
                     std::lock_guard lock(task->mutex);
                     if (!task->decode_first_ms.load())
                     {
                         task->decode_first_ms.store(mango::Time::ms());
+                        first = true;
                     }
                     task->updates.push_back(rect);
                     task->progress += rect.progress;
+                }
+
+                if (trace_decode && first)
+                {
+                    printLine("[trace] #{} first-pixels", task->index);
                 }
 
                 if (m_on_content_changed)
@@ -498,6 +538,168 @@ namespace ifap
         m_prefetch_direction = direction;
     }
 
+    void TextureCache::cancelStaleDecodes(size_t priority_index)
+    {
+        const size_t count = m_indexer.size();
+        if (!count)
+        {
+            return;
+        }
+
+        // Keep in-flight decodes bounded to a window around the visible image. Anything
+        // further out is work for images the user already scrolled past; cancelling it
+        // frees decode-pool/worker capacity so the visible image's decode isn't starved.
+        const size_t keep = texture_prefetch_size;
+
+        std::vector<size_t> stale;
+
+        m_cache.for_each([&] (size_t index, std::shared_ptr<DecodeTask>& task)
+        {
+            if (index == priority_index || !task)
+            {
+                return;
+            }
+
+            // Only reclaim work still in flight; finished textures stay cached so
+            // navigating back to them is instant.
+            if (!task->isDecoding())
+            {
+                return;
+            }
+
+            const size_t forward = (index + count - priority_index) % count;
+            const size_t backward = (priority_index + count - index) % count;
+            const size_t distance = std::min(forward, backward);
+
+            if (distance > keep)
+            {
+                stale.push_back(index);
+            }
+        });
+
+        // Erasing drops the cache's strong reference; the task's deleter routes it to
+        // the reaper, which cancels the decoder and joins the future before freeing it.
+        for (size_t index : stale)
+        {
+            if (trace_decode)
+            {
+                printLine("[trace] #{} cancel-stale (priority #{})", index, priority_index);
+            }
+
+            m_cache.erase(index);
+        }
+    }
+
+    bool TextureCache::isPinIndex(size_t index) const
+    {
+        return std::find(m_pin_set.begin(), m_pin_set.end(), index) != m_pin_set.end();
+    }
+
+    std::shared_ptr<DecodeTask> TextureCache::lookupTask(size_t index)
+    {
+        auto it = m_pinned.find(index);
+        if (it != m_pinned.end())
+        {
+            return it->second;
+        }
+
+        if (auto cached = m_cache.get(index))
+        {
+            return cached.value();
+        }
+
+        return {};
+    }
+
+    void TextureCache::storeTask(size_t index, const std::shared_ptr<DecodeTask>& task)
+    {
+        // Window members go into the eviction-immune overlay; everything else into
+        // the evictable cache. repin() keeps m_pin_set in sync with the window.
+        if (isPinIndex(index))
+        {
+            m_pinned[index] = task;
+        }
+        else
+        {
+            m_cache.insert(index, task);
+        }
+    }
+
+    void TextureCache::forEachTask(const std::function<void(size_t, std::shared_ptr<DecodeTask>&)>& fn)
+    {
+        for (auto& entry : m_pinned)
+        {
+            fn(entry.first, entry.second);
+        }
+
+        m_cache.for_each(fn);
+    }
+
+    void TextureCache::repin(size_t priority_index)
+    {
+        const size_t count = m_indexer.size();
+        if (!count)
+        {
+            return;
+        }
+
+        // Desired pin window: the current image plus the active prefetch window.
+        // Built with the same index math as tickPrefetch() so the pinned set and
+        // the prefetched set stay identical.
+        std::vector<size_t> desired;
+        desired.push_back(priority_index % count);
+
+        const int dir = m_prefetch_direction ? m_prefetch_direction : 1;
+        for (size_t i = 0; i < texture_prefetch_size; ++i)
+        {
+            const size_t idx = modulo(priority_index + (i + 1) * size_t(dir), count);
+            if (std::find(desired.begin(), desired.end(), idx) == desired.end())
+            {
+                desired.push_back(idx);
+            }
+        }
+
+        auto inDesired = [&] (size_t idx)
+        {
+            return std::find(desired.begin(), desired.end(), idx) != desired.end();
+        };
+
+        // Migrate out: entries that left the window return to the evictable cache,
+        // staying resident so navigating back to them is instant.
+        for (auto it = m_pinned.begin(); it != m_pinned.end(); )
+        {
+            if (!inDesired(it->first))
+            {
+                m_cache.insert(it->first, it->second);
+                it = m_pinned.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+
+        // Publish the new window before migrating in, so storeTask()/isPinIndex()
+        // (and any creation that follows) route window members to the overlay.
+        m_pin_set = std::move(desired);
+
+        // Migrate in: window members currently sitting in the evictable cache are
+        // promoted to the overlay so eviction can never drop them.
+        for (size_t idx : m_pin_set)
+        {
+            if (m_pinned.find(idx) != m_pinned.end())
+            {
+                continue;
+            }
+
+            if (auto cached = m_cache.get(idx))
+            {
+                m_pinned[idx] = cached.value();
+                m_cache.erase(idx);
+            }
+        }
+    }
+
     void TextureCache::logDecodeTiming(DecodeTask& task)
     {
         if (task.decode_logged)
@@ -533,6 +735,14 @@ namespace ifap
     size_t TextureCache::countActiveDecodes() const
     {
         size_t active = 0;
+
+        for (const auto& entry : m_pinned)
+        {
+            if (entry.second && entry.second->isDecoding())
+            {
+                ++active;
+            }
+        }
 
         m_cache.for_each([&active] (size_t /*index*/, const std::shared_ptr<DecodeTask>& task)
         {
@@ -571,7 +781,7 @@ namespace ifap
         {
             const size_t index = modulo(priority_index + (i + 1) * size_t(m_prefetch_direction), count);
 
-            if (m_cache.get(index))
+            if (lookupTask(index))
             {
                 continue;
             }
@@ -628,6 +838,8 @@ namespace ifap
     size_t TextureCache::setCurrentPath(const std::string& name)
     {
         m_cache.clear();
+        m_pinned.clear();
+        m_pin_set.clear();
 
         std::string filename = name;
         Path temp(filename);
@@ -733,18 +945,27 @@ namespace ifap
         return m_current_index;
     }
 
-    std::shared_ptr<DecodeTask> TextureCache::getTexture(size_t index)
+    std::shared_ptr<DecodeTask> TextureCache::getTexture(size_t index, bool priority)
     {
-        auto entry = m_cache.get(index);
+        // Navigation defines a new pin window (current image + prefetch window).
+        // Establish it before lookup/creation so the visible image is routed to
+        // the eviction-immune overlay and protected from this point on.
+        if (priority)
+        {
+            repin(index);
+        }
+
+        auto entry = lookupTask(index);
         if (entry)
         {
-            return entry.value();
+            return entry;
         }
 
         std::shared_ptr<DecodeTask> task = makeTask();
         std::string filename = m_indexer[index];
 
         task->name = filename;
+        task->index = index;
         task->file = std::make_unique<File>(*m_current_path, filename);
         task->decoder = std::make_unique<ImageDecoder>(*task->file, filename);
         ImageHeader header = task->decoder->header();
@@ -767,7 +988,7 @@ namespace ifap
             createPlaceholderTexture(*task, m_renderer, header.width, header.height);
             task->prepare_state = PrepareState::Failed;
 
-            m_cache.insert(index, task);
+            storeTask(index, task);
             return task;
         }
 
@@ -806,12 +1027,18 @@ namespace ifap
 
         task->prepare_state = PrepareState::Preparing;
 
+        if (trace_decode)
+        {
+            printLine("[trace] #{} request (priority={}) {} x {}",
+                index, priority ? 1 : 0, header.width, header.height);
+        }
+
         WorkerJob job;
         job.type = WorkerJob::Type::Prepare;
         job.task = task;
-        enqueuePrepare(std::move(job));
+        enqueuePrepare(std::move(job), priority);
 
-        m_cache.insert(index, task);
+        storeTask(index, task);
         return task;
     }
 
@@ -915,6 +1142,13 @@ namespace ifap
         bool progress = false;
 
         drainGpuDestroys(2);
+
+        // Refresh the pin window first so the visible image and its prefetch window
+        // are in the eviction-immune overlay before cancelStaleDecodes()/tickPrefetch()
+        // run (a prefetch insert here could otherwise evict the just-navigated image).
+        repin(priority_index);
+
+        cancelStaleDecodes(priority_index);
         tickPrefetch(priority_index);
 
         // Adapt the GPU upload budget: stay conservative for a few frames after the
@@ -941,16 +1175,51 @@ namespace ifap
 
         // Decode-timing logging only; GPU texture creation is budgeted below so a burst
         // of finished prefetch decodes can't fire several large allocations in one frame.
-        m_cache.for_each([this] (size_t /*index*/, std::shared_ptr<DecodeTask>& task_ptr)
+        forEachTask([this] (size_t /*index*/, std::shared_ptr<DecodeTask>& task_ptr)
         {
             logDecodeTiming(*task_ptr);
         });
 
         // Priority image: always set up and uploaded immediately so the visible image
         // keeps progressing without waiting on a budget.
-        if (auto entry = m_cache.get(priority_index))
+        auto priority_entry = lookupTask(priority_index);
+
+        if (trace_decode)
         {
-            if (updateDecodeTask(*entry.value()))
+            // Report transitions only (this runs at the frame poll rate). The key signal
+            // is whether the visible image is even in the cache for update() to service,
+            // plus its servicing state when it changes.
+            int state = -1; // -1 = missing from cache
+            if (priority_entry)
+            {
+                const DecodeTask& t = *priority_entry;
+                state = (t.prepare_state == PrepareState::Ready ? 1 : 0)
+                      | (t.gpu_texture_ready ? 2 : 0)
+                      | (t.hasPendingUpdates() ? 4 : 0)
+                      | (t.isDecoding() ? 8 : 0);
+            }
+
+            if (priority_index != m_trace_last_index || state != m_trace_last_state)
+            {
+                m_trace_last_index = priority_index;
+                m_trace_last_state = state;
+
+                if (state < 0)
+                {
+                    printLine("[trace] #{} PRIORITY MISSING FROM CACHE", priority_index);
+                }
+                else
+                {
+                    printLine("[trace] #{} service ready={} gpu={} pending={} decoding={}",
+                        priority_index, (state & 1) ? 1 : 0, (state & 2) ? 1 : 0,
+                        (state & 4) ? 1 : 0, (state & 8) ? 1 : 0);
+                }
+            }
+        }
+
+        if (priority_entry)
+        {
+            if (updateDecodeTask(*priority_entry))
             {
                 progress = true;
             }
@@ -959,7 +1228,7 @@ namespace ifap
         int upload_budget = kBackgroundUploadBudget;
         int setup_budget = kBackgroundSetupBudget;
 
-        m_cache.for_each([this, priority_index, &upload_budget, &setup_budget, &progress]
+        forEachTask([this, priority_index, &upload_budget, &setup_budget, &progress]
             (size_t index, std::shared_ptr<DecodeTask>& task_ptr)
         {
             if (index == priority_index)
