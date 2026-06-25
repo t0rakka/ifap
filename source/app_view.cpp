@@ -44,8 +44,6 @@ namespace ifap
 
     void AppView::startup(const CommandLine& commands)
     {
-        printEnable(Print::Info, false);
-
         m_left_time = 0;
         m_right_time = 0;
 
@@ -403,23 +401,9 @@ namespace ifap
 
         // Input and texture work before swapchain acquire so event handling stays
         // responsive even when the GPU is busy decoding/uploading.
-        const u64 t0 = mango::Time::us();
         const bool texture_progress = m_texture_cache.update(m_current_index);
-        const u64 t1 = mango::Time::us();
 
         renderFrame();
-        const u64 t2 = mango::Time::us();
-
-        // Flag any main-thread stall: these should be a few ms at most. A spike here
-        // pinpoints whether the block is in texture upload/update or in the renderer
-        // (swapchain acquire/present, large GPU allocation, etc).
-        const u64 update_us = t1 - t0;
-        const u64 render_us = t2 - t1;
-        if (update_us > 8000 || render_us > 8000)
-        {
-            printLine(Print::Error, "[frame] update {} ms, render {} ms",
-                update_us / 1000, render_us / 1000);
-        }
 
         if (texture_progress || needsContinuousUpdate())
         {

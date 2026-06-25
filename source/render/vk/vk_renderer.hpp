@@ -49,6 +49,15 @@ namespace ifap
         // left intact and false is returned (caller should retry later). Never waits
         // on a fence, so it is safe to call every frame on the main thread.
         bool tryDestroyTexture(TextureHandle handle);
+
+        // Reclaim the persistent upload staging buffers for a texture that is fully
+        // uploaded (no more region uploads expected). Frees host memory; idle slots
+        // re-allocate lazily if another upload ever arrives.
+        void releaseUploadStaging(TextureHandle handle);
+
+        // Sets the per-frame GPU upload budget (bytes copied/transferred per upload
+        // submit). The cache lowers this while navigating and raises it when idle.
+        void setUploadBytesPerFrame(size_t bytes);
     };
 
 } // namespace ifap

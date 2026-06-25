@@ -509,6 +509,8 @@ namespace ifap
         uint32_t m_graphicsQueueFamilyIndex = 0;
         VkCommandPool m_graphicsCommandPool = VK_NULL_HANDLE;
         VkCommandPool m_transferCommandPool = VK_NULL_HANDLE;
+        // Per-frame upload budget (bytes), driven by the cache's navigation state.
+        VkDeviceSize m_uploadBytesPerBatch = 8 * 1024 * 1024;
         std::unique_ptr<Swapchain> m_swapchain;
         std::vector<VkCommandBuffer> m_commandBuffers;
         VkShaderModule m_processingVertexShader = VK_NULL_HANDLE;
@@ -633,6 +635,8 @@ namespace ifap
                                     const TextureRegionUpload* regions, size_t count);
         void destroyTexture(TextureHandle handle);
         bool tryDestroyTexture(TextureHandle handle);
+        void releaseUploadStaging(TextureHandle handle);
+        void setUploadBytesPerFrame(size_t bytes);
         void freeTextureResources(GpuTexture& texture, TextureHandle handle);
         int getMaxTextureDimension() const;
     };
@@ -1124,7 +1128,7 @@ namespace ifap
             return 0;
         }
 
-        static constexpr VkDeviceSize kMaxUploadBytesPerBatch = 8 * 1024 * 1024;
+        const VkDeviceSize maxUploadBytesPerBatch = m_uploadBytesPerBatch;
         // Buffer copy offsets must be a multiple of the texel block size and of 4;
         // 16 satisfies RGBA8 (4), RGBA16F (8) and RGBA32F (16).
         static constexpr VkDeviceSize kBufferOffsetAlign = 16;
@@ -1171,7 +1175,7 @@ namespace ifap
 
             // Always accept the first region (even if it exceeds the budget); stop
             // once adding another would push the batch past the per-frame budget.
-            if (!batch.empty() && offset + imageSize > kMaxUploadBytesPerBatch)
+            if (!batch.empty() && offset + imageSize > maxUploadBytesPerBatch)
             {
                 break;
             }
@@ -1468,6 +1472,34 @@ namespace ifap
 
         freeTextureResources(*texture, handle);
         return true;
+    }
+
+    void VKRenderer::Impl::setUploadBytesPerFrame(size_t bytes)
+    {
+        m_uploadBytesPerBatch = bytes ? VkDeviceSize(bytes) : VkDeviceSize(1);
+    }
+
+    void VKRenderer::Impl::releaseUploadStaging(TextureHandle handle)
+    {
+        GpuTexture* texture = getTexture(handle);
+        if (!texture)
+        {
+            return;
+        }
+
+        // Called once the image is fully decoded and uploaded: the persistent staging
+        // buffers won't be needed again, so reclaim them to free host memory. Slots
+        // still in flight keep their buffer (freed later on destroy). If a stray
+        // upload ever arrives, ensureStagingCapacity() simply reallocates.
+        recycleUploadSlots(*texture, false);
+
+        for (UploadSlot& slot : texture->upload_slots)
+        {
+            if (!slot.pending)
+            {
+                destroyUploadSlotStaging(slot);
+            }
+        }
     }
 
     void VKRenderer::Impl::createPipelines()
@@ -2230,5 +2262,7 @@ namespace ifap
     size_t VKRenderer::uploadTextureRegions(TextureHandle handle, PixelFormat format, const TextureRegionUpload* regions, size_t count) { return m_impl->uploadTextureRegions(handle, format, regions, count); }
     void VKRenderer::destroyTexture(TextureHandle handle) { m_impl->destroyTexture(handle); }
     bool VKRenderer::tryDestroyTexture(TextureHandle handle) { return m_impl->tryDestroyTexture(handle); }
+    void VKRenderer::releaseUploadStaging(TextureHandle handle) { m_impl->releaseUploadStaging(handle); }
+    void VKRenderer::setUploadBytesPerFrame(size_t bytes) { m_impl->setUploadBytesPerFrame(bytes); }
 
 } // namespace ifap

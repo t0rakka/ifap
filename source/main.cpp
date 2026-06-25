@@ -15,7 +15,7 @@ using namespace mango;
 
 int mangoMain(const mango::CommandLine& commands)
 {
-    printEnable(Print::Info, true);
+    printEnable(Print::Info, false);
     ifap::runApp(commands);
     return 0;
 }

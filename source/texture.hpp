@@ -82,6 +82,10 @@ namespace ifap
 
         std::atomic<bool> m_shutdown { false };
 
+        // Navigation tracking for the adaptive upload budget.
+        size_t m_last_priority_index = size_t(-1);
+        int m_upload_settle_frames = 0;
+
         ARCCache<size_t, std::shared_ptr<DecodeTask>> m_cache { texture_cache_size };
         ImageFileIndexer m_indexer;
 

@@ -523,7 +523,7 @@ namespace ifap
             return;
         }
 
-        printLine(Print::Error, "[decode] {}: total {} ms, first pixels {} ms ({} x {})",
+        printLine("[decode] {}: total {} ms, first pixels {} ms ({} x {})",
             task.name,
             end - start,
             first ? (first - start) : 0,
@@ -749,7 +749,7 @@ namespace ifap
         task->decoder = std::make_unique<ImageDecoder>(*task->file, filename);
         ImageHeader header = task->decoder->header();
 
-        printLine("{}: {} x {}", filename, header.width, header.height);
+        //printLine("{}: {} x {}", filename, header.width, header.height);
         if (!header.width || !header.height)
         {
             return {};
@@ -895,6 +895,11 @@ namespace ifap
         if (all_uploaded && task.gpu_texture_ready && decode_finished)
         {
             task.bitmap.reset();
+
+            // The image is fully on the GPU; the upload staging buffers are no longer
+            // needed, so reclaim them too (the CPU bitmap above was the larger cost,
+            // this trims the rest).
+            m_renderer.releaseUploadStaging(texture.handle);
         }
 
         return submitted > 0;
@@ -911,6 +916,25 @@ namespace ifap
 
         drainGpuDestroys(2);
         tickPrefetch(priority_index);
+
+        // Adapt the GPU upload budget: stay conservative for a few frames after the
+        // visible image changes (so navigation stays snappy), then ramp up so a
+        // dwelt-on image sharpens quickly.
+        if (priority_index != m_last_priority_index)
+        {
+            m_last_priority_index = priority_index;
+            m_upload_settle_frames = texture_upload_settle_frames;
+        }
+
+        if (m_upload_settle_frames > 0)
+        {
+            --m_upload_settle_frames;
+            m_renderer.setUploadBytesPerFrame(texture_upload_bytes_navigating);
+        }
+        else
+        {
+            m_renderer.setUploadBytesPerFrame(texture_upload_bytes_idle);
+        }
 
         static constexpr int kBackgroundUploadBudget = 1;
         static constexpr int kBackgroundSetupBudget = 1;
