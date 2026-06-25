@@ -1754,8 +1754,6 @@ namespace ifap
 
     bool VKRenderer::Impl::beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend)
     {
-        updateSwapchain();
-
         m_clear_color[0] = clear_r;
         m_clear_color[1] = clear_g;
         m_clear_color[2] = clear_b;
@@ -1766,7 +1764,31 @@ namespace ifap
         m_processing_rendering_active = false;
         m_content_drawn = false;
 
-        m_frame = m_swapchain->beginFrame();
+        // On VK_SUBOPTIMAL_KHR the acquired image no longer matches the surface: the
+        // window resized between resolving the surface extent and acquiring the image,
+        // so MoltenVK hands back a drawable of a different size. Presenting it shows the
+        // frame at the wrong extent for one frame — the resize flash. beginFrame() flags
+        // a recreate on SUBOPTIMAL, so recreate + re-acquire and only present a correctly
+        // sized frame. Bounded to two attempts: a second consecutive mismatch is rare
+        // enough that presenting it (one negligible flash) beats looping.
+        for (int attempt = 0; attempt < 2; ++attempt)
+        {
+            updateSwapchain();
+
+            m_frame = m_swapchain->beginFrame();
+            if (!m_frame)
+            {
+                break;
+            }
+
+            if (m_frame.acquireResult() == VK_SUBOPTIMAL_KHR && attempt == 0)
+            {
+                continue;
+            }
+
+            break;
+        }
+
         m_frame_active = bool(m_frame);
         return m_frame_active;
     }
