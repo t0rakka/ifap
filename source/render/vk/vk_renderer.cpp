@@ -614,6 +614,7 @@ namespace ifap
         void recycleUploadSlots(GpuTexture& texture, bool wait);
         UploadSlot* acquireUploadSlot(GpuTexture& texture);
         size_t submitUploadRegions(GpuTexture& texture, const TextureRegionUpload* regions, size_t count);
+        void clearTexture(GpuTexture& texture);
         VkSampler selectSampler(TextureFilter filter) const;
         VkPipeline selectPipeline(const ImageDrawRequest& request) const;
         void recordDraw(const ImageDrawRequest& request);
@@ -1315,6 +1316,113 @@ namespace ifap
         return consumed;
     }
 
+    void VKRenderer::Impl::clearTexture(GpuTexture& texture)
+    {
+        // Fill freshly created images with a defined neutral grey before any region
+        // upload arrives. The image backing a full-resolution texture is created with
+        // uninitialised device memory and streamed in tile-by-tile; once the first tile
+        // lands, layout_ready flips and the whole image is sampled — including the
+        // not-yet-uploaded area. Desktop drivers tend to hand back zeroed (dark) memory,
+        // but MoltenVK does not, so that area samples garbage and reads as magenta/pink.
+        // Clearing guarantees a defined placeholder colour on every platform. Submitted
+        // through the same async upload-slot path as a copy so it never blocks the caller.
+        UploadSlot* slot = acquireUploadSlot(texture);
+        if (!slot)
+        {
+            return;
+        }
+
+        VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+
+        VkCommandBufferAllocateInfo allocInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = m_transferCommandPool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1,
+        };
+
+        vkAllocateCommandBuffers(m_device, &allocInfo, &commandBuffer);
+
+        VkCommandBufferBeginInfo beginInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        };
+
+        vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+        const VkImageSubresourceRange range =
+        {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        };
+
+        VkImageMemoryBarrier toTransfer =
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = texture.image,
+            .subresourceRange = range,
+        };
+
+        vkCmdPipelineBarrier(commandBuffer,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &toTransfer);
+
+        VkClearColorValue clearColor {};
+        clearColor.float32[0] = 0.125f;
+        clearColor.float32[1] = 0.125f;
+        clearColor.float32[2] = 0.125f;
+        clearColor.float32[3] = 1.0f;
+
+        vkCmdClearColorImage(commandBuffer, texture.image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1, &range);
+
+        VkImageMemoryBarrier toShader =
+        {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = texture.image,
+            .subresourceRange = range,
+        };
+
+        vkCmdPipelineBarrier(commandBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &toShader);
+
+        vkEndCommandBuffer(commandBuffer);
+
+        vkResetFences(m_device, 1, &slot->fence);
+
+        VkSubmitInfo submitInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &commandBuffer,
+        };
+
+        vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, slot->fence);
+        slot->command_buffer = commandBuffer;
+        slot->pending = true;
+        texture.layout_ready = true;
+    }
+
     TextureHandle VKRenderer::Impl::createTexture(int width, int height, PixelFormat format, const void* initial_data)
     {
         auto texture = std::make_unique<GpuTexture>();
@@ -1366,6 +1474,13 @@ namespace ifap
             };
 
             submitUploadRegions(gpu, &region, 1);
+        }
+        else
+        {
+            // No initial pixels: the image streams in tile-by-tile, so clear it to a
+            // defined placeholder colour first (otherwise the not-yet-uploaded area
+            // samples uninitialised memory — pink on MoltenVK).
+            clearTexture(gpu);
         }
 
         return handle;
