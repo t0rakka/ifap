@@ -531,6 +531,7 @@ namespace ifap
         VkDeviceMemory m_processingMemory = VK_NULL_HANDLE;
         VkImageView m_processingView = VK_NULL_HANDLE;
         VkImageLayout m_processingLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkExtent2D m_processingExtent { 0, 0 };
         VkBuffer m_vertexBuffer = VK_NULL_HANDLE;
         VkDeviceMemory m_vertexBufferMemory = VK_NULL_HANDLE;
         VkSampler m_samplerNearest = VK_NULL_HANDLE;
@@ -583,9 +584,8 @@ namespace ifap
         void createDescriptorResources();
         void createProcessingTarget();
         void destroyProcessingTarget();
+        void ensureProcessingTarget();
         void createCommandBuffers();
-        void rebuildSwapchainResources();
-        void updateSwapchain();
         void beginCommandBufferRecording();
         void beginProcessingRendering();
         void endProcessingRendering();
@@ -846,15 +846,6 @@ namespace ifap
     {
         MANGO_UNREFERENCED(width);
         MANGO_UNREFERENCED(height);
-
-        // Swapchain recreation is intentionally NOT done here. It is deferred to
-        // beginFrame()'s updateSwapchain() so the recreate (which destroys the old
-        // swapchain still holding the on-screen image) is immediately followed by
-        // acquire + draw + present in the same callback, with nothing in between.
-        // This mirrors the vkbasic reference render() and avoids the resize flash
-        // caused by destroying the in-use swapchain in onResize, separate from the
-        // present. mango already calls invalidate() after onResize on every
-        // platform, so the redraw is scheduled even in OnDemand mode.
     }
 
     VkFormat VKRenderer::Impl::toVkFormat(PixelFormat format)
@@ -1502,24 +1493,39 @@ namespace ifap
 
             vkUpdateDescriptorSets(m_device, 1, &descriptorWrite, 0, nullptr);
         }
+
+        m_processingExtent = extent;
     }
 
-    void VKRenderer::Impl::rebuildSwapchainResources()
+    void VKRenderer::Impl::ensureProcessingTarget()
     {
-        vkDeviceWaitIdle(m_device);
-
-        if (!m_commandBuffers.empty())
+        if (!m_swapchain)
         {
-            vkFreeCommandBuffers(m_device, m_graphicsCommandPool, u32(m_commandBuffers.size()), m_commandBuffers.data());
-            m_commandBuffers.clear();
+            return;
         }
 
-        // Pipelines are NOT rebuilt: viewport/scissor are dynamic and the swapchain
-        // format is stable across resize, so a resize only swaps the extent-sized
-        // processing target and re-allocates command buffers. This removes the
-        // per-resize-step pipeline rebuild that produced the gap/flicker.
+        const VkExtent2D extent = m_swapchain->getExtent();
+        if (extent.width == 0 || extent.height == 0)
+        {
+            return;
+        }
+
+        if (m_processingImage != VK_NULL_HANDLE &&
+            extent.width == m_processingExtent.width &&
+            extent.height == m_processingExtent.height)
+        {
+            // Already matches the swapchain extent — nothing to rebuild. Command buffers
+            // depend only on the (stable) image count, and the pipelines use dynamic
+            // viewport/scissor with a stable format, so the extent-sized processing
+            // target is the only resource a resize touches.
+            return;
+        }
+
+        // beginFrame()'s recreate already waited on all swapchain fences, but the
+        // processing image may still be referenced by an earlier submission; idle the
+        // device before replacing it.
+        vkDeviceWaitIdle(m_device);
         createProcessingTarget();
-        createCommandBuffers();
     }
 
     void VKRenderer::Impl::createCommandBuffers()
@@ -1715,16 +1721,6 @@ namespace ifap
         destroy(m_resolvePipeline);
     }
 
-    void VKRenderer::Impl::updateSwapchain()
-    {
-        if (!m_swapchain->recreateSwapchain())
-        {
-            return;
-        }
-
-        rebuildSwapchainResources();
-    }
-
     VkSampler VKRenderer::Impl::selectSampler(TextureFilter filter) const
     {
         switch (filter)
@@ -1764,29 +1760,14 @@ namespace ifap
         m_processing_rendering_active = false;
         m_content_drawn = false;
 
-        // On VK_SUBOPTIMAL_KHR the acquired image no longer matches the surface: the
-        // window resized between resolving the surface extent and acquiring the image,
-        // so MoltenVK hands back a drawable of a different size. Presenting it shows the
-        // frame at the wrong extent for one frame — the resize flash. beginFrame() flags
-        // a recreate on SUBOPTIMAL, so recreate + re-acquire and only present a correctly
-        // sized frame. Bounded to two attempts: a second consecutive mismatch is rare
-        // enough that presenting it (one negligible flash) beats looping.
-        for (int attempt = 0; attempt < 2; ++attempt)
+        // beginFrame() owns the swapchain recreate + suboptimal retry, so it always
+        // hands back a correctly-sized image (or an empty frame to drop). We then sync
+        // the only extent-sized resource we own — the processing target — to the now
+        // final extent; it rebuilds only when the size actually changed.
+        m_frame = m_swapchain->beginFrame();
+        if (m_frame)
         {
-            updateSwapchain();
-
-            m_frame = m_swapchain->beginFrame();
-            if (!m_frame)
-            {
-                break;
-            }
-
-            if (m_frame.acquireResult() == VK_SUBOPTIMAL_KHR && attempt == 0)
-            {
-                continue;
-            }
-
-            break;
+            ensureProcessingTarget();
         }
 
         m_frame_active = bool(m_frame);
