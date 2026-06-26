@@ -566,6 +566,10 @@ namespace ifap
             int width = 0;
             int height = 0;
             bool layout_ready = false;
+            // Index of the last frame whose command buffer sampled this texture.
+            // Gates destruction until that frame has retired (see tryDestroyTexture);
+            // 0 means it has never been drawn.
+            u64 last_used_frame = 0;
         };
 
         std::vector<std::unique_ptr<GpuTexture>> m_textures;
@@ -581,6 +585,14 @@ namespace ifap
         float m_sdr_white_nits = 100.0f;
         int m_max_texture_dimension = 0;
         float m_clear_color[4] = { 0.06f, 0.06f, 0.06f, 1.0f };
+
+        // Monotonic count of frames actually submitted (advanced in endFrame). A
+        // texture drawn in frame N is referenced by a command buffer guarded by a
+        // swapchain fence that is not waited until N + m_maxImagesInFlight, so its GPU
+        // resources must not be freed until enough frames have retired. This makes
+        // destruction safe independent of the texture cache's size/eviction policy.
+        u64 m_frame_counter = 0;
+        static constexpr u64 kFrameRetireDelay = 3; // m_maxImagesInFlight (2) + 1
 
         void createDevice(VkInstance instance);
         void createPipelines();
@@ -1573,6 +1585,18 @@ namespace ifap
             return true;
         }
 
+        // A render frame's command buffer may still be sampling this texture's
+        // image/view/descriptor. Those are guarded by swapchain fences (up to
+        // m_maxImagesInFlight frames deep) that destroyTexture does NOT wait on, so
+        // freeing here while a frame is in flight is a use-after-free that faults the
+        // GPU (VK_ERROR_DEVICE_LOST). Defer until enough frames have retired. Textures
+        // never drawn (last_used_frame == 0) have no such reference.
+        if (texture->last_used_frame != 0 &&
+            m_frame_counter - texture->last_used_frame < kFrameRetireDelay)
+        {
+            return false;
+        }
+
         // Reclaim any slots whose fence has already signalled, without waiting.
         recycleUploadSlots(*texture, false);
 
@@ -2286,6 +2310,11 @@ namespace ifap
 
         m_content_drawn = true;
 
+        // The in-flight frame's command buffer now references this texture's
+        // image/view/descriptor; record it so tryDestroyTexture won't free the
+        // texture until that frame has retired.
+        texture->last_used_frame = m_frame_counter;
+
         ProcessingPushConstants push {};
         push.transform[0] = request.translate.x;
         push.transform[1] = request.translate.y;
@@ -2357,6 +2386,11 @@ namespace ifap
 
         m_frame.submitAndPresent(m_graphicsQueue, commandBuffer);
         m_frame_active = false;
+
+        // A frame referencing whatever textures recordDraw stamped is now submitted;
+        // advancing the counter lets tryDestroyTexture retire those textures once
+        // enough subsequent frames have made their swapchain fences signal.
+        ++m_frame_counter;
     }
 
     VKRenderer::VKRenderer(VulkanWindow& window, Instance& instance, VkSurfaceKHR surface)
