@@ -808,7 +808,7 @@ namespace ifap
         for (uint32_t i = 0; i < queueFamilies.size(); ++i)
         {
             if ((queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
-                getPresentationSupport(m_physicalDevice, i, m_window))
+                m_window.getPresentationSupport(m_physicalDevice, i))
             {
                 queueFamilyIndex = i;
                 break;
