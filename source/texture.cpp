@@ -1171,10 +1171,7 @@ namespace ifap
         }
 
         static constexpr int kBackgroundUploadBudget = 1;
-        static constexpr int kBackgroundSetupBudget = 1;
 
-        // Decode-timing logging only; GPU texture creation is budgeted below so a burst
-        // of finished prefetch decodes can't fire several large allocations in one frame.
         forEachTask([this] (size_t /*index*/, std::shared_ptr<DecodeTask>& task_ptr)
         {
             logDecodeTiming(*task_ptr);
@@ -1225,29 +1222,35 @@ namespace ifap
             }
         }
 
-        int upload_budget = kBackgroundUploadBudget;
-        int setup_budget = kBackgroundSetupBudget;
-
-        forEachTask([this, priority_index, &upload_budget, &setup_budget, &progress]
-            (size_t index, std::shared_ptr<DecodeTask>& task_ptr)
+        // Setup pass: create the GPU texture for every ready-but-uncreated prefetched
+        // image eagerly. With VMA this is a cheap pool sub-allocation plus an async
+        // clear (no fence wait), not the per-image vkAllocateMemory it used to be, and
+        // it is naturally rate-limited by the decode pipeline (texture_inflight_decode_limit).
+        // Front-loading it means a freshly-prefetched image is displayable (placeholder)
+        // the instant it is navigated to, instead of waiting for a budgeted frame.
+        // finishGpuSetup() no-ops on already-created, not-yet-ready, and downscale tasks.
+        forEachTask([this, priority_index] (size_t index, std::shared_ptr<DecodeTask>& task_ptr)
         {
             if (index == priority_index)
             {
                 return;
             }
 
-            // Bound prefetch texture setup to one per frame. With VMA, createTexture()
-            // is now a cheap pool sub-allocation (not a per-image vkAllocateMemory), so
-            // this is no longer the stall it once was; the real per-frame throttle is the
-            // pixel-upload byte budget (setUploadBytesPerFrame) applied in updateDecodeTask.
-            if (!task_ptr->gpu_texture_ready)
-            {
-                if (setup_budget <= 0)
-                {
-                    return;
-                }
+            finishGpuSetup(*task_ptr);
+        });
 
-                --setup_budget;
+        // Upload pass: pixel uploads stay throttled. The renderer's byte budget
+        // (setUploadBytesPerFrame) is applied per batch, so limiting background work to
+        // one batch per frame keeps it a true per-frame cap and protects navigation
+        // snappiness. A batch that makes progress sustains the redraw loop for the next.
+        int upload_budget = kBackgroundUploadBudget;
+
+        forEachTask([this, priority_index, &upload_budget, &progress]
+            (size_t index, std::shared_ptr<DecodeTask>& task_ptr)
+        {
+            if (index == priority_index)
+            {
+                return;
             }
 
             if (upload_budget <= 0)
