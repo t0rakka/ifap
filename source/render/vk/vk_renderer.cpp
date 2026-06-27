@@ -12,6 +12,7 @@
 
 #include <mango/vulkan/vulkan.hpp>
 #include <mango/vulkan/compiler.hpp>
+#include <mango/vulkan/allocator.hpp>
 
 namespace ifap
 {
@@ -505,6 +506,9 @@ namespace ifap
 
         VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
         VkDevice m_device = VK_NULL_HANDLE;
+        // Owns all image/buffer device memory via VMA. Created right after the device
+        // and destroyed just before it; every VMA-backed resource must be freed first.
+        std::unique_ptr<Allocator> m_allocator;
         VkQueue m_graphicsQueue = VK_NULL_HANDLE;
         uint32_t m_graphicsQueueFamilyIndex = 0;
         VkCommandPool m_graphicsCommandPool = VK_NULL_HANDLE;
@@ -530,12 +534,11 @@ namespace ifap
         VkPipeline m_pipelineBicubicNoBlend = VK_NULL_HANDLE;
         VkPipeline m_resolvePipeline = VK_NULL_HANDLE;
         VkImage m_processingImage = VK_NULL_HANDLE;
-        VkDeviceMemory m_processingMemory = VK_NULL_HANDLE;
+        VmaAllocation m_processingAllocation = VK_NULL_HANDLE;
         VkImageView m_processingView = VK_NULL_HANDLE;
         VkImageLayout m_processingLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkExtent2D m_processingExtent { 0, 0 };
-        VkBuffer m_vertexBuffer = VK_NULL_HANDLE;
-        VkDeviceMemory m_vertexBufferMemory = VK_NULL_HANDLE;
+        BufferAllocation m_vertexBuffer;
         VkSampler m_samplerNearest = VK_NULL_HANDLE;
         VkSampler m_samplerLinear = VK_NULL_HANDLE;
 
@@ -546,19 +549,18 @@ namespace ifap
             VkFence fence = VK_NULL_HANDLE;
             VkCommandBuffer command_buffer = VK_NULL_HANDLE;
             // Persistent, persistently-mapped staging buffer reused across uploads.
-            // Avoids a vkAllocateMemory per region per frame (the OpenGL backend let
-            // the driver manage staging; doing it by hand here was a regression).
-            VkBuffer staging_buffer = VK_NULL_HANDLE;
-            VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+            // Avoids an allocation per region per frame (the OpenGL backend let the
+            // driver manage staging; doing it by hand here was a regression). Backed by
+            // a VMA Upload allocation; write through staging.mapped.
+            BufferAllocation staging;
             VkDeviceSize staging_capacity = 0;
-            void* staging_mapped = nullptr;
             bool pending = false;
         };
 
         struct GpuTexture
         {
             VkImage image = VK_NULL_HANDLE;
-            VkDeviceMemory memory = VK_NULL_HANDLE;
+            VmaAllocation allocation = VK_NULL_HANDLE;
             VkImageView view = VK_NULL_HANDLE;
             VkDescriptorSet descriptor = VK_NULL_HANDLE;
             UploadSlot upload_slots[kUploadSlotCount] = {};
@@ -614,11 +616,7 @@ namespace ifap
         const GpuTexture* getTexture(TextureHandle handle) const;
         static VkFormat toVkFormat(PixelFormat format);
         static size_t bytesPerPixel(PixelFormat format);
-        uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
-        void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
-                          VkBuffer& buffer, VkDeviceMemory& memory) const;
-        void createImage(int width, int height, VkFormat format, VkImageUsageFlags usage,
-                         VkImage& image, VkDeviceMemory& memory) const;
+        ImageAllocation createImage(int width, int height, VkFormat format, VkImageUsageFlags usage) const;
         void createImageView(VkImage image, VkFormat format, VkImageView& view) const;
         void releaseUploadSlot(UploadSlot& slot);
         void destroyUploadSlotStaging(UploadSlot& slot);
@@ -658,6 +656,10 @@ namespace ifap
         : m_window(window)
     {
         createDevice(instance);
+
+        // VMA backs every image/buffer from here on. The device was created with the
+        // Vulkan 1.3 feature set, so advertise 1.3 to enable VMA's version-specific paths.
+        m_allocator = std::make_unique<Allocator>(instance, m_physicalDevice, m_device, VK_API_VERSION_1_3);
 
         const VkSurfaceFormatKHR selectedFormat = selectSurfaceFormat(m_physicalDevice, surface);
 
@@ -766,15 +768,8 @@ namespace ifap
                 vkDestroyShaderModule(m_device, m_resolveFragmentShader, nullptr);
             }
 
-            if (m_vertexBuffer)
-            {
-                vkDestroyBuffer(m_device, m_vertexBuffer, nullptr);
-            }
-
-            if (m_vertexBufferMemory)
-            {
-                vkFreeMemory(m_device, m_vertexBufferMemory, nullptr);
-            }
+            m_allocator->destroyBuffer(m_vertexBuffer);
+            m_vertexBuffer = {};
 
             if (m_samplerNearest)
             {
@@ -788,6 +783,12 @@ namespace ifap
 
             vkDestroyCommandPool(m_device, m_transferCommandPool, nullptr);
             vkDestroyCommandPool(m_device, m_graphicsCommandPool, nullptr);
+
+            // All VMA-backed resources (textures, processing target, vertex buffer,
+            // staging buffers) have been freed above; tear the allocator down before
+            // the device it was created against.
+            m_allocator.reset();
+
             vkDestroyDevice(m_device, nullptr);
         }
     }
@@ -905,52 +906,7 @@ namespace ifap
         return 4;
     }
 
-    uint32_t VKRenderer::Impl::findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const
-    {
-        VkPhysicalDeviceMemoryProperties memProperties;
-        vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &memProperties);
-
-        for (uint32_t i = 0; i < memProperties.memoryTypeCount; ++i)
-        {
-            if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties)
-            {
-                return i;
-            }
-        }
-
-        printLine(Print::Error, "VKRenderer: failed to find memory type.");
-        return 0;
-    }
-
-    void VKRenderer::Impl::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
-                                  VkBuffer& buffer, VkDeviceMemory& memory) const
-    {
-        VkBufferCreateInfo bufferInfo =
-        {
-            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            .size = size,
-            .usage = usage,
-            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        };
-
-        vkCreateBuffer(m_device, &bufferInfo, nullptr, &buffer);
-
-        VkMemoryRequirements requirements;
-        vkGetBufferMemoryRequirements(m_device, buffer, &requirements);
-
-        VkMemoryAllocateInfo allocInfo =
-        {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            .allocationSize = requirements.size,
-            .memoryTypeIndex = findMemoryType(requirements.memoryTypeBits, properties),
-        };
-
-        vkAllocateMemory(m_device, &allocInfo, nullptr, &memory);
-        vkBindBufferMemory(m_device, buffer, memory, 0);
-    }
-
-    void VKRenderer::Impl::createImage(int width, int height, VkFormat format, VkImageUsageFlags usage,
-                                       VkImage& image, VkDeviceMemory& memory) const
+    ImageAllocation VKRenderer::Impl::createImage(int width, int height, VkFormat format, VkImageUsageFlags usage) const
     {
         VkImageCreateInfo imageInfo =
         {
@@ -967,20 +923,7 @@ namespace ifap
             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
         };
 
-        vkCreateImage(m_device, &imageInfo, nullptr, &image);
-
-        VkMemoryRequirements requirements;
-        vkGetImageMemoryRequirements(m_device, image, &requirements);
-
-        VkMemoryAllocateInfo allocInfo =
-        {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            .allocationSize = requirements.size,
-            .memoryTypeIndex = findMemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
-        };
-
-        vkAllocateMemory(m_device, &allocInfo, nullptr, &memory);
-        vkBindImageMemory(m_device, image, memory, 0);
+        return m_allocator->createImage(imageInfo, MemoryUsage::GpuOnly);
     }
 
     void VKRenderer::Impl::createImageView(VkImage image, VkFormat format, VkImageView& view) const
@@ -1040,30 +983,15 @@ namespace ifap
 
     void VKRenderer::Impl::destroyUploadSlotStaging(UploadSlot& slot)
     {
-        if (slot.staging_mapped)
-        {
-            vkUnmapMemory(m_device, slot.staging_memory);
-            slot.staging_mapped = nullptr;
-        }
-
-        if (slot.staging_buffer != VK_NULL_HANDLE)
-        {
-            vkDestroyBuffer(m_device, slot.staging_buffer, nullptr);
-            slot.staging_buffer = VK_NULL_HANDLE;
-        }
-
-        if (slot.staging_memory != VK_NULL_HANDLE)
-        {
-            vkFreeMemory(m_device, slot.staging_memory, nullptr);
-            slot.staging_memory = VK_NULL_HANDLE;
-        }
-
+        // Persistently mapped: VMA unmaps as part of destroying the allocation.
+        m_allocator->destroyBuffer(slot.staging);
+        slot.staging = {};
         slot.staging_capacity = 0;
     }
 
     void VKRenderer::Impl::ensureStagingCapacity(UploadSlot& slot, VkDeviceSize size)
     {
-        if (slot.staging_buffer != VK_NULL_HANDLE && slot.staging_capacity >= size)
+        if (slot.staging.buffer != VK_NULL_HANDLE && slot.staging_capacity >= size)
         {
             return;
         }
@@ -1081,11 +1009,8 @@ namespace ifap
         // whose fence has signalled), so replacing the buffer here is safe.
         destroyUploadSlotStaging(slot);
 
-        createBuffer(capacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     slot.staging_buffer, slot.staging_memory);
-
-        vkMapMemory(m_device, slot.staging_memory, 0, capacity, 0, &slot.staging_mapped);
+        slot.staging = m_allocator->createBuffer(capacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                                 MemoryUsage::Upload, true);
         slot.staging_capacity = capacity;
     }
 
@@ -1207,11 +1132,15 @@ namespace ifap
         // more (then it stays at that size). No per-region allocation.
         ensureStagingCapacity(*slot, cursor);
 
-        u8* base = reinterpret_cast<u8*>(slot->staging_mapped);
+        u8* base = reinterpret_cast<u8*>(slot->staging.mapped);
         for (const BatchEntry& entry : batch)
         {
             std::memcpy(base + entry.offset, regions[entry.index].pixels, size_t(entry.size));
         }
+
+        // VMA Upload memory may be non-coherent; make the writes visible to the GPU
+        // before the copy. A no-op on coherent (incl. ReBAR) allocations.
+        m_allocator->flush(slot->staging.allocation, 0, VK_WHOLE_SIZE);
 
         VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 
@@ -1282,7 +1211,7 @@ namespace ifap
                 .imageExtent = { u32(region.width), u32(region.height), 1 },
             };
 
-            vkCmdCopyBufferToImage(commandBuffer, slot->staging_buffer, texture.image,
+            vkCmdCopyBufferToImage(commandBuffer, slot->staging.buffer, texture.image,
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
         }
 
@@ -1443,9 +1372,10 @@ namespace ifap
         texture->format = format;
 
         const VkFormat vkFormat = toVkFormat(format);
-        createImage(width, height, vkFormat,
-                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                    texture->image, texture->memory);
+        ImageAllocation image = createImage(width, height, vkFormat,
+                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        texture->image = image.image;
+        texture->allocation = image.allocation;
         createImageView(texture->image, vkFormat, texture->view);
 
         VkFenceCreateInfo fenceInfo =
@@ -1540,12 +1470,9 @@ namespace ifap
 
         if (texture.image)
         {
-            vkDestroyImage(m_device, texture.image, nullptr);
-        }
-
-        if (texture.memory)
-        {
-            vkFreeMemory(m_device, texture.memory, nullptr);
+            m_allocator->destroyImage({ texture.image, texture.allocation });
+            texture.image = VK_NULL_HANDLE;
+            texture.allocation = VK_NULL_HANDLE;
         }
 
         for (UploadSlot& slot : texture.upload_slots)
@@ -1679,14 +1606,9 @@ namespace ifap
 
         if (m_processingImage)
         {
-            vkDestroyImage(m_device, m_processingImage, nullptr);
+            m_allocator->destroyImage({ m_processingImage, m_processingAllocation });
             m_processingImage = VK_NULL_HANDLE;
-        }
-
-        if (m_processingMemory)
-        {
-            vkFreeMemory(m_device, m_processingMemory, nullptr);
-            m_processingMemory = VK_NULL_HANDLE;
+            m_processingAllocation = VK_NULL_HANDLE;
         }
 
         m_processingLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -1707,9 +1629,10 @@ namespace ifap
             return;
         }
 
-        createImage(int(extent.width), int(extent.height), kProcessingFormat,
-                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                    m_processingImage, m_processingMemory);
+        ImageAllocation processing = createImage(int(extent.width), int(extent.height), kProcessingFormat,
+                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        m_processingImage = processing.image;
+        m_processingAllocation = processing.allocation;
         createImageView(m_processingImage, kProcessingFormat, m_processingView);
 
         if (!m_resolveDescriptor && m_descriptorPool && m_resolveDescriptorSetLayout)
@@ -1946,14 +1869,12 @@ namespace ifap
              1.0f,  1.0f,
         };
 
-        createBuffer(sizeof(vertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     m_vertexBuffer, m_vertexBufferMemory);
-
-        void* data = nullptr;
-        vkMapMemory(m_device, m_vertexBufferMemory, 0, sizeof(vertices), 0, &data);
-        std::memcpy(data, vertices, sizeof(vertices));
-        vkUnmapMemory(m_device, m_vertexBufferMemory);
+        // Static 4-vertex quad: a persistently-mapped Upload buffer written once. Flush
+        // covers the non-coherent case (no-op otherwise); the GPU only reads it later.
+        m_vertexBuffer = m_allocator->createBuffer(sizeof(vertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                                                   MemoryUsage::Upload, true);
+        std::memcpy(m_vertexBuffer.mapped, vertices, sizeof(vertices));
+        m_allocator->flush(m_vertexBuffer.allocation, 0, VK_WHOLE_SIZE);
     }
 
     void VKRenderer::Impl::destroyPipelines()
@@ -2209,7 +2130,7 @@ namespace ifap
             VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ResolvePushConstants), &push);
 
         VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(commandBuffer, 0, 1, &m_vertexBuffer, &offset);
+        vkCmdBindVertexBuffers(commandBuffer, 0, 1, &m_vertexBuffer.buffer, &offset);
         vkCmdDraw(commandBuffer, 4, 1, 0, 0);
     }
 
@@ -2333,7 +2254,7 @@ namespace ifap
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ProcessingPushConstants), &push);
 
         VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(commandBuffer, 0, 1, &m_vertexBuffer, &offset);
+        vkCmdBindVertexBuffers(commandBuffer, 0, 1, &m_vertexBuffer.buffer, &offset);
         vkCmdDraw(commandBuffer, 4, 1, 0, 0);
     }
 
