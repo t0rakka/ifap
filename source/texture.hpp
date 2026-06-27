@@ -8,6 +8,8 @@
 #include "indexer.hpp"
 #include "render/vk/vk_renderer.hpp"
 
+#include <mango/core/buffer.hpp>
+
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -36,13 +38,33 @@ namespace ifap
     {
         VKRenderer& renderer;
 
-        std::unique_ptr<File> file;
+        // Captured on the UI thread at request time so the worker has a stable path to
+        // open even if the user changes folder (setCurrentPath reassigns the cache's
+        // current path) while this prepare is in flight.
+        std::shared_ptr<Path> path;
+
+        // The whole compressed file, read once into RAM on the worker thread (bulk
+        // sequential I/O, off the UI thread). The decoder reads from this, so it must
+        // outlive the async decode; it is released once the decode has finished.
+        std::unique_ptr<Buffer> buffer;
         std::unique_ptr<ImageDecoder> decoder;
         std::unique_ptr<Bitmap> bitmap;
         std::unique_ptr<Bitmap> scaled_bitmap;
         ImageDecodeFuture future;
 
         GpuTexture texture;
+
+        // Header parse results, produced by the worker (runPrepare) before prepare_state
+        // flips to Ready, then copied into `texture` exactly once on the UI thread
+        // (promoteHeaderDims, gated by prepare_state's release/acquire). Kept separate so
+        // the worker never writes the dims/format the per-frame draw path reads.
+        int header_width = 0;
+        int header_height = 0;
+        int header_sample_width = 0;
+        int header_sample_height = 0;
+        PixelFormat header_format = PixelFormat::RGBA8_UNORM;
+        bool header_linear = false;
+        bool header_applied = false; // UI-only guard for one-shot promotion
 
         Format bitmap_format;
         bool downscale = false;
@@ -143,6 +165,13 @@ namespace ifap
 
         std::mutex m_gpu_destroy_mutex;
         std::deque<TextureHandle> m_gpu_destroy_queue;
+
+        // One shared 1x1 placeholder texture, reused by every not-yet-ready image instead
+        // of allocating a per-task placeholder. This avoids doubling texture/descriptor
+        // creation (placeholder + real) and the destroy-queue churn that exhausts the
+        // descriptor pool under fast navigation. Never queued for destruction by tasks;
+        // owned by the cache and freed in the destructor.
+        TextureHandle m_placeholder = 0;
 
         int m_prefetch_direction = 0;
 

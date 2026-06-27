@@ -542,20 +542,26 @@ namespace ifap
         VkSampler m_samplerNearest = VK_NULL_HANDLE;
         VkSampler m_samplerLinear = VK_NULL_HANDLE;
 
-        static constexpr int kUploadSlotCount = 2;
+        // Renderer-global pool of in-flight upload/clear submissions, each tagged with
+        // the timeline value its submit signals. A slot is idle once that value is
+        // reached; idle slots are reclaimed and their staging reused. Replaces the old
+        // per-texture fenced slots — staging is now bounded globally, not per texture.
+        static constexpr int kUploadSlotCount = 8;
 
         struct UploadSlot
         {
-            VkFence fence = VK_NULL_HANDLE;
             VkCommandBuffer command_buffer = VK_NULL_HANDLE;
             // Persistent, persistently-mapped staging buffer reused across uploads.
-            // Avoids an allocation per region per frame (the OpenGL backend let the
-            // driver manage staging; doing it by hand here was a regression). Backed by
-            // a VMA Upload allocation; write through staging.mapped.
+            // Backed by a VMA Upload allocation; write through staging.mapped. (Clears
+            // acquire a slot but use no staging, so most slots never grow one.)
             BufferAllocation staging;
             VkDeviceSize staging_capacity = 0;
-            bool pending = false;
+            // Timeline value this slot's last submission signals; 0 = never used. The
+            // slot is idle (reclaimable) once the timeline has reached this value.
+            u64 pending_value = 0;
         };
+
+        UploadSlot m_uploadSlots[kUploadSlotCount];
 
         struct GpuTexture
         {
@@ -563,15 +569,15 @@ namespace ifap
             VmaAllocation allocation = VK_NULL_HANDLE;
             VkImageView view = VK_NULL_HANDLE;
             VkDescriptorSet descriptor = VK_NULL_HANDLE;
-            UploadSlot upload_slots[kUploadSlotCount] = {};
             PixelFormat format = PixelFormat::RGBA8_UNORM;
             int width = 0;
             int height = 0;
             bool layout_ready = false;
-            // Index of the last frame whose command buffer sampled this texture.
-            // Gates destruction until that frame has retired (see tryDestroyTexture);
-            // 0 means it has never been drawn.
-            u64 last_used_frame = 0;
+            // Highest timeline value of any submission (upload, clear, or frame draw)
+            // that referenced this texture's image/view/descriptor. Destruction is
+            // gated until the timeline reaches it (see tryDestroyTexture); 0 means
+            // nothing has ever referenced it.
+            u64 last_used_value = 0;
         };
 
         std::vector<std::unique_ptr<GpuTexture>> m_textures;
@@ -588,13 +594,14 @@ namespace ifap
         int m_max_texture_dimension = 0;
         float m_clear_color[4] = { 0.06f, 0.06f, 0.06f, 1.0f };
 
-        // Monotonic count of frames actually submitted (advanced in endFrame). A
-        // texture drawn in frame N is referenced by a command buffer guarded by a
-        // swapchain fence that is not waited until N + m_maxImagesInFlight, so its GPU
-        // resources must not be freed until enough frames have retired. This makes
-        // destruction safe independent of the texture cache's size/eviction policy.
-        u64 m_frame_counter = 0;
-        static constexpr u64 kFrameRetireDelay = 3; // m_maxImagesInFlight (2) + 1
+        // The unified GPU clock. Every queue submission (upload, clear, frame) signals
+        // ++m_timelineValue; resources record the value of their last use and are
+        // reclaimed once vkGetSemaphoreCounterValue() passes it. m_frame_value is the
+        // value the in-flight frame will signal, reserved in beginFrame() and stamped
+        // onto every texture sampled in recordDraw().
+        VkSemaphore m_timeline = VK_NULL_HANDLE;
+        u64 m_timelineValue = 0;
+        u64 m_frame_value = 0;
 
         void createDevice(VkInstance instance);
         void createPipelines();
@@ -618,11 +625,12 @@ namespace ifap
         static size_t bytesPerPixel(PixelFormat format);
         ImageAllocation createImage(int width, int height, VkFormat format, VkImageUsageFlags usage) const;
         void createImageView(VkImage image, VkFormat format, VkImageView& view) const;
-        void releaseUploadSlot(UploadSlot& slot);
         void destroyUploadSlotStaging(UploadSlot& slot);
         void ensureStagingCapacity(UploadSlot& slot, VkDeviceSize size);
-        void recycleUploadSlots(GpuTexture& texture, bool wait);
-        UploadSlot* acquireUploadSlot(GpuTexture& texture);
+        u64 timelineCompleted() const;
+        void waitTimeline(u64 value) const;
+        u64 submitTimelined(VkCommandBuffer commandBuffer);
+        UploadSlot* acquireUploadSlot();
         size_t submitUploadRegions(GpuTexture& texture, const TextureRegionUpload* regions, size_t count);
         void clearTexture(GpuTexture& texture);
         VkSampler selectSampler(TextureFilter filter) const;
@@ -660,6 +668,23 @@ namespace ifap
         // VMA backs every image/buffer from here on. The device was created with the
         // Vulkan 1.3 feature set, so advertise 1.3 to enable VMA's version-specific paths.
         m_allocator = std::make_unique<Allocator>(instance, m_physicalDevice, m_device, VK_API_VERSION_1_3);
+
+        // The unified reclamation clock (see m_timeline). Starts at 0; the first submit
+        // signals 1.
+        VkSemaphoreTypeCreateInfo timelineType =
+        {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+            .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+            .initialValue = 0,
+        };
+
+        VkSemaphoreCreateInfo timelineInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+            .pNext = &timelineType,
+        };
+
+        vkCreateSemaphore(m_device, &timelineInfo, nullptr, &m_timeline);
 
         const VkSurfaceFormatKHR selectedFormat = selectSurfaceFormat(m_physicalDevice, surface);
 
@@ -781,6 +806,25 @@ namespace ifap
                 vkDestroySampler(m_device, m_samplerLinear, nullptr);
             }
 
+            // vkDeviceWaitIdle above guarantees every timelined submission has retired,
+            // so the upload ring's command buffers and staging can be freed outright.
+            for (UploadSlot& slot : m_uploadSlots)
+            {
+                if (slot.command_buffer != VK_NULL_HANDLE)
+                {
+                    vkFreeCommandBuffers(m_device, m_transferCommandPool, 1, &slot.command_buffer);
+                    slot.command_buffer = VK_NULL_HANDLE;
+                }
+
+                destroyUploadSlotStaging(slot);
+            }
+
+            if (m_timeline != VK_NULL_HANDLE)
+            {
+                vkDestroySemaphore(m_device, m_timeline, nullptr);
+                m_timeline = VK_NULL_HANDLE;
+            }
+
             vkDestroyCommandPool(m_device, m_transferCommandPool, nullptr);
             vkDestroyCommandPool(m_device, m_graphicsCommandPool, nullptr);
 
@@ -833,9 +877,19 @@ namespace ifap
 
         std::vector<const char*> deviceExtensions = requiredDeviceExtensions();
 
+        // timelineSemaphore (core in 1.2) is the one monotonic clock used for all GPU
+        // resource reclamation: uploads, clears and frames signal increasing values and
+        // resources are freed once the completed value passes their last-use value.
+        VkPhysicalDeviceVulkan12Features features12 =
+        {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+            .timelineSemaphore = VK_TRUE,
+        };
+
         VkPhysicalDeviceVulkan13Features features13 =
         {
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+            .pNext = &features12,
             .dynamicRendering = VK_TRUE,
         };
 
@@ -967,18 +1021,58 @@ namespace ifap
         return m_textures[handle - 1].get();
     }
 
-    void VKRenderer::Impl::releaseUploadSlot(UploadSlot& slot)
+    u64 VKRenderer::Impl::timelineCompleted() const
     {
-        // Frees the transient command buffer and marks the slot idle. The persistent
-        // staging buffer is intentionally kept for reuse (destroyed only with the
-        // texture, in destroyUploadSlotStaging()).
-        if (slot.command_buffer != VK_NULL_HANDLE)
+        u64 value = 0;
+        vkGetSemaphoreCounterValue(m_device, m_timeline, &value);
+        return value;
+    }
+
+    void VKRenderer::Impl::waitTimeline(u64 value) const
+    {
+        if (value == 0)
         {
-            vkFreeCommandBuffers(m_device, m_transferCommandPool, 1, &slot.command_buffer);
-            slot.command_buffer = VK_NULL_HANDLE;
+            return;
         }
 
-        slot.pending = false;
+        VkSemaphoreWaitInfo waitInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            .semaphoreCount = 1,
+            .pSemaphores = &m_timeline,
+            .pValues = &value,
+        };
+
+        vkWaitSemaphores(m_device, &waitInfo, UINT64_MAX);
+    }
+
+    u64 VKRenderer::Impl::submitTimelined(VkCommandBuffer commandBuffer)
+    {
+        // One submission point for all upload/clear work: signals the next timeline
+        // value (no fence needed — reclamation reads the timeline). Same queue as the
+        // frame, so submission order + the command buffer's own image barriers give the
+        // upload→sample dependency without an explicit wait.
+        const u64 value = ++m_timelineValue;
+
+        VkTimelineSemaphoreSubmitInfo timelineInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+            .signalSemaphoreValueCount = 1,
+            .pSignalSemaphoreValues = &value,
+        };
+
+        VkSubmitInfo submitInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .pNext = &timelineInfo,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &commandBuffer,
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &m_timeline,
+        };
+
+        vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+        return value;
     }
 
     void VKRenderer::Impl::destroyUploadSlotStaging(UploadSlot& slot)
@@ -1014,38 +1108,25 @@ namespace ifap
         slot.staging_capacity = capacity;
     }
 
-    void VKRenderer::Impl::recycleUploadSlots(GpuTexture& texture, bool wait)
+    VKRenderer::Impl::UploadSlot* VKRenderer::Impl::acquireUploadSlot()
     {
-        for (UploadSlot& slot : texture.upload_slots)
+        // A slot is idle once the timeline has passed the value its last submission
+        // signalled (pending_value == 0 means never used). Reclaim that submission's
+        // command buffer and hand the slot back; its staging is kept for reuse. If all
+        // slots are still in flight, return null — the caller simply retries next frame
+        // (the pipeline stays non-blocking).
+        const u64 completed = timelineCompleted();
+
+        for (UploadSlot& slot : m_uploadSlots)
         {
-            if (!slot.pending || !slot.fence)
+            if (slot.pending_value <= completed)
             {
-                continue;
-            }
+                if (slot.command_buffer != VK_NULL_HANDLE)
+                {
+                    vkFreeCommandBuffers(m_device, m_transferCommandPool, 1, &slot.command_buffer);
+                    slot.command_buffer = VK_NULL_HANDLE;
+                }
 
-            VkResult result = wait
-                ? vkWaitForFences(m_device, 1, &slot.fence, VK_TRUE, UINT64_MAX)
-                : vkGetFenceStatus(m_device, slot.fence);
-
-            if (result == VK_SUCCESS)
-            {
-                releaseUploadSlot(slot);
-            }
-            else if (wait && result != VK_ERROR_DEVICE_LOST)
-            {
-                printLine(Print::Error, "VKRenderer: upload fence wait failed: {}", getString(result));
-            }
-        }
-    }
-
-    VKRenderer::Impl::UploadSlot* VKRenderer::Impl::acquireUploadSlot(GpuTexture& texture)
-    {
-        recycleUploadSlots(texture, false);
-
-        for (UploadSlot& slot : texture.upload_slots)
-        {
-            if (!slot.pending)
-            {
                 return &slot;
             }
         }
@@ -1060,7 +1141,7 @@ namespace ifap
             return 0;
         }
 
-        UploadSlot* slot = acquireUploadSlot(texture);
+        UploadSlot* slot = acquireUploadSlot();
         if (!slot)
         {
             return 0;
@@ -1240,19 +1321,11 @@ namespace ifap
 
         vkEndCommandBuffer(commandBuffer);
 
-        vkResetFences(m_device, 1, &slot->fence);
-
-        VkSubmitInfo submitInfo =
-        {
-            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            .commandBufferCount = 1,
-            .pCommandBuffers = &commandBuffer,
-        };
-
-        vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, slot->fence);
+        const u64 value = submitTimelined(commandBuffer);
         slot->command_buffer = commandBuffer;
-        slot->pending = true;
+        slot->pending_value = value;
         texture.layout_ready = true;
+        texture.last_used_value = std::max(texture.last_used_value, value);
 
         return consumed;
     }
@@ -1267,7 +1340,7 @@ namespace ifap
         // but MoltenVK does not, so that area samples garbage and reads as magenta/pink.
         // Clearing guarantees a defined placeholder colour on every platform. Submitted
         // through the same async upload-slot path as a copy so it never blocks the caller.
-        UploadSlot* slot = acquireUploadSlot(texture);
+        UploadSlot* slot = acquireUploadSlot();
         if (!slot)
         {
             return;
@@ -1349,45 +1422,36 @@ namespace ifap
 
         vkEndCommandBuffer(commandBuffer);
 
-        vkResetFences(m_device, 1, &slot->fence);
-
-        VkSubmitInfo submitInfo =
-        {
-            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            .commandBufferCount = 1,
-            .pCommandBuffers = &commandBuffer,
-        };
-
-        vkQueueSubmit(m_graphicsQueue, 1, &submitInfo, slot->fence);
+        const u64 value = submitTimelined(commandBuffer);
         slot->command_buffer = commandBuffer;
-        slot->pending = true;
+        slot->pending_value = value;
         texture.layout_ready = true;
+        texture.last_used_value = std::max(texture.last_used_value, value);
     }
 
     TextureHandle VKRenderer::Impl::createTexture(int width, int height, PixelFormat format, const void* initial_data)
     {
+        const VkFormat vkFormat = toVkFormat(format);
+        ImageAllocation image = createImage(width, height, vkFormat,
+                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+
+        if (image.image == VK_NULL_HANDLE)
+        {
+            // Allocation failed (typically VRAM exhaustion for very large images). Never
+            // build an image view / descriptor on a null image: that produces an invalid
+            // descriptor and crashes the GPU at draw time. Return 0 so the caller keeps
+            // its placeholder and can retry once other textures have been freed.
+            printLine(Print::Error, "VKRenderer: createTexture {}x{} failed (out of GPU memory)", width, height);
+            return 0;
+        }
+
         auto texture = std::make_unique<GpuTexture>();
         texture->width = width;
         texture->height = height;
         texture->format = format;
-
-        const VkFormat vkFormat = toVkFormat(format);
-        ImageAllocation image = createImage(width, height, vkFormat,
-                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
         texture->image = image.image;
         texture->allocation = image.allocation;
         createImageView(texture->image, vkFormat, texture->view);
-
-        VkFenceCreateInfo fenceInfo =
-        {
-            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-            .flags = VK_FENCE_CREATE_SIGNALED_BIT,
-        };
-
-        for (UploadSlot& slot : texture->upload_slots)
-        {
-            vkCreateFence(m_device, &fenceInfo, nullptr, &slot.fence);
-        }
 
         VkDescriptorSetAllocateInfo allocInfo =
         {
@@ -1397,7 +1461,20 @@ namespace ifap
             .pSetLayouts = &m_contentDescriptorSetLayout,
         };
 
-        vkAllocateDescriptorSets(m_device, &allocInfo, &texture->descriptor);
+        VkResult descriptorResult = vkAllocateDescriptorSets(m_device, &allocInfo, &texture->descriptor);
+
+        if (descriptorResult != VK_SUCCESS || texture->descriptor == VK_NULL_HANDLE)
+        {
+            // Descriptor pool exhausted: a null descriptor set would crash the driver at
+            // draw time (vkUpdateDescriptorSets with dstSet == NULL). Unwind the image and
+            // view we just built and return 0 so the caller keeps its placeholder/retries.
+            printLine(Print::Error, "VKRenderer: createTexture {}x{} failed (descriptor pool exhausted)", width, height);
+            texture->descriptor = VK_NULL_HANDLE;
+            vkDestroyImageView(m_device, texture->view, nullptr);
+            ImageAllocation toFree = { texture->image, texture->allocation };
+            m_allocator->destroyImage(toFree);
+            return 0;
+        }
 
         m_textures.push_back(std::move(texture));
         TextureHandle handle = TextureHandle(m_textures.size());
@@ -1475,18 +1552,8 @@ namespace ifap
             texture.allocation = VK_NULL_HANDLE;
         }
 
-        for (UploadSlot& slot : texture.upload_slots)
-        {
-            if (slot.fence)
-            {
-                vkDestroyFence(m_device, slot.fence, nullptr);
-                slot.fence = VK_NULL_HANDLE;
-            }
-
-            releaseUploadSlot(slot);
-            destroyUploadSlotStaging(slot);
-        }
-
+        // No per-texture upload state to free: staging/command buffers live in the
+        // renderer-global upload ring, reclaimed by timeline value.
         m_textures[handle - 1].reset();
     }
 
@@ -1498,9 +1565,9 @@ namespace ifap
             return;
         }
 
-        // Blocking variant: used at teardown where waiting out in-flight uploads is
+        // Blocking variant: used at teardown where waiting out in-flight GPU work is
         // acceptable and guarantees the GPU no longer references the image/memory.
-        recycleUploadSlots(*texture, true);
+        waitTimeline(texture->last_used_value);
         freeTextureResources(*texture, handle);
     }
 
@@ -1512,28 +1579,14 @@ namespace ifap
             return true;
         }
 
-        // A render frame's command buffer may still be sampling this texture's
-        // image/view/descriptor. Those are guarded by swapchain fences (up to
-        // m_maxImagesInFlight frames deep) that destroyTexture does NOT wait on, so
-        // freeing here while a frame is in flight is a use-after-free that faults the
-        // GPU (VK_ERROR_DEVICE_LOST). Defer until enough frames have retired. Textures
-        // never drawn (last_used_frame == 0) have no such reference.
-        if (texture->last_used_frame != 0 &&
-            m_frame_counter - texture->last_used_frame < kFrameRetireDelay)
+        // The image/view/descriptor may still be referenced by an in-flight upload,
+        // clear, or render frame — every such submission stamped its signalled timeline
+        // value into last_used_value. Freeing before the timeline reaches that value is
+        // a use-after-free that faults the GPU (VK_ERROR_DEVICE_LOST). One rule covers
+        // uploads and frames alike; last_used_value == 0 means nothing referenced it.
+        if (texture->last_used_value > timelineCompleted())
         {
             return false;
-        }
-
-        // Reclaim any slots whose fence has already signalled, without waiting.
-        recycleUploadSlots(*texture, false);
-
-        for (const UploadSlot& slot : texture->upload_slots)
-        {
-            if (slot.pending)
-            {
-                // An upload is still referencing this image; defer destruction.
-                return false;
-            }
         }
 
         freeTextureResources(*texture, handle);
@@ -1553,19 +1606,10 @@ namespace ifap
             return;
         }
 
-        // Called once the image is fully decoded and uploaded: the persistent staging
-        // buffers won't be needed again, so reclaim them to free host memory. Slots
-        // still in flight keep their buffer (freed later on destroy). If a stray
-        // upload ever arrives, ensureStagingCapacity() simply reallocates.
-        recycleUploadSlots(*texture, false);
-
-        for (UploadSlot& slot : texture->upload_slots)
-        {
-            if (!slot.pending)
-            {
-                destroyUploadSlotStaging(slot);
-            }
-        }
+        // No-op now: staging lives in the renderer-global upload ring (bounded by
+        // kUploadSlotCount), not per texture, so there is nothing texture-specific to
+        // reclaim here. Kept so the cache can still signal "fully uploaded" intent.
+        MANGO_UNREFERENCED(texture);
     }
 
     void VKRenderer::Impl::createPipelines()
@@ -1841,17 +1885,24 @@ namespace ifap
 
         vkCreatePipelineLayout(m_device, &resolvePipelineLayoutInfo, nullptr, &m_resolvePipelineLayout);
 
+        // Headroom for the live working set: the cache, the pinned window, in-flight
+        // placeholder->real swaps still awaiting destruction, plus the resolve set. The
+        // non-blocking pipeline can hold noticeably more textures at once than the bare
+        // cache count, so size generously (descriptor sets are cheap). createTexture also
+        // fails gracefully if this is ever exceeded, rather than handing back a null set.
+        const u32 kMaxDescriptorSets = u32(texture_cache_size) * 8 + 32;
+
         VkDescriptorPoolSize poolSize =
         {
             .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount = texture_cache_size * 4 + 1,
+            .descriptorCount = kMaxDescriptorSets,
         };
 
         VkDescriptorPoolCreateInfo poolInfo =
         {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-            .maxSets = texture_cache_size * 4 + 1,
+            .maxSets = kMaxDescriptorSets,
             .poolSizeCount = 1,
             .pPoolSizes = &poolSize,
         };
@@ -1942,6 +1993,13 @@ namespace ifap
         if (m_frame)
         {
             ensureProcessingTarget();
+
+            // Reserve the timeline value this frame's submit will signal. All upload /
+            // clear work for this tick already ran (in the cache update before render),
+            // so this value is strictly greater than theirs; recordDraw stamps it onto
+            // every sampled texture. An aborted frame simply leaves the value unsignalled
+            // (a harmless gap — nothing waits on exactly it).
+            m_frame_value = ++m_timelineValue;
         }
 
         m_frame_active = bool(m_frame);
@@ -2194,8 +2252,6 @@ namespace ifap
             return;
         }
 
-        recycleUploadSlots(*texture, false);
-
         if (!texture->layout_ready)
         {
             return;
@@ -2232,9 +2288,9 @@ namespace ifap
         m_content_drawn = true;
 
         // The in-flight frame's command buffer now references this texture's
-        // image/view/descriptor; record it so tryDestroyTexture won't free the
-        // texture until that frame has retired.
-        texture->last_used_frame = m_frame_counter;
+        // image/view/descriptor; stamp the value that frame will signal so
+        // tryDestroyTexture won't free the texture until that frame has retired.
+        texture->last_used_value = std::max(texture->last_used_value, m_frame_value);
 
         ProcessingPushConstants push {};
         push.transform[0] = request.translate.x;
@@ -2305,13 +2361,11 @@ namespace ifap
         vkEndCommandBuffer(commandBuffer);
         m_command_buffer_recording = false;
 
-        m_frame.submitAndPresent(m_graphicsQueue, commandBuffer);
+        // Additionally signal the unified timeline at the value reserved in beginFrame,
+        // so reclamation can retire textures this frame sampled once it completes. The
+        // swapchain's own binary semaphores + fence still drive present/acquire as before.
+        m_frame.submitAndPresent(m_graphicsQueue, commandBuffer, m_timeline, m_frame_value);
         m_frame_active = false;
-
-        // A frame referencing whatever textures recordDraw stamped is now submitted;
-        // advancing the counter lets tryDestroyTexture retire those textures once
-        // enough subsequent frames have made their swapchain fences signal.
-        ++m_frame_counter;
     }
 
     VKRenderer::VKRenderer(VulkanWindow& window, Instance& instance, VkSurfaceKHR surface)

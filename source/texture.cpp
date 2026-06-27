@@ -33,19 +33,6 @@ namespace ifap
                 std::max(1, int(float(height) * scale)));
         }
 
-        void createPlaceholderTexture(DecodeTask& task, VKRenderer& renderer, int width, int height)
-        {
-            static const u8 placeholder_pixel[] = { 32, 32, 32, 255 };
-
-            GpuTexture& texture = task.texture;
-            texture.width = width;
-            texture.height = height;
-            texture.sample_width = 1;
-            texture.sample_height = 1;
-            // format and linear come from selectPixelFormat() — do not clobber them here
-            texture.handle = renderer.createTexture(1, 1, texture.format, placeholder_pixel);
-        }
-
         PixelFormat selectPixelFormat(const ImageHeader& header, bool& linear)
         {
             if (header.format.isFloat())
@@ -83,6 +70,28 @@ namespace ifap
             }
 
             return Format(32, Format::UNORM, Format::RGBA, 8, 8, 8, 8);
+        }
+
+        // Copy the worker-produced header_* fields into the drawable texture struct.
+        // Runs on the UI thread, exactly once, only after prepare_state == Ready has been
+        // observed (acquire), so it safely picks up the worker's release-ordered writes.
+        // Until this runs the task keeps its neutral 1x1 placeholder dims, so the per-frame
+        // draw path only ever reads texture.* written on this same (UI) thread.
+        void promoteHeaderDims(DecodeTask& task)
+        {
+            if (task.header_applied)
+            {
+                return;
+            }
+
+            GpuTexture& texture = task.texture;
+            texture.width = task.header_width;
+            texture.height = task.header_height;
+            texture.sample_width = task.header_sample_width;
+            texture.sample_height = task.header_sample_height;
+            texture.format = task.header_format;
+            texture.linear = task.header_linear;
+            task.header_applied = true;
         }
 
     } // namespace
@@ -147,6 +156,11 @@ namespace ifap
         , m_on_content_changed(std::move(on_content_changed))
         , m_should_abort(std::move(should_abort))
     {
+        // Create the single shared placeholder up front (before the worker threads start),
+        // so every getTexture() can hand it out without allocating a per-image texture.
+        static const u8 placeholder_pixel[] = { 32, 32, 32, 255 };
+        m_placeholder = m_renderer.createTexture(1, 1, PixelFormat::RGBA8_UNORM, placeholder_pixel);
+
         m_worker = std::thread([this] { workerThreadMain(); });
         m_reaper = std::thread([this] { reaperThreadMain(); });
     }
@@ -179,6 +193,12 @@ namespace ifap
         {
             m_renderer.destroyTexture(m_gpu_destroy_queue.front());
             m_gpu_destroy_queue.pop_front();
+        }
+
+        if (m_placeholder)
+        {
+            m_renderer.destroyTexture(m_placeholder);
+            m_placeholder = 0;
         }
     }
 
@@ -252,7 +272,9 @@ namespace ifap
 
         WorkerJob job;
         job.type = WorkerJob::Type::Dispose;
-        job.gpu_handle = raw_task->texture.handle;
+        // Never destroy the shared placeholder; only a per-task texture is owned here.
+        TextureHandle handle = raw_task->texture.handle;
+        job.gpu_handle = (handle != m_placeholder) ? handle : 0;
         raw_task->texture.handle = 0;
         job.task = std::shared_ptr<DecodeTask>(raw_task, [](DecodeTask*) {});
         enqueueDispose(std::move(job));
@@ -362,14 +384,14 @@ namespace ifap
 
     void TextureCache::runPrepare(const std::shared_ptr<DecodeTask>& task)
     {
-        if (!task || !task->decoder || m_shutdown || (m_should_abort && m_should_abort()))
+        if (!task || m_shutdown || (m_should_abort && m_should_abort()))
         {
             return;
         }
 
         // Evicted before we reached it: the user scrolled past while this prepare sat
         // in the queue, so only this job still references the task. Skip the expensive
-        // bitmap allocation + decode launch instead of doing work nobody will use.
+        // I/O + bitmap allocation + decode launch instead of doing work nobody will use.
         if (task.use_count() <= 1)
         {
             if (trace_decode)
@@ -381,20 +403,89 @@ namespace ifap
 
         try
         {
-            if (task->downscale)
+            // Bulk, sequential read of the whole compressed file into RAM, on this worker
+            // thread (never the UI thread). Going through File(path, name) preserves the
+            // custom-mapper / archive support setCurrentPath() relies on; copying its
+            // memory into a Buffer forces one sequential read and lets us drop the mapping
+            // immediately, so the decode below never has to touch the disk again. The
+            // single worker serialises these reads (one file at a time, spinning-disk
+            // friendly) while the launched decodes run in parallel on the decode pool.
             {
+                File file(*task->path, task->name);
+                task->buffer = std::make_unique<Buffer>(ConstMemory(file));
+            }
+
+            task->decoder = std::make_unique<ImageDecoder>(*task->buffer, task->name);
+            ImageHeader header = task->decoder->header();
+
+            if (!header.width || !header.height)
+            {
+                task->prepare_state = PrepareState::Failed;
+                if (m_on_content_changed)
+                {
+                    m_on_content_changed();
+                }
+                return;
+            }
+
+            const int max_texture_dimension = m_renderer.getMaxTextureDimension();
+            const bool needs_downscale = max_texture_dimension > 0 &&
+                (header.width > max_texture_dimension || header.height > max_texture_dimension);
+
+            if (needs_downscale && header.format.isFloat())
+            {
+                printLine(Print::Error, "{}: {} x {} exceeds GPU texture limit (max dimension: {}); float preview not supported yet",
+                    task->name, header.width, header.height, max_texture_dimension);
+
+                task->prepare_state = PrepareState::Failed;
+                if (m_on_content_changed)
+                {
+                    m_on_content_changed();
+                }
+                return;
+            }
+
+            // Header-derived results go into the task's header_* staging fields, never
+            // texture.* — those are promoted on the UI thread (promoteHeaderDims) so the
+            // per-frame draw path never reads dims/format while we write them here.
+            task->bitmap_format = selectBitmapFormat(header);
+            task->header_format = selectPixelFormat(header, task->header_linear);
+            task->header_width = header.width;
+            task->header_height = header.height;
+
+            if (needs_downscale)
+            {
+                const math::int32x2 preview_size = computeDownscaleDimensions(
+                    header.width, header.height, max_texture_dimension);
+
+                task->downscale = true;
+                task->downscale_width = preview_size.x;
+                task->downscale_height = preview_size.y;
+
+                printLine(Print::Info, "{}: {} x {} exceeds GPU limit ({}), preview {} x {}",
+                    task->name, header.width, header.height, max_texture_dimension,
+                    task->downscale_width, task->downscale_height);
+
+                task->header_sample_width = task->downscale_width;
+                task->header_sample_height = task->downscale_height;
+
                 task->scaled_bitmap = std::make_unique<Bitmap>(
                     task->downscale_width, task->downscale_height, task->bitmap_format);
             }
+            else
+            {
+                task->header_sample_width = header.width;
+                task->header_sample_height = header.height;
+            }
 
             task->bitmap = std::make_unique<Bitmap>(
-                task->texture.width, task->texture.height, task->bitmap_format);
+                header.width, header.height, task->bitmap_format);
 
             task->decode_start_ms.store(mango::Time::ms());
 
             if (trace_decode)
             {
-                printLine("[trace] #{} launch", task->index);
+                printLine("[trace] #{} launch {} x {}", task->index, header.width, header.height);
             }
 
             task->future = task->decoder->launch([this, task = task.get()] (const ImageDecodeRect& rect)
@@ -462,7 +553,7 @@ namespace ifap
             raw->bitmap.reset();
             raw->scaled_bitmap.reset();
             raw->decoder.reset();
-            raw->file.reset();
+            raw->buffer.reset();
         }
 
         job.task.reset();
@@ -477,7 +568,22 @@ namespace ifap
 
     void TextureCache::drainGpuDestroys(int budget)
     {
-        while (budget-- > 0)
+        // Attempt each currently-queued handle at most once per call. tryDestroyTexture
+        // requeues (to the back) any texture an in-flight frame still references, so
+        // capping at the initial backlog size both clears the backlog promptly and avoids
+        // spinning on busy textures. A small budget caps the work; budget < 0 means "all".
+        size_t remaining;
+        {
+            std::lock_guard lock(m_gpu_destroy_mutex);
+            remaining = m_gpu_destroy_queue.size();
+        }
+
+        if (budget >= 0 && size_t(budget) < remaining)
+        {
+            remaining = size_t(budget);
+        }
+
+        for (; remaining > 0; --remaining)
         {
             TextureHandle handle = 0;
 
@@ -504,27 +610,47 @@ namespace ifap
 
     bool TextureCache::finishGpuSetup(DecodeTask& task)
     {
-        if (task.gpu_texture_ready || task.downscale)
+        if (task.gpu_texture_ready)
         {
             return false;
         }
 
-        if (task.prepare_state != PrepareState::Ready || !task.bitmap)
+        // Check Ready (acquire) before reading task.downscale / task.bitmap: those are
+        // written by the worker and only safe to read once the release store is visible.
+        if (task.prepare_state != PrepareState::Ready || !task.bitmap || task.downscale)
         {
+            return false;
+        }
+
+        // Promote the worker's real dimensions/format into the texture before creating the
+        // GPU image. This must happen here (not only in updateDecodeTask) because the
+        // background setup pass in update() calls finishGpuSetup() directly for prefetched,
+        // non-priority tasks — without this they'd be created at the 1x1 placeholder size
+        // and, with gpu_texture_ready latched, could never be corrected on navigation.
+        promoteHeaderDims(task);
+
+        TextureHandle created = m_renderer.createTexture(
+            task.texture.width, task.texture.height, task.texture.format, nullptr);
+
+        if (!created)
+        {
+            // GPU texture creation failed (e.g. VRAM exhaustion). Keep the placeholder and
+            // leave gpu_texture_ready false so we retry on a later frame, once cache
+            // eviction has freed device memory. The visible image stays a placeholder
+            // rather than crashing on an invalid texture.
             return false;
         }
 
         TextureHandle placeholder = task.texture.handle;
-        task.texture.handle = 0;
-
-        task.texture.handle = m_renderer.createTexture(
-            task.texture.width, task.texture.height, task.texture.format, nullptr);
+        task.texture.handle = created;
 
         task.texture.sample_width = task.texture.width;
         task.texture.sample_height = task.texture.height;
         task.gpu_texture_ready = true;
 
-        if (placeholder)
+        // The shared placeholder is owned by the cache and reused by other tasks; only
+        // queue a per-task texture for destruction.
+        if (placeholder && placeholder != m_placeholder)
         {
             std::lock_guard lock(m_gpu_destroy_mutex);
             m_gpu_destroy_queue.push_back(placeholder);
@@ -707,6 +833,13 @@ namespace ifap
             return;
         }
 
+        // The future is only assigned by the worker once prepare_state flips to Ready
+        // (release); don't read it before then (acquire), or we'd race that assignment.
+        if (task.prepare_state != PrepareState::Ready)
+        {
+            return;
+        }
+
         // The future becomes ready when decode() has fully returned.
         if (!task.future.valid() ||
             task.future.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
@@ -729,7 +862,7 @@ namespace ifap
             task.name,
             end - start,
             first ? (first - start) : 0,
-            task.texture.width, task.texture.height);
+            task.header_width, task.header_height);
     }
 
     size_t TextureCache::countActiveDecodes() const
@@ -818,11 +951,19 @@ namespace ifap
 
         if (needs_create)
         {
+            TextureHandle created = m_renderer.createTexture(dw, dh, texture.format, task.scaled_bitmap->image);
+
+            if (!created)
+            {
+                // VRAM exhaustion: keep the placeholder, retry on a later frame.
+                return;
+            }
+
             TextureHandle placeholder = texture.handle;
-            texture.handle = m_renderer.createTexture(dw, dh, texture.format, task.scaled_bitmap->image);
+            texture.handle = created;
             task.gpu_texture_ready = true;
 
-            if (placeholder)
+            if (placeholder && placeholder != m_placeholder)
             {
                 std::lock_guard lock(m_gpu_destroy_mutex);
                 m_gpu_destroy_queue.push_back(placeholder);
@@ -962,75 +1103,32 @@ namespace ifap
         }
 
         std::shared_ptr<DecodeTask> task = makeTask();
-        std::string filename = m_indexer[index];
 
-        task->name = filename;
+        task->name = m_indexer[index];
         task->index = index;
-        task->file = std::make_unique<File>(*m_current_path, filename);
-        task->decoder = std::make_unique<ImageDecoder>(*task->file, filename);
-        ImageHeader header = task->decoder->header();
 
-        //printLine("{}: {} x {}", filename, header.width, header.height);
-        if (!header.width || !header.height)
-        {
-            return {};
-        }
+        // Capture the current path so the worker can open the file even if the user
+        // changes folder (setCurrentPath reassigns m_current_path) while this is queued.
+        task->path = m_current_path;
 
-        const int max_texture_dimension = m_renderer.getMaxTextureDimension();
-        const bool needs_downscale = max_texture_dimension > 0 &&
-            (header.width > max_texture_dimension || header.height > max_texture_dimension);
-
-        if (needs_downscale && header.format.isFloat())
-        {
-            printLine(Print::Error, "{}: {} x {} exceeds GPU texture limit (max dimension: {}); float preview not supported yet",
-                filename, header.width, header.height, max_texture_dimension);
-
-            createPlaceholderTexture(*task, m_renderer, header.width, header.height);
-            task->prepare_state = PrepareState::Failed;
-
-            storeTask(index, task);
-            return task;
-        }
-
+        // All file I/O and header parsing now happen on the worker thread (runPrepare) so
+        // a cold, huge file can never seek-stall the UI. The real dimensions aren't known
+        // yet, so point at the shared 1x1 placeholder immediately (no per-task allocation);
+        // the correct size/format are promoted once the header arrives (promoteHeaderDims),
+        // and the full-resolution texture is created in finishGpuSetup.
         GpuTexture& texture = task->texture;
-        task->bitmap_format = selectBitmapFormat(header);
-        texture.format = selectPixelFormat(header, texture.linear);
-
-        if (needs_downscale)
-        {
-            const math::int32x2 preview_size = computeDownscaleDimensions(
-                header.width, header.height, max_texture_dimension);
-
-            task->downscale = true;
-            task->downscale_width = preview_size.x;
-            task->downscale_height = preview_size.y;
-
-            printLine(Print::Info, "{}: {} x {} exceeds GPU limit ({}), preview {} x {}",
-                filename, header.width, header.height, max_texture_dimension,
-                task->downscale_width, task->downscale_height);
-
-            texture.sample_width = task->downscale_width;
-            texture.sample_height = task->downscale_height;
-        }
-        else
-        {
-            texture.sample_width = header.width;
-            texture.sample_height = header.height;
-        }
-
-        texture.width = header.width;
-        texture.height = header.height;
-        task->updates.clear();
-        task->progress = 0.0f;
-
-        createPlaceholderTexture(*task, m_renderer, header.width, header.height);
+        texture.handle = m_placeholder;
+        texture.width = 1;
+        texture.height = 1;
+        texture.sample_width = 1;
+        texture.sample_height = 1;
+        texture.format = PixelFormat::RGBA8_UNORM;
 
         task->prepare_state = PrepareState::Preparing;
 
         if (trace_decode)
         {
-            printLine("[trace] #{} request (priority={}) {} x {}",
-                index, priority ? 1 : 0, header.width, header.height);
+            printLine("[trace] #{} request (priority={})", index, priority ? 1 : 0);
         }
 
         WorkerJob job;
@@ -1044,6 +1142,13 @@ namespace ifap
 
     bool TextureCache::updateDecodeTask(DecodeTask& task)
     {
+        // Promote the worker's header dimensions into the drawable texture before any GPU
+        // setup or draw uses them. Gated on Ready so it observes the worker's writes.
+        if (task.prepare_state == PrepareState::Ready)
+        {
+            promoteHeaderDims(task);
+        }
+
         finishGpuSetup(task);
 
         GpuTexture& texture = task.texture;
@@ -1123,6 +1228,12 @@ namespace ifap
         {
             task.bitmap.reset();
 
+            // The decode is done reading from the file Buffer, so drop the decoder (which
+            // references the buffer) and then the buffer itself. This is what bounds the
+            // extra "whole compressed file in RAM" cost of bulk reads to in-flight decodes.
+            task.decoder.reset();
+            task.buffer.reset();
+
             // The image is fully on the GPU; the upload staging buffers are no longer
             // needed, so reclaim them too (the CPU bitmap above was the larger cost,
             // this trims the rest).
@@ -1141,7 +1252,11 @@ namespace ifap
 
         bool progress = false;
 
-        drainGpuDestroys(2);
+        // Drain the whole backlog each frame: with the non-blocking, header-off-thread
+        // pipeline, evictions and placeholder->real swaps can queue textures faster than a
+        // fixed tiny budget could free them, starving the descriptor pool / VRAM. Busy
+        // textures are safely requeued by tryDestroyTexture.
+        drainGpuDestroys(-1);
 
         // Refresh the pin window first so the visible image and its prefetch window
         // are in the eviction-immune overlay before cancelStaleDecodes()/tickPrefetch()
