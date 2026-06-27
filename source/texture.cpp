@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <memory>
 
 namespace ifap
@@ -410,9 +411,40 @@ namespace ifap
             // immediately, so the decode below never has to touch the disk again. The
             // single worker serialises these reads (one file at a time, spinning-disk
             // friendly) while the launched decodes run in parallel on the decode pool.
+            //
+            // The copy runs in blocks with an abort/abandonment check between them: if the
+            // user scrolled past this image while a large read was in progress, we bail
+            // here instead of holding the worker until the whole file is read.
             {
                 File file(*task->path, task->name);
-                task->buffer = std::make_unique<Buffer>(ConstMemory(file));
+                ConstMemory src = file;
+
+                auto buffer = std::make_unique<Buffer>(src.size);
+                u8* dst = buffer->data();
+                bool aborted = false;
+
+                for (size_t offset = 0; offset < src.size; offset += texture_read_block_size)
+                {
+                    if (m_shutdown || (m_should_abort && m_should_abort()) || task.use_count() <= 1)
+                    {
+                        aborted = true;
+                        break;
+                    }
+
+                    const size_t block = std::min(texture_read_block_size, src.size - offset);
+                    std::memcpy(dst + offset, src.address + offset, block);
+                }
+
+                if (aborted)
+                {
+                    if (trace_decode)
+                    {
+                        printLine("[trace] #{} abort-read", task->index);
+                    }
+                    return;
+                }
+
+                task->buffer = std::move(buffer);
             }
 
             task->decoder = std::make_unique<ImageDecoder>(*task->buffer, task->name);
