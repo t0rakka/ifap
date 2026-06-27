@@ -1236,10 +1236,10 @@ namespace ifap
                 return;
             }
 
-            // Bound large GPU allocations: create at most one prefetched texture per
-            // frame. createTexture() for a full-resolution image is a heavyweight
-            // vkAllocateMemory; doing several in one frame is what stalled the main
-            // thread (the OpenGL backend let the driver manage this lazily).
+            // Bound prefetch texture setup to one per frame. With VMA, createTexture()
+            // is now a cheap pool sub-allocation (not a per-image vkAllocateMemory), so
+            // this is no longer the stall it once was; the real per-frame throttle is the
+            // pixel-upload byte budget (setUploadBytesPerFrame) applied in updateDecodeTask.
             if (!task_ptr->gpu_texture_ready)
             {
                 if (setup_budget <= 0)
