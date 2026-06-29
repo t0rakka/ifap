@@ -528,6 +528,17 @@ namespace ifap
         VkPipelineLayout m_resolvePipelineLayout = VK_NULL_HANDLE;
         VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet m_resolveDescriptor = VK_NULL_HANDLE;
+
+        // Content (processing-pass) descriptor sets are rewritten every frame with the
+        // texture being drawn. A single set per texture is illegal: the previous frame's
+        // command buffer is still pending and references it (VUID-vkUpdateDescriptorSets-
+        // None-03047 -> device loss on MoltenVK). Instead we own a ring keyed to the
+        // swapchain image index -- the same lifetime the swapchain already fences before
+        // a command buffer is re-recorded, so the block for the acquired image is idle.
+        // kContentDescriptorsPerImage allows several draws per frame (e.g. cross-fade).
+        static constexpr u32 kContentDescriptorsPerImage = 8;
+        std::vector<VkDescriptorSet> m_contentDescriptors;
+        u32 m_contentDescriptorCursor = 0;
         VkPipeline m_pipelineBilinearBlend = VK_NULL_HANDLE;
         VkPipeline m_pipelineBilinearNoBlend = VK_NULL_HANDLE;
         VkPipeline m_pipelineBicubicBlend = VK_NULL_HANDLE;
@@ -568,7 +579,6 @@ namespace ifap
             VkImage image = VK_NULL_HANDLE;
             VmaAllocation allocation = VK_NULL_HANDLE;
             VkImageView view = VK_NULL_HANDLE;
-            VkDescriptorSet descriptor = VK_NULL_HANDLE;
             PixelFormat format = PixelFormat::RGBA8_UNORM;
             int width = 0;
             int height = 0;
@@ -1453,28 +1463,9 @@ namespace ifap
         texture->allocation = image.allocation;
         createImageView(texture->image, vkFormat, texture->view);
 
-        VkDescriptorSetAllocateInfo allocInfo =
-        {
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .descriptorPool = m_descriptorPool,
-            .descriptorSetCount = 1,
-            .pSetLayouts = &m_contentDescriptorSetLayout,
-        };
-
-        VkResult descriptorResult = vkAllocateDescriptorSets(m_device, &allocInfo, &texture->descriptor);
-
-        if (descriptorResult != VK_SUCCESS || texture->descriptor == VK_NULL_HANDLE)
-        {
-            // Descriptor pool exhausted: a null descriptor set would crash the driver at
-            // draw time (vkUpdateDescriptorSets with dstSet == NULL). Unwind the image and
-            // view we just built and return 0 so the caller keeps its placeholder/retries.
-            printLine(Print::Error, "VKRenderer: createTexture {}x{} failed (descriptor pool exhausted)", width, height);
-            texture->descriptor = VK_NULL_HANDLE;
-            vkDestroyImageView(m_device, texture->view, nullptr);
-            ImageAllocation toFree = { texture->image, texture->allocation };
-            m_allocator->destroyImage(toFree);
-            return 0;
-        }
+        // The processing-pass (content) descriptor set is not owned per texture: it is
+        // bound from a per-image ring and written with this texture's view at draw time
+        // (see recordDraw). Only the image + view are owned here.
 
         m_textures.push_back(std::move(texture));
         TextureHandle handle = TextureHandle(m_textures.size());
@@ -1535,11 +1526,6 @@ namespace ifap
 
     void VKRenderer::Impl::freeTextureResources(GpuTexture& texture, TextureHandle handle)
     {
-        if (texture.descriptor)
-        {
-            vkFreeDescriptorSets(m_device, m_descriptorPool, 1, &texture.descriptor);
-        }
-
         if (texture.view)
         {
             vkDestroyImageView(m_device, texture.view, nullptr);
@@ -1762,6 +1748,28 @@ namespace ifap
         };
 
         vkAllocateCommandBuffers(m_device, &allocInfo, m_commandBuffers.data());
+
+        // One content-descriptor block per swapchain image, reused across frames. Reuse
+        // is safe because the swapchain fences each image's prior submission before its
+        // command buffer is re-recorded, retiring every set in that image's block.
+        const u32 contentDescriptorCount = imageCount * kContentDescriptorsPerImage;
+        m_contentDescriptors.assign(contentDescriptorCount, VK_NULL_HANDLE);
+
+        std::vector<VkDescriptorSetLayout> layouts(contentDescriptorCount, m_contentDescriptorSetLayout);
+
+        VkDescriptorSetAllocateInfo contentAllocInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = m_descriptorPool,
+            .descriptorSetCount = contentDescriptorCount,
+            .pSetLayouts = layouts.data(),
+        };
+
+        VkResult result = vkAllocateDescriptorSets(m_device, &contentAllocInfo, m_contentDescriptors.data());
+        if (result != VK_SUCCESS)
+        {
+            printLine(Print::Error, "VKRenderer: failed to allocate content descriptor sets.");
+        }
     }
 
     void VKRenderer::Impl::createShaders()
@@ -1885,11 +1893,10 @@ namespace ifap
 
         vkCreatePipelineLayout(m_device, &resolvePipelineLayoutInfo, nullptr, &m_resolvePipelineLayout);
 
-        // Headroom for the live working set: the cache, the pinned window, in-flight
-        // placeholder->real swaps still awaiting destruction, plus the resolve set. The
-        // non-blocking pipeline can hold noticeably more textures at once than the bare
-        // cache count, so size generously (descriptor sets are cheap). createTexture also
-        // fails gracefully if this is ever exceeded, rather than handing back a null set.
+        // Sets drawn from this pool: the per-image content ring (image count *
+        // kContentDescriptorsPerImage) plus the single resolve set. Textures no longer
+        // own a set (the content set is bound from the ring at draw time), so this is
+        // small; size generously anyway since descriptor sets are cheap.
         const u32 kMaxDescriptorSets = u32(texture_cache_size) * 8 + 32;
 
         VkDescriptorPoolSize poolSize =
@@ -1993,6 +2000,11 @@ namespace ifap
         if (m_frame)
         {
             ensureProcessingTarget();
+
+            // The acquired image's prior submission has retired (the swapchain fenced it
+            // before handing the frame back), so its content-descriptor block is idle and
+            // safe to rewrite. Restart at the block's first slot.
+            m_contentDescriptorCursor = 0;
 
             // Reserve the timeline value this frame's submit will signal. All upload /
             // clear work for this tick already ran (in the cache update before render),
@@ -2257,6 +2269,25 @@ namespace ifap
             return;
         }
 
+        const u32 imageIndex = m_frame.imageIndex();
+
+        // Take the next free set from this image's content-descriptor block. The block
+        // is idle (its frame retired before acquire) and each draw within the frame uses
+        // a distinct slot, so writing it never races an in-flight or already-recorded
+        // draw. Clamp on the rare overflow rather than aliasing a slot already bound this
+        // frame (which would make every draw sample the last texture).
+        const u32 blockBase = imageIndex * kContentDescriptorsPerImage;
+        const u32 slot = blockBase + std::min(m_contentDescriptorCursor, kContentDescriptorsPerImage - 1);
+        if (slot >= m_contentDescriptors.size())
+        {
+            return;
+        }
+        VkDescriptorSet descriptor = m_contentDescriptors[slot];
+        if (m_contentDescriptorCursor < kContentDescriptorsPerImage - 1)
+        {
+            ++m_contentDescriptorCursor;
+        }
+
         VkSampler sampler = selectSampler(request.filter);
 
         VkDescriptorImageInfo imageInfo =
@@ -2269,7 +2300,7 @@ namespace ifap
         VkWriteDescriptorSet descriptorWrite =
         {
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = texture->descriptor,
+            .dstSet = descriptor,
             .dstBinding = 0,
             .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -2288,8 +2319,8 @@ namespace ifap
         m_content_drawn = true;
 
         // The in-flight frame's command buffer now references this texture's
-        // image/view/descriptor; stamp the value that frame will signal so
-        // tryDestroyTexture won't free the texture until that frame has retired.
+        // image/view; stamp the value that frame will signal so tryDestroyTexture
+        // won't free the texture until that frame has retired.
         texture->last_used_value = std::max(texture->last_used_value, m_frame_value);
 
         ProcessingPushConstants push {};
@@ -2300,12 +2331,11 @@ namespace ifap
         push.texScale[0] = 1.0f / float(std::max(1, request.width));
         push.texScale[1] = 1.0f / float(std::max(1, request.height));
 
-        const u32 imageIndex = m_frame.imageIndex();
         VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
 
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, selectPipeline(request));
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_processingPipelineLayout,
-            0, 1, &texture->descriptor, 0, nullptr);
+            0, 1, &descriptor, 0, nullptr);
         vkCmdPushConstants(commandBuffer, m_processingPipelineLayout,
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ProcessingPushConstants), &push);
 
