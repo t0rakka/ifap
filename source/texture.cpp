@@ -5,7 +5,6 @@
 #include "texture.hpp"
 
 #include <mango/image/bicubic.hpp>
-#include <mango/core/half.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -43,239 +42,9 @@ namespace ifap
         inline Format formatF16() { return Format(64, Format::FLOAT16, Format::RGBA, 16, 16, 16, 16); }
         inline Format formatF32() { return Format(128, Format::FLOAT32, Format::RGBA, 32, 32, 32, 32); }
 
-        // ---- inverse transfer functions (encoded sample -> scene-linear) -------------
-
-        inline float srgbToLinearF(float c)
-        {
-            return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
-        }
-
-        // ITU-R BT.709 / SMPTE 170M OETF inverse.
-        inline float bt709ToLinearF(float v)
-        {
-            return v < 0.081f ? v / 4.5f : std::pow((v + 0.099f) / 1.099f, 1.0f / 0.45f);
-        }
-
-        // SMPTE ST 2084 (PQ) EOTF. Output is normalized so 1.0 == 10,000 nits.
-        inline float pqToLinearF(float e)
-        {
-            const float m1 = 0.1593017578125f;
-            const float m2 = 78.84375f;
-            const float c1 = 0.8359375f;
-            const float c2 = 18.8515625f;
-            const float c3 = 18.6875f;
-            const float ep = std::pow(std::max(e, 0.0f), 1.0f / m2);
-            const float num = std::max(ep - c1, 0.0f);
-            const float den = c2 - c3 * ep;
-            return std::pow(num / den, 1.0f / m1);
-        }
-
-        // ARIB STD-B67 (HLG) OETF inverse -> scene-linear [0,1].
-        inline float hlgToLinearF(float e)
-        {
-            const float a = 0.17883277f;
-            const float b = 0.28466892f;
-            const float c = 0.55991073f;
-            e = std::max(e, 0.0f);
-            return e <= 0.5f ? (e * e) / 3.0f : (std::exp((e - c) / a) + b) / 12.0f;
-        }
-
-        float transferToLinear(float v, TransferFunction transfer, float gamma)
-        {
-            if (gamma > 0.0f)
-            {
-                return std::pow(std::max(v, 0.0f), gamma);
-            }
-
-            switch (transfer)
-            {
-                case TransferFunction::Linear:  return v;
-                case TransferFunction::sRGB:    return srgbToLinearF(v);
-                case TransferFunction::BT709:   return bt709ToLinearF(v);
-                case TransferFunction::Gamma22: return std::pow(std::max(v, 0.0f), 2.2f);
-                case TransferFunction::Gamma28: return std::pow(std::max(v, 0.0f), 2.8f);
-                case TransferFunction::PQ:      return pqToLinearF(v);
-                case TransferFunction::HLG:     return hlgToLinearF(v);
-                default:                        return srgbToLinearF(v);
-            }
-        }
-
-        // ---- primaries -> BT.709 matrix ----------------------------------------------
-
-        struct Mat3 { float m[9]; };
-
-        Mat3 mat3Mul(const Mat3& a, const Mat3& b)
-        {
-            Mat3 r;
-            for (int i = 0; i < 3; ++i)
-            {
-                for (int j = 0; j < 3; ++j)
-                {
-                    float s = 0.0f;
-                    for (int k = 0; k < 3; ++k)
-                    {
-                        s += a.m[i * 3 + k] * b.m[k * 3 + j];
-                    }
-                    r.m[i * 3 + j] = s;
-                }
-            }
-            return r;
-        }
-
-        bool mat3Inverse(const Mat3& a, Mat3& out)
-        {
-            const float* m = a.m;
-            const float c00 = m[4] * m[8] - m[5] * m[7];
-            const float c01 = m[5] * m[6] - m[3] * m[8];
-            const float c02 = m[3] * m[7] - m[4] * m[6];
-            const float det = m[0] * c00 + m[1] * c01 + m[2] * c02;
-            if (std::fabs(det) < 1e-12f)
-            {
-                return false;
-            }
-            const float id = 1.0f / det;
-            out.m[0] = c00 * id;
-            out.m[1] = (m[2] * m[7] - m[1] * m[8]) * id;
-            out.m[2] = (m[1] * m[5] - m[2] * m[4]) * id;
-            out.m[3] = c01 * id;
-            out.m[4] = (m[0] * m[8] - m[2] * m[6]) * id;
-            out.m[5] = (m[2] * m[3] - m[0] * m[5]) * id;
-            out.m[6] = c02 * id;
-            out.m[7] = (m[1] * m[6] - m[0] * m[7]) * id;
-            out.m[8] = (m[0] * m[4] - m[1] * m[3]) * id;
-            return true;
-        }
-
-        // RGB -> CIE XYZ from CIE 1931 xy chromaticities (white normalized to Y = 1).
-        bool rgbToXyz(const ColorPoint& w, const ColorPoint& r,
-                      const ColorPoint& g, const ColorPoint& b, Mat3& out)
-        {
-            auto valid = [] (const ColorPoint& p) { return p.y > 1e-6f; };
-            if (!valid(w) || !valid(r) || !valid(g) || !valid(b))
-            {
-                return false;
-            }
-
-            auto X = [] (const ColorPoint& p) { return p.x / p.y; };
-            auto Z = [] (const ColorPoint& p) { return (1.0f - p.x - p.y) / p.y; };
-
-            Mat3 M =
-            {
-                X(r), X(g), X(b),
-                1.0f, 1.0f, 1.0f,
-                Z(r), Z(g), Z(b)
-            };
-
-            Mat3 Mi;
-            if (!mat3Inverse(M, Mi))
-            {
-                return false;
-            }
-
-            const float Wx = X(w);
-            const float Wy = 1.0f;
-            const float Wz = Z(w);
-            const float Sr = Mi.m[0] * Wx + Mi.m[1] * Wy + Mi.m[2] * Wz;
-            const float Sg = Mi.m[3] * Wx + Mi.m[4] * Wy + Mi.m[5] * Wz;
-            const float Sb = Mi.m[6] * Wx + Mi.m[7] * Wy + Mi.m[8] * Wz;
-
-            out.m[0] = M.m[0] * Sr; out.m[1] = M.m[1] * Sg; out.m[2] = M.m[2] * Sb;
-            out.m[3] = M.m[3] * Sr; out.m[4] = M.m[4] * Sg; out.m[5] = M.m[5] * Sb;
-            out.m[6] = M.m[6] * Sr; out.m[7] = M.m[7] * Sg; out.m[8] = M.m[8] * Sb;
-            return true;
-        }
-
-        bool standardPrimaries(ColorPrimaries p, ColorPoint& w, ColorPoint& r,
-                               ColorPoint& g, ColorPoint& b)
-        {
-            const ColorPoint D65 { 0.3127f, 0.3290f };
-            switch (p)
-            {
-                case ColorPrimaries::BT709:
-                    w = D65; r = { 0.640f, 0.330f }; g = { 0.300f, 0.600f }; b = { 0.150f, 0.060f }; return true;
-                case ColorPrimaries::BT2020:
-                    w = D65; r = { 0.708f, 0.292f }; g = { 0.170f, 0.797f }; b = { 0.131f, 0.046f }; return true;
-                case ColorPrimaries::DisplayP3:
-                    w = D65; r = { 0.680f, 0.320f }; g = { 0.265f, 0.690f }; b = { 0.150f, 0.060f }; return true;
-                case ColorPrimaries::DCI_P3:
-                    w = { 0.314f, 0.351f }; r = { 0.680f, 0.320f }; g = { 0.265f, 0.690f }; b = { 0.150f, 0.060f }; return true;
-                case ColorPrimaries::AdobeRGB:
-                    w = D65; r = { 0.640f, 0.330f }; g = { 0.210f, 0.710f }; b = { 0.150f, 0.060f }; return true;
-                case ColorPrimaries::BT601_625:
-                    w = D65; r = { 0.640f, 0.330f }; g = { 0.290f, 0.600f }; b = { 0.150f, 0.060f }; return true;
-                case ColorPrimaries::BT601_525:
-                    w = D65; r = { 0.630f, 0.340f }; g = { 0.310f, 0.595f }; b = { 0.155f, 0.070f }; return true;
-                default:
-                    return false;
-            }
-        }
-
-        // Builds source-primaries -> BT.709 (linear) 3x3. Falls back to identity when the
-        // primaries are already BT.709 or cannot be resolved (safe no-op). Exact
-        // chromaticities take precedence; white-point adaptation is not applied yet, so
-        // non-D65 sources (CIE XYZ / equal-energy) get a small residual tint (TODO).
-        void buildPrimariesMatrix(const ColorInfo& color, ColorPrimaries prim,
-                                  float out[9], bool& identity)
-        {
-            identity = true;
-            out[0] = 1; out[1] = 0; out[2] = 0;
-            out[3] = 0; out[4] = 1; out[5] = 0;
-            out[6] = 0; out[7] = 0; out[8] = 1;
-
-            if (prim == ColorPrimaries::BT709)
-            {
-                return;
-            }
-
-            Mat3 srcToXyz;
-            bool haveSrc = false;
-
-            if (color.has_chromaticities)
-            {
-                haveSrc = rgbToXyz(color.white, color.red, color.green, color.blue, srcToXyz);
-                if (!haveSrc)
-                {
-                    // Degenerate chromaticities (e.g. CIE XYZ primaries): the channels are
-                    // already XYZ, so RGB->XYZ is identity.
-                    srcToXyz = Mat3 { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
-                    haveSrc = true;
-                }
-            }
-            else
-            {
-                ColorPoint w, r, g, b;
-                if (standardPrimaries(prim, w, r, g, b))
-                {
-                    haveSrc = rgbToXyz(w, r, g, b, srcToXyz);
-                }
-            }
-
-            if (!haveSrc)
-            {
-                return;
-            }
-
-            // BT.709 (D65) RGB -> XYZ.
-            Mat3 bt709 =
-            {
-                0.4123908f, 0.3575843f, 0.1804808f,
-                0.2126390f, 0.7151687f, 0.0721923f,
-                0.0193308f, 0.1191948f, 0.9505322f
-            };
-
-            Mat3 bt709Inv;
-            if (!mat3Inverse(bt709, bt709Inv))
-            {
-                return;
-            }
-
-            const Mat3 m = mat3Mul(bt709Inv, srcToXyz);
-            for (int i = 0; i < 9; ++i)
-            {
-                out[i] = m.m[i];
-            }
-            identity = false;
-        }
+        // Scene-linear working-space target for linearize(); always fp16 so the final
+        // blit never clamps HDR to UNORM/sRGB. Decode uses bitmap_format (native layout).
+        inline Format formatLinearDest() { return formatF16(); }
 
         // ---- classification ----------------------------------------------------------
 
@@ -283,20 +52,17 @@ namespace ifap
         {
             PixelFormat upload_format = PixelFormat::RGBA8_SRGB; // GPU texture format
             Format      bitmap_format = formatU8();              // CPU decode target layout
-            bool        convert = false;                         // bake to scene-linear BT.709
-            TransferFunction transfer = TransferFunction::sRGB;  // source EOTF (convert path)
-            float       gamma = 0.0f;                            // explicit gamma (convert path)
-            bool        matrix_identity = true;
-            float       matrix[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+            bool        convert = false;                         // linearize() to scene-linear BT.709
         };
 
         // Decides how an image reaches the sampler as scene-linear BT.709:
         //   - fast GPU paths use the VkFormat alone (RGBA8_SRGB hw-decode, or linear
         //     UNORM/float passthrough) for BT.709 sRGB/linear content;
         //   - anything else (non-BT.709 primaries, exact non-BT.709 chromaticities, a
-        //     transfer that isn't sRGB/linear, or an explicit gamma) is flagged for the
-        //     CPU bake which produces scene-linear BT.709 fp16.
-        // ICC-tagged images stay on the hardware sRGB path for now (TODO: ColorManager).
+        //     transfer that isn't sRGB/linear, or an explicit gamma) is flagged for
+        //     mango::linearize() which produces scene-linear BT.709 fp16 per tile;
+        //   - ICC-tagged images stay on the hardware sRGB path (linearize() does not
+        //     handle ICC; ColorManager is a separate path when we add it).
         ColorPlan classifyColor(const ImageHeader& header, ConstMemory icc)
         {
             const ColorInfo& color = header.color;
@@ -368,51 +134,20 @@ namespace ifap
                 return plan;
             }
 
-            // Bake path: decode in the source encoding as fp16, then convert each tile to
-            // scene-linear BT.709 fp16 on the decode thread.
+            // Bake path: decode in the source encoding, then linearize() each tile into a
+            // dedicated fp16 bitmap (never reuse the decode format as the dest — linearize
+            // accepts u8/sRGB surfaces but clamps HDR when used as dest).
             plan.convert = true;
             plan.upload_format = PixelFormat::RGBA16F;
-            plan.bitmap_format = formatF16();
-            plan.transfer = transfer;
-            plan.gamma = explicit_gamma ? color.gamma : 0.0f;
-            buildPrimariesMatrix(color, prim, plan.matrix, plan.matrix_identity);
-            return plan;
-        }
-
-        // Converts one decoded tile from the source encoding (fp16) to scene-linear BT.709
-        // (fp16) in place between the two bitmaps. Runs on the decode thread, one disjoint
-        // rect at a time, so it never blocks the UI and stays consistent with progressive
-        // decoding.
-        void convertRectToLinear(const Bitmap& src, Bitmap& dst, const ImageDecodeRect& rect,
-                                 TransferFunction transfer, float gamma,
-                                 const float matrix[9], bool matrix_identity)
-        {
-            for (int y = rect.y; y < rect.y + rect.height; ++y)
+            if (is_float)
             {
-                const Half* s = reinterpret_cast<const Half*>(src.address(rect.x, y));
-                Half* d = reinterpret_cast<Half*>(dst.address(rect.x, y));
-
-                for (int x = 0; x < rect.width; ++x)
-                {
-                    float r = transferToLinear(float(s[x * 4 + 0]), transfer, gamma);
-                    float g = transferToLinear(float(s[x * 4 + 1]), transfer, gamma);
-                    float b = transferToLinear(float(s[x * 4 + 2]), transfer, gamma);
-                    const float a = float(s[x * 4 + 3]);
-
-                    if (!matrix_identity)
-                    {
-                        const float R = matrix[0] * r + matrix[1] * g + matrix[2] * b;
-                        const float G = matrix[3] * r + matrix[4] * g + matrix[5] * b;
-                        const float B = matrix[6] * r + matrix[7] * g + matrix[8] * b;
-                        r = R; g = G; b = B;
-                    }
-
-                    d[x * 4 + 0] = r;
-                    d[x * 4 + 1] = g;
-                    d[x * 4 + 2] = b;
-                    d[x * 4 + 3] = a;
-                }
+                plan.bitmap_format = header.format.bits > 64 ? formatF32() : formatF16();
             }
+            else
+            {
+                plan.bitmap_format = formatU8();
+            }
+            return plan;
         }
 
         // Copy the worker-produced header_* fields into the drawable texture struct.
@@ -833,10 +568,7 @@ namespace ifap
             task->header_format = plan.upload_format;
             task->header_linear = true; // sampled texels are scene-linear in every path
             task->needs_color_convert = plan.convert;
-            task->color_transfer = plan.transfer;
-            task->color_gamma = plan.gamma;
-            task->color_matrix_identity = plan.matrix_identity;
-            std::memcpy(task->color_matrix, plan.matrix, sizeof(task->color_matrix));
+            task->header_color = header.color;
             task->header_width = header.width;
             task->header_height = header.height;
 
@@ -868,12 +600,12 @@ namespace ifap
             task->bitmap = std::make_unique<Bitmap>(
                 header.width, header.height, task->bitmap_format);
 
-            // Bake path: a second fp16 bitmap holds the scene-linear BT.709 result that the
-            // GPU samples; the decode writes the source encoding into `bitmap`.
+            // Bake path: scene-linear fp16 result for the GPU; decode layout stays in
+            // bitmap_format (u8 encoded integer, or fp16/fp32 float).
             if (task->needs_color_convert)
             {
                 task->convert_bitmap = std::make_unique<Bitmap>(
-                    header.width, header.height, task->bitmap_format);
+                    header.width, header.height, formatLinearDest());
             }
 
             task->decode_start_ms.store(mango::Time::ms());
@@ -890,13 +622,17 @@ namespace ifap
                     return;
                 }
 
-                // Bake this tile to scene-linear BT.709 before publishing it, so the UI
-                // thread only ever uploads converted pixels. Disjoint rects -> no lock.
+                // linearize() this tile to scene-linear BT.709 before publishing it, so the
+                // UI thread only ever uploads converted pixels. Dest must be float (fp16)
+                // — integer/sRGB dest surfaces clamp HDR during the final blit.
                 if (task->needs_color_convert && task->bitmap && task->convert_bitmap)
                 {
-                    convertRectToLinear(*task->bitmap, *task->convert_bitmap, rect,
-                        task->color_transfer, task->color_gamma,
-                        task->color_matrix, task->color_matrix_identity);
+                    const Surface src(*task->bitmap, rect.x, rect.y, rect.width, rect.height);
+                    const Surface dst(*task->convert_bitmap, rect.x, rect.y, rect.width, rect.height);
+                    if (dst.format.isFloat())
+                    {
+                        linearize(dst, src, task->header_color);
+                    }
                 }
 
                 bool first = false;
