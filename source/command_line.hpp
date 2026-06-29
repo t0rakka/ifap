@@ -12,6 +12,7 @@ namespace ifap
     struct CommandLineOptions
     {
         bool debug = false;
+        bool info = false;
     };
 
     struct ParsedCommandLine

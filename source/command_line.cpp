@@ -26,6 +26,12 @@ namespace ifap
                 continue;
             }
 
+            if (arg == "--info")
+            {
+                result.options.info = true;
+                continue;
+            }
+
             result.commands.push_back(arg);
         }
 

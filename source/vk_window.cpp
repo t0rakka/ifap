@@ -7,6 +7,7 @@
 #include "app_view.hpp"
 #include "render/vk/vk_renderer.hpp"
 
+#include <mango/core/system.hpp>
 #include <mango/vulkan/vulkan.hpp>
 
 namespace ifap
@@ -76,6 +77,12 @@ namespace ifap
     void runApp(const CommandLine& commands)
     {
         const ParsedCommandLine parsed = parseCommandLine(commands);
+
+        if (parsed.options.info)
+        {
+            printEnable(Print::Info, true);
+        }
+
         Instance instance = createVulkanInstance(parsed.options.debug);
         VKAppWindow window(instance, parsed.commands);
         window.setTitle("iFap Image Viewer");
