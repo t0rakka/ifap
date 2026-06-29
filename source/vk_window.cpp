@@ -3,6 +3,7 @@
     Copyright 2013-2025 Twilight 3D Finland Oy. All rights reserved.
 */
 #include "window.hpp"
+#include "command_line.hpp"
 #include "app_view.hpp"
 #include "render/vk/vk_renderer.hpp"
 
@@ -13,18 +14,6 @@ namespace ifap
     using namespace mango;
     using namespace mango::filesystem;
     using namespace mango::vulkan;
-
-    bool commandLineHasFlag(const CommandLine& commands, std::string_view flag)
-    {
-        for (size_t i = 1; i < commands.size(); ++i)
-        {
-            if (commands[i] == flag)
-            {
-                return true;
-            }
-        }
-        return false;
-    }
 
     class VKAppWindow : public VulkanWindow
     {
@@ -86,9 +75,9 @@ namespace ifap
 
     void runApp(const CommandLine& commands)
     {
-        const bool debug = commandLineHasFlag(commands, "--debug");
-        Instance instance = createVulkanInstance(debug);
-        VKAppWindow window(instance, commands);
+        const ParsedCommandLine parsed = parseCommandLine(commands);
+        Instance instance = createVulkanInstance(parsed.options.debug);
+        VKAppWindow window(instance, parsed.commands);
         window.setTitle("iFap Image Viewer");
 
         EventLoopConfig config;

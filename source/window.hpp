@@ -12,8 +12,6 @@ namespace ifap
 
     using CommandLine = std::vector<std::string_view>;
 
-    bool commandLineHasFlag(const CommandLine& commands, std::string_view flag);
-
     void runApp(const CommandLine& commands);
 
 } // namespace ifap

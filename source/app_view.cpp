@@ -49,18 +49,9 @@ namespace ifap
 
         if (commands.size() > 1)
         {
-            for (size_t i = 1; i < commands.size(); ++i)
-            {
-                if (commands[i] == "--debug")
-                {
-                    continue;
-                }
-
-                FileIndex index;
-                index.emplace(std::string(commands[i]));
-                onDropFiles(index);
-                break;
-            }
+            FileIndex index;
+            index.emplace(std::string(commands[1]));
+            onDropFiles(index);
         }
     }
 
