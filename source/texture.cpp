@@ -524,7 +524,7 @@ namespace ifap
                 task->buffer = std::move(buffer);
             }
 
-            task->decoder = std::make_unique<ImageDecoder>(*task->buffer, task->name);
+            task->decoder = std::make_unique<ImageDecoder>(*task->buffer, *task->path, task->name);
             ImageHeader header = task->decoder->header();
 
             if (!header.width || !header.height)
