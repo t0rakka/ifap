@@ -14,6 +14,18 @@ namespace ifap
     using namespace mango::filesystem;
     using namespace mango::vulkan;
 
+    bool commandLineHasFlag(const CommandLine& commands, std::string_view flag)
+    {
+        for (size_t i = 1; i < commands.size(); ++i)
+        {
+            if (commands[i] == flag)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     class VKAppWindow : public VulkanWindow
     {
     protected:
@@ -42,12 +54,15 @@ namespace ifap
         void onFrame(const FrameInfo& info) override { m_app.onFrame(info); }
     };
 
-    static Instance createVulkanInstance()
+    static Instance createVulkanInstance(bool enable_validation)
     {
         InstanceExtensionProperties instanceExtensionProperties;
 
         std::vector<const char*> enabledLayers;
-        //enabledLayers.push_back("VK_LAYER_KHRONOS_validation");
+        if (enable_validation)
+        {
+            enabledLayers.push_back("VK_LAYER_KHRONOS_validation");
+        }
 
         std::vector<const char*> enabledExtensions = requiredSurfaceExtensions();
 
@@ -71,7 +86,8 @@ namespace ifap
 
     void runApp(const CommandLine& commands)
     {
-        Instance instance = createVulkanInstance();
+        const bool debug = commandLineHasFlag(commands, "--debug");
+        Instance instance = createVulkanInstance(debug);
         VKAppWindow window(instance, commands);
         window.setTitle("iFap Image Viewer");
 
