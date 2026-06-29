@@ -176,7 +176,13 @@ namespace ifap
             {
                 case VK_COLOR_SPACE_HDR10_ST2084_EXT:
                 case VK_COLOR_SPACE_HDR10_HLG_EXT:
-                    return 100.0f;
+                    // ITU-R BT.2408 "graphics/diffuse white" reference. PQ is absolute,
+                    // so this is the exact nit level diffuse white scans out at. The strict
+                    // sRGB reference (100) leaves SDR content visibly dimmer than the rest
+                    // of a Windows 11 HDR desktop (which shows SDR white near ~200 nits),
+                    // which reads as "too dark"; 203 matches the HDR graphics-white standard
+                    // (and the divisor the HLG path already uses).
+                    return 203.0f;
                 default:
                     return 100.0f;
             }
