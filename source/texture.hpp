@@ -72,6 +72,18 @@ namespace ifap
         int downscale_height = 0;
         bool gpu_texture_ready = false;
 
+        // Input -> scene-linear BT.709 color pipeline. When needs_color_convert is set the
+        // worker decodes into `bitmap` in the file's own encoding and converts each decoded
+        // rect into `convert_bitmap` (scene-linear BT.709, fp16), which is what gets
+        // uploaded. Fast-path images (BT.709 sRGB/linear, handled by the VkFormat) leave
+        // this clear and upload straight from `bitmap`. Set by the worker before launch().
+        bool needs_color_convert = false;
+        TransferFunction color_transfer = TransferFunction::sRGB; // source EOTF to invert
+        float color_gamma = 0.0f;            // explicit display-gamma exponent (0 = use transfer)
+        bool color_matrix_identity = true;   // source primaries already BT.709
+        float color_matrix[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 }; // source primaries -> BT.709
+        std::unique_ptr<Bitmap> convert_bitmap;
+
         std::atomic<PrepareState> prepare_state { PrepareState::Pending };
 
         mutable std::mutex mutex;
