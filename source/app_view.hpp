@@ -76,6 +76,7 @@ namespace ifap
 
         bool m_loop_active = false;
         bool m_shutdown = false;
+        bool m_awaiting_display = false;
 
         void nextImage(int direction);
         void resetTransformation();
@@ -88,7 +89,9 @@ namespace ifap
 
         void renderFrame();
         void requestRedraw();
+        void scheduleNextFrame();
         bool needsContinuousUpdate() const;
+        bool isContentDisplayed() const;
         bool isExitRequested() const;
         void shutdown();
 

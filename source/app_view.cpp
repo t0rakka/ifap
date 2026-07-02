@@ -71,6 +71,7 @@ namespace ifap
             m_current_task = m_texture_cache.getTexture(m_current_index, true);
 
             resetTransformation();
+            m_awaiting_display = true;
         }
     }
 
@@ -166,11 +167,74 @@ namespace ifap
         m_window.invalidate();
     }
 
+    void AppView::scheduleNextFrame()
+    {
+        if (isExitRequested())
+        {
+            return;
+        }
+
+        // OnDemand idles with WAIT_INFINITE until an OS event arrives. Worker-thread
+        // invalidate/wake is not reliable on macOS (mouse click "fixes" a gray window
+        // because it delivers a real event). Arm a timed wake so we keep pumping until
+        // the image is actually on screen.
+        const double hz = m_window.getDisplayRefreshRate();
+        const double interval = hz > 0.0 ? (1.0 / hz) : (1.0 / 60.0);
+        m_window.requestFrameIn(interval);
+    }
+
+    bool AppView::isContentDisplayed() const
+    {
+        if (!m_current_task)
+        {
+            return false;
+        }
+
+        const DecodeTask& task = *m_current_task;
+
+        if (task.prepare_state != PrepareState::Ready || !task.gpu_texture_ready)
+        {
+            return false;
+        }
+
+        if (!task.texture.handle || !m_renderer.isTextureLayoutReady(task.texture.handle))
+        {
+            return false;
+        }
+
+        if (!task.content_uploaded)
+        {
+            return false;
+        }
+
+        if (task.hasPendingUpdates() || task.isDecoding())
+        {
+            return false;
+        }
+
+        if (!m_renderer.isTextureUploadComplete(task.texture.handle))
+        {
+            return false;
+        }
+
+        if (task.present_settle_frames > 0)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
     bool AppView::needsContinuousUpdate() const
     {
         if (isExitRequested())
         {
             return false;
+        }
+
+        if (m_awaiting_display)
+        {
+            return true;
         }
 
         if (m_mouse_translate.enable || m_mouse_scale.enable)
@@ -192,6 +256,23 @@ namespace ifap
             }
 
             if (!m_current_task->gpu_texture_ready || m_current_task->hasPendingUpdates())
+            {
+                return true;
+            }
+
+            if (m_current_task->texture.handle &&
+                !m_renderer.isTextureLayoutReady(m_current_task->texture.handle))
+            {
+                return true;
+            }
+
+            if (m_current_task->texture.handle &&
+                !m_renderer.isTextureUploadComplete(m_current_task->texture.handle))
+            {
+                return true;
+            }
+
+            if (m_current_task->present_settle_frames > 0)
             {
                 return true;
             }
@@ -331,7 +412,9 @@ namespace ifap
             m_current_index = index;
             m_current_task = m_texture_cache.getTexture(m_current_index, true);
             resetTransformation();
+            m_awaiting_display = true;
             requestRedraw();
+            m_window.dispatchFrame();
         }
     }
 
@@ -401,9 +484,24 @@ namespace ifap
 
         // Input and texture work before swapchain acquire so event handling stays
         // responsive even when the GPU is busy decoding/uploading.
-        const bool texture_progress = m_texture_cache.update(m_current_index);
+        const bool texture_progress = m_texture_cache.update(m_current_index, m_current_task);
 
         renderFrame();
+
+        if (m_current_task && m_current_task->present_settle_frames > 0)
+        {
+            --m_current_task->present_settle_frames;
+        }
+
+        if (m_awaiting_display && isContentDisplayed())
+        {
+            m_awaiting_display = false;
+        }
+
+        if (m_awaiting_display)
+        {
+            scheduleNextFrame();
+        }
 
         if (texture_progress || needsContinuousUpdate())
         {

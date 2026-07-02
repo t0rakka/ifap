@@ -58,6 +58,12 @@ namespace ifap
         // Sets the per-frame GPU upload budget (bytes copied/transferred per upload
         // submit). The cache lowers this while navigating and raises it when idle.
         void setUploadBytesPerFrame(size_t bytes);
+
+        // True once the GPU has retired the most recent upload/clear for this texture.
+        bool isTextureUploadComplete(TextureHandle handle) const;
+
+        // True once an upload/clear submit has retired and the image is sampleable.
+        bool isTextureLayoutReady(TextureHandle handle) const;
     };
 
 } // namespace ifap

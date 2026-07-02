@@ -72,6 +72,13 @@ namespace ifap
         int downscale_height = 0;
         bool gpu_texture_ready = false;
 
+        // Set once a pixel upload submit succeeds; gates "displayed" so a cleared GPU
+        // image alone does not end the cold-drop pump before real content lands.
+        bool content_uploaded = false;
+
+        // Main-thread only: keep presenting for a few frames after an upload submit.
+        int present_settle_frames = 0;
+
         // Input -> scene-linear BT.709 color pipeline. When needs_color_convert is set the
         // worker decodes into `bitmap` (native encoded layout) and linearize()s each rect
         // into `convert_bitmap` (always fp16 scene-linear BT.709), which is what gets
@@ -194,7 +201,7 @@ namespace ifap
         // Pinned-overlay helpers (see m_pinned).
         bool isPinIndex(size_t index) const;
         std::shared_ptr<DecodeTask> lookupTask(size_t index);
-        void storeTask(size_t index, const std::shared_ptr<DecodeTask>& task);
+        void storeTask(size_t index, const std::shared_ptr<DecodeTask>& task, bool pin_overlay = false);
         void repin(size_t priority_index);
         void forEachTask(const std::function<void(size_t, std::shared_ptr<DecodeTask>&)>& fn);
 
@@ -222,7 +229,7 @@ namespace ifap
         std::shared_ptr<DecodeTask> getTexture(size_t index, bool priority = false);
         void setPrefetchDirection(int direction);
         bool updateDecodeTask(DecodeTask& task);
-        bool update(size_t priority_index);
+        bool update(size_t priority_index, const std::shared_ptr<DecodeTask>& priority_task = {});
 
     protected:
         void uploadDownscaledPreview(DecodeTask& task);

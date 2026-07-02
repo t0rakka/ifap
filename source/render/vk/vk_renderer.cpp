@@ -589,6 +589,11 @@ namespace ifap
             int width = 0;
             int height = 0;
             bool layout_ready = false;
+            // Timeline value from the most recent upload/clear submit. The OnDemand loop
+            // polls this (via isTextureUploadComplete) so a one-shot decode cannot go idle
+            // before the GPU copy is visible; recordDraw does not skip — progressive
+            // uploads keep showing the last good partial image.
+            u64 last_upload_value = 0;
             // Highest timeline value of any submission (upload, clear, or frame draw)
             // that referenced this texture's image/view/descriptor. Destruction is
             // gated until the timeline reaches it (see tryDestroyTexture); 0 means
@@ -652,6 +657,8 @@ namespace ifap
         VkSampler selectSampler(TextureFilter filter) const;
         VkPipeline selectPipeline(const ImageDrawRequest& request) const;
         void recordDraw(const ImageDrawRequest& request);
+        bool isTextureUploadComplete(TextureHandle handle) const;
+        bool isTextureLayoutReady(TextureHandle handle) const;
 
         Impl(VulkanWindow& window, Instance& instance, VkSurfaceKHR surface);
         ~Impl();
@@ -1341,9 +1348,27 @@ namespace ifap
         slot->command_buffer = commandBuffer;
         slot->pending_value = value;
         texture.layout_ready = true;
+        texture.last_upload_value = value;
         texture.last_used_value = std::max(texture.last_used_value, value);
 
         return consumed;
+    }
+
+    bool VKRenderer::Impl::isTextureUploadComplete(TextureHandle handle) const
+    {
+        const GpuTexture* texture = getTexture(handle);
+        if (!texture || texture->last_upload_value == 0)
+        {
+            return true;
+        }
+
+        return timelineCompleted() >= texture->last_upload_value;
+    }
+
+    bool VKRenderer::Impl::isTextureLayoutReady(TextureHandle handle) const
+    {
+        const GpuTexture* texture = getTexture(handle);
+        return texture && texture->layout_ready;
     }
 
     void VKRenderer::Impl::clearTexture(GpuTexture& texture)
@@ -1442,6 +1467,7 @@ namespace ifap
         slot->command_buffer = commandBuffer;
         slot->pending_value = value;
         texture.layout_ready = true;
+        texture.last_upload_value = value;
         texture.last_used_value = std::max(texture.last_used_value, value);
     }
 
@@ -1497,6 +1523,13 @@ namespace ifap
             // defined placeholder colour first (otherwise the not-yet-uploaded area
             // samples uninitialised memory — pink on MoltenVK).
             clearTexture(gpu);
+        }
+
+        if (!gpu.layout_ready)
+        {
+            freeTextureResources(gpu, handle);
+            m_textures.pop_back();
+            return 0;
         }
 
         return handle;
@@ -2424,5 +2457,7 @@ namespace ifap
     bool VKRenderer::tryDestroyTexture(TextureHandle handle) { return m_impl->tryDestroyTexture(handle); }
     void VKRenderer::releaseUploadStaging(TextureHandle handle) { m_impl->releaseUploadStaging(handle); }
     void VKRenderer::setUploadBytesPerFrame(size_t bytes) { m_impl->setUploadBytesPerFrame(bytes); }
+    bool VKRenderer::isTextureUploadComplete(TextureHandle handle) const { return m_impl->isTextureUploadComplete(handle); }
+    bool VKRenderer::isTextureLayoutReady(TextureHandle handle) const { return m_impl->isTextureLayoutReady(handle); }
 
 } // namespace ifap

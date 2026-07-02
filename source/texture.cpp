@@ -878,8 +878,21 @@ namespace ifap
         return {};
     }
 
-    void TextureCache::storeTask(size_t index, const std::shared_ptr<DecodeTask>& task)
+    void TextureCache::storeTask(size_t index, const std::shared_ptr<DecodeTask>& task, bool pin_overlay)
     {
+        if (pin_overlay)
+        {
+            m_pinned[index] = task;
+            m_cache.erase(index);
+
+            if (std::find(m_pin_set.begin(), m_pin_set.end(), index) == m_pin_set.end())
+            {
+                m_pin_set.push_back(index);
+            }
+
+            return;
+        }
+
         // Window members go into the eviction-immune overlay; everything else into
         // the evictable cache. repin() keeps m_pin_set in sync with the window.
         if (isPinIndex(index))
@@ -907,6 +920,7 @@ namespace ifap
         const size_t count = m_indexer.size();
         if (!count)
         {
+            m_pin_set.assign(1, priority_index);
             return;
         }
 
@@ -1277,7 +1291,7 @@ namespace ifap
         job.task = task;
         enqueuePrepare(std::move(job), priority);
 
-        storeTask(index, task);
+        storeTask(index, task, priority);
         return task;
     }
 
@@ -1369,6 +1383,12 @@ namespace ifap
         const bool decode_finished = !task.future.valid() ||
             task.future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
 
+        if (submitted > 0)
+        {
+            task.content_uploaded = true;
+            task.present_settle_frames = std::max(task.present_settle_frames, 2);
+        }
+
         if (all_uploaded && task.gpu_texture_ready && decode_finished)
         {
             task.bitmap.reset();
@@ -1389,7 +1409,7 @@ namespace ifap
         return submitted > 0;
     }
 
-    bool TextureCache::update(size_t priority_index)
+    bool TextureCache::update(size_t priority_index, const std::shared_ptr<DecodeTask>& priority_task)
     {
         if (m_shutdown || (m_should_abort && m_should_abort()))
         {
@@ -1440,7 +1460,8 @@ namespace ifap
 
         // Priority image: always set up and uploaded immediately so the visible image
         // keeps progressing without waiting on a budget.
-        auto priority_entry = lookupTask(priority_index);
+        // Prefer the AppView's current task so a cold drop cannot miss cache lookup.
+        std::shared_ptr<DecodeTask> priority_entry = priority_task ? priority_task : lookupTask(priority_index);
 
         if (trace_decode)
         {
