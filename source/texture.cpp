@@ -39,11 +39,34 @@ namespace ifap
         // fp16 for HDR/float and for the bake target (range + precision through the
         // primaries matrix), fp32 only for >fp16 float sources.
         inline Format formatU8()  { return Format(32, Format::UNORM, Format::RGBA, 8, 8, 8, 8); }
+        inline Format formatU16() { return Format(64, Format::UNORM, Format::RGBA, 16, 16, 16, 16); }
         inline Format formatF16() { return Format(64, Format::FLOAT16, Format::RGBA, 16, 16, 16, 16); }
         inline Format formatF32() { return Format(128, Format::FLOAT32, Format::RGBA, 32, 32, 32, 32); }
 
+        inline Format decodeBitmapFormat(const ImageHeader& header)
+        {
+            // Palette/indexed sources decode into RGBA; mango resolves the palette on
+            // decode when the destination format does not match the file format.
+            if (header.format.isIndexed())
+            {
+                return header.format.bits > 8 ? formatU16() : formatU8();
+            }
+
+            if (header.format.isFloat())
+            {
+                return header.format.bits > 64 ? formatF32() : formatF16();
+            }
+
+            if (header.format.bits > 32)
+            {
+                return formatU16();
+            }
+
+            return formatU8();
+        }
+
         // Scene-linear working-space target for linearize(); always fp16 so the final
-        // blit never clamps HDR to UNORM/sRGB. Decode uses bitmap_format (native layout).
+        // blit never clamps HDR to UNORM/sRGB. Decode uses bitmap_format (RGBA for indexed).
         inline Format formatLinearDest() { return formatF16(); }
 
         // ---- classification ----------------------------------------------------------
@@ -101,18 +124,33 @@ namespace ifap
                         plan.upload_format = wide ? PixelFormat::RGBA32F : PixelFormat::RGBA16F;
                         plan.bitmap_format = wide ? formatF32() : formatF16();
                     }
+                    else if (header.format.bits > 32)
+                    {
+                        plan.convert = true;
+                        plan.upload_format = PixelFormat::RGBA16F;
+                        plan.bitmap_format = formatU16();
+                    }
                     else
                     {
                         plan.upload_format = PixelFormat::RGBA8_UNORM;
-                        plan.bitmap_format = formatU8();
+                        plan.bitmap_format = decodeBitmapFormat(header);
                     }
                     return plan;
                 }
 
                 if (transfer == TransferFunction::sRGB && !is_float)
                 {
-                    plan.upload_format = PixelFormat::RGBA8_SRGB;
-                    plan.bitmap_format = formatU8();
+                    if (header.format.bits > 32)
+                    {
+                        plan.convert = true;
+                        plan.upload_format = PixelFormat::RGBA16F;
+                        plan.bitmap_format = formatU16();
+                    }
+                    else
+                    {
+                        plan.upload_format = PixelFormat::RGBA8_SRGB;
+                        plan.bitmap_format = decodeBitmapFormat(header);
+                    }
                     return plan;
                 }
             }
@@ -126,10 +164,17 @@ namespace ifap
                     plan.upload_format = PixelFormat::RGBA16F;
                     plan.bitmap_format = formatF16();
                 }
+                else if (header.format.bits > 32)
+                {
+                    // ICC + 16-bit PSD/TIFF: decode natively, bake to scene-linear fp16.
+                    plan.convert = true;
+                    plan.upload_format = PixelFormat::RGBA16F;
+                    plan.bitmap_format = formatU16();
+                }
                 else
                 {
                     plan.upload_format = PixelFormat::RGBA8_SRGB;
-                    plan.bitmap_format = formatU8();
+                    plan.bitmap_format = decodeBitmapFormat(header);
                 }
                 return plan;
             }
@@ -139,14 +184,7 @@ namespace ifap
             // accepts u8/sRGB surfaces but clamps HDR when used as dest).
             plan.convert = true;
             plan.upload_format = PixelFormat::RGBA16F;
-            if (is_float)
-            {
-                plan.bitmap_format = header.format.bits > 64 ? formatF32() : formatF16();
-            }
-            else
-            {
-                plan.bitmap_format = formatU8();
-            }
+            plan.bitmap_format = decodeBitmapFormat(header);
             return plan;
         }
 
