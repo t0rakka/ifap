@@ -6,6 +6,7 @@
 #include "command_line.hpp"
 #include "app_view.hpp"
 #include "render/vk/vk_renderer.hpp"
+#include "render/vk/vk_surface_format.hpp"
 
 #include <mango/core/system.hpp>
 #include <mango/vulkan/vulkan.hpp>
@@ -19,29 +20,49 @@ namespace ifap
     class VKAppWindow : public VulkanWindow
     {
     protected:
-        VKRenderer m_renderer;
-        AppView m_app;
+        Instance& m_instance;
+        const CommandLine& m_commands;
+        std::unique_ptr<VKRenderer> m_renderer;
+        std::unique_ptr<AppView> m_app;
 
     public:
-        VKAppWindow(Instance& instance, const CommandLine& commands)
-            : VulkanWindow(instance, 1280, 800, 0)
-            , m_renderer(*this, instance, m_surface)
-            , m_app(*this, m_renderer)
+        VKAppWindow(Instance& instance, const CommandLine& commands, const VulkanDeviceConfig& config)
+            : VulkanWindow(instance, 1280, 800, 0, &config)
+            , m_instance(instance)
+            , m_commands(commands)
         {
-            m_renderer.initialize();
-            m_app.startup(commands);
-            setVisible(true);
         }
 
         ~VKAppWindow() override = default;
 
-        void onClose() override { m_app.onClose(); }
-        void onMouseMove(int x, int y) override { m_app.onMouseMove(x, y); }
-        void onMouseClick(int x, int y, MouseButton button, int count) override { m_app.onMouseClick(x, y, button, count); }
-        void onKeyPress(Keycode code, u32 mask) override { m_app.onKeyPress(code, mask); }
-        void onDropFiles(const FileIndex& index) override { m_app.onDropFiles(index); }
-        void onResize(int width, int height) override { m_app.onResize(width, height); }
-        void onFrame(const FrameInfo& info) override { m_app.onFrame(info); }
+        void onDeviceReady() override
+        {
+            logSelectedSurfaceFormat(*this);
+
+            m_renderer = std::make_unique<VKRenderer>(*this, m_instance);
+            m_renderer->initialize();
+            m_app = std::make_unique<AppView>(*this, *m_renderer);
+            m_app->startup(m_commands);
+        }
+
+        void onSwapchainResize(VkExtent2D extent) override
+        {
+            if (m_renderer)
+            {
+                m_renderer->resize(int(extent.width), int(extent.height));
+            }
+        }
+
+        void onClose() override { if (m_app) m_app->onClose(); }
+        void onMouseMove(int x, int y) override { if (m_app) m_app->onMouseMove(x, y); }
+        void onMouseClick(int x, int y, MouseButton button, int count) override
+        {
+            if (m_app) m_app->onMouseClick(x, y, button, count);
+        }
+        void onKeyPress(Keycode code, u32 mask) override { if (m_app) m_app->onKeyPress(code, mask); }
+        void onDropFiles(const FileIndex& index) override { if (m_app) m_app->onDropFiles(index); }
+        void onResize(int width, int height) override { if (m_app) m_app->onResize(width, height); }
+        void onFrame(const FrameInfo& info) override { if (m_app) m_app->onFrame(info); }
     };
 
     static Instance createVulkanInstance(bool enable_validation)
@@ -54,6 +75,8 @@ namespace ifap
             enabledLayers.push_back("VK_LAYER_KHRONOS_validation");
         }
 
+        // Resolves and locks the process window system. Call Window::setWindowSystem()
+        // before this if you need to override auto-detection (must be before any window).
         std::vector<const char*> enabledExtensions = requiredSurfaceExtensions();
 
         if (instanceExtensionProperties.contains(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))
@@ -83,8 +106,9 @@ namespace ifap
             printEnable(Print::Info, true);
         }
 
+        const VulkanDeviceConfig deviceConfig = makeVulkanDeviceConfig();
         Instance instance = createVulkanInstance(parsed.options.debug);
-        VKAppWindow window(instance, parsed.commands);
+        VKAppWindow window(instance, parsed.commands, deviceConfig);
         window.setTitle("iFap Image Viewer");
 
         EventLoopConfig config;

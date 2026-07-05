@@ -93,24 +93,6 @@ namespace ifap
             }
         }
 
-        static bool surfaceFormatMatches(const VkSurfaceFormatKHR& a, const VkSurfaceFormatKHR& b)
-        {
-            return a.format == b.format && a.colorSpace == b.colorSpace;
-        }
-
-        static bool containsSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& formats, const VkSurfaceFormatKHR& candidate)
-        {
-            for (const VkSurfaceFormatKHR& format : formats)
-            {
-                if (surfaceFormatMatches(format, candidate))
-                {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
         static OutputTransform selectOutputTransform(const VkSurfaceFormatKHR& surfaceFormat)
         {
             if (surfaceFormat.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT)
@@ -188,179 +170,7 @@ namespace ifap
             }
         }
 
-        // ------------------------------------------------------------------
-        // Resolve pass: scene-linear BT.709 in -> swapchain colorspace out.
-        // ------------------------------------------------------------------
-        //
-        // >>> ACTIVE TARGET: the single uncommented kDevSurfaceFormat line below.
-        //     Read it before tuning — defaults/calibration apply to THAT color space only.
-        //
-        // VkFormat        — how samples are stored (layout, UNORM/SFLOAT/SRGB, …)
-        // VkColorSpaceKHR — what those values mean at scanout (primaries + EOTF)
-        //
-        // SDR baseline goal: same sRGB JPEG should look correct per tagged colorspace.
-        // Texture side: Mango decoder sets header.linear → RGBA8_SRGB vs UNORM.
-        //
-        // HLG:      BT.709 -> BT.2020, x0.265*(nits/203) (BT.2408), HLG OETF
-        // Adobe:    BT.709 -> Adobe RGB (XYZ-derived matrix), OETF exponent 256/563
-        // BT709:    SMPTE 170M / ITU piecewise OETF (same primaries)
-        // DCI-P3:   BT.709 -> P3 primaries, gamma 2.6
-        // ------------------------------------------------------------------
-
-        // KNOWN ISSUE (Hyprland/Wayland, June 2026): an HDR / wide-gamut *windowed*
-        // swapchain flickers on resize (cleared frame shown before content). This is a
-        // compositor-side limitation, not an ifap rendering bug. HDR-first selection
-        // works great on Windows 11 and macOS/MoltenVK; only Hyprland/Wayland misbehaves.
-        //
-        // Diagnosis: vkbasic with an SDR swapchain does not flicker, and forcing ifap to
-        // the same SDR format (B8G8R8A8_UNORM / SRGB_NONLINEAR) makes resize smooth in
-        // both OnDemand and Continuous modes. Frame mode is NOT the cause.
-        //
-        // Wayland quirk: in windowed mode the HDR10 colorspace is effectively SDR anyway
-        // (the compositor tonemaps HDR10 -> SDR display), so we lose nothing by shipping
-        // HDR-first here. Going fullscreen flips the display into real HDR (gorgeous), but
-        // exiting fullscreen leaves it stuck in HDR — hyprctl can't recover it; only a
-        // logout does. Their HDR pipeline is simply not there yet.
-        //
-        // Decision: keep HDR-first auto ON by default (kDevForceSurfaceFormat = false) so
-        // ifap is ready to "just work" once a Wayland compositor ships a correct HDR impl.
-        // Set this to true (with the SDR entry below) to force SDR for flicker-free
-        // testing. Intended long-term mitigation: fullscreen-gated HDR (SDR windowed,
-        // HDR-first in fullscreen).
-        constexpr bool kDevForceSurfaceFormat = false;
-
-        constexpr VkSurfaceFormatKHR kDevSurfaceFormat =
-        {
-            // OK
-            //VK_FORMAT_B8G8R8A8_UNORM,      VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
-            //VK_FORMAT_B8G8R8A8_SRGB,       VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
-            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
-            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_DISPLAY_P3_NONLINEAR_EXT
-            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_PASS_THROUGH_EXT
-            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT
-            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_HDR10_ST2084_EXT
-            VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_COLOR_SPACE_HDR10_ST2084_EXT
-            //VK_FORMAT_B8G8R8A8_SRGB,       VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
-            //VK_FORMAT_B8G8R8A8_UNORM,      VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
-            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT
-            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
-            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_BT2020_LINEAR_EXT
-            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT
-            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_HDR10_HLG_EXT
-            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_BT709_NONLINEAR_EXT
-            //VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT
-        };
-
-        static VkSurfaceFormatKHR selectBestFormatForColorSpace(
-            const std::vector<VkSurfaceFormatKHR>& surfaceFormats,
-            VkColorSpaceKHR colorSpace)
-        {
-            static const VkFormat formatPreference[] =
-            {
-                VK_FORMAT_R16G16B16A16_SFLOAT,
-                VK_FORMAT_A2B10G10R10_UNORM_PACK32,
-                VK_FORMAT_A2R10G10B10_UNORM_PACK32,
-                VK_FORMAT_B8G8R8A8_SRGB,
-                VK_FORMAT_B8G8R8A8_UNORM,
-            };
-
-            for (VkFormat format : formatPreference)
-            {
-                const VkSurfaceFormatKHR candidate { format, colorSpace };
-
-                if (containsSurfaceFormat(surfaceFormats, candidate))
-                {
-                    return candidate;
-                }
-            }
-
-            return surfaceFormats.empty()
-                ? VkSurfaceFormatKHR { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR }
-                : surfaceFormats[0];
-        }
-
-        static VkSurfaceFormatKHR selectSurfaceFormat(VkPhysicalDevice physicalDevice, VkSurfaceKHR surface)
-        {
-            // HDR-first auto selection; per-color-space output calibration comes later.
-            static const VkSurfaceFormatKHR preferredFormats[] =
-            {
-                { VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_HDR10_ST2084_EXT },
-                { VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_COLOR_SPACE_HDR10_ST2084_EXT },
-                { VK_FORMAT_A2R10G10B10_UNORM_PACK32, VK_COLOR_SPACE_HDR10_ST2084_EXT },
-
-                { VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_HDR10_HLG_EXT },
-                { VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_COLOR_SPACE_HDR10_HLG_EXT },
-
-                { VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_BT2020_LINEAR_EXT },
-                { VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_COLOR_SPACE_BT2020_LINEAR_EXT },
-
-                { VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT },
-                { VK_FORMAT_R16G16B16A16_SFLOAT, VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT },
-                { VK_FORMAT_B8G8R8A8_SRGB, VK_COLOR_SPACE_DISPLAY_P3_NONLINEAR_EXT },
-
-                { VK_FORMAT_B8G8R8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },
-                { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR },
-            };
-
-            const std::vector<VkSurfaceFormatKHR> surfaceFormats = getSurfaceFormats(physicalDevice, surface);
-
-            VkSurfaceFormatKHR selectedFormat = preferredFormats[std::size(preferredFormats) - 1];
-            bool forced = false;
-
-            if (kDevForceSurfaceFormat)
-            {
-                if (containsSurfaceFormat(surfaceFormats, kDevSurfaceFormat))
-                {
-                    selectedFormat = kDevSurfaceFormat;
-                    forced = true;
-                }
-                else if (containsSurfaceFormat(surfaceFormats,
-                    selectBestFormatForColorSpace(surfaceFormats, kDevSurfaceFormat.colorSpace)))
-                {
-                    selectedFormat = selectBestFormatForColorSpace(surfaceFormats, kDevSurfaceFormat.colorSpace);
-                    forced = true;
-                    printLine(Print::Warning, "VKRenderer: exact dev format unavailable; using best format for {}",
-                        getString(kDevSurfaceFormat.colorSpace));
-                }
-                else
-                {
-                    printLine(Print::Warning, "VKRenderer: dev color space {} not supported; using auto selection",
-                        getString(kDevSurfaceFormat.colorSpace));
-                }
-            }
-
-            if (!forced && !surfaceFormats.empty())
-            {
-                selectedFormat = surfaceFormats[0];
-
-                for (const VkSurfaceFormatKHR& preferred : preferredFormats)
-                {
-                    if (containsSurfaceFormat(surfaceFormats, preferred))
-                    {
-                        selectedFormat = preferred;
-                        break;
-                    }
-                }
-            }
-
-            printLine(Print::Info, "VKRenderer: PhysicalDeviceSurfaceFormats:");
-
-            for (const VkSurfaceFormatKHR& format : surfaceFormats)
-            {
-                const bool is_selected = surfaceFormatMatches(format, selectedFormat);
-                printLine(Print::Info, "  {} {} | {}",
-                    is_selected ? ">" : " ",
-                    getString(format.format),
-                    getString(format.colorSpace));
-            }
-
-            if (forced)
-            {
-                printLine(Print::Info, "VKRenderer: using dev-forced surface format");
-            }
-
-            return selectedFormat;
-        }
+        // Swapchain format/colorspace is selected by VulkanWindow (vk_surface_format.cpp).
 
         VkPipelineColorBlendAttachmentState makeBlendAttachment(bool blend)
         {
@@ -512,17 +322,11 @@ namespace ifap
 
         VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
         VkDevice m_device = VK_NULL_HANDLE;
-        // Owns all image/buffer device memory via VMA. Created right after the device
-        // and destroyed just before it; every VMA-backed resource must be freed first.
         std::unique_ptr<Allocator> m_allocator;
         VkQueue m_graphicsQueue = VK_NULL_HANDLE;
         uint32_t m_graphicsQueueFamilyIndex = 0;
-        VkCommandPool m_graphicsCommandPool = VK_NULL_HANDLE;
         VkCommandPool m_transferCommandPool = VK_NULL_HANDLE;
-        // Per-frame upload budget (bytes), driven by the cache's navigation state.
         VkDeviceSize m_uploadBytesPerBatch = 8 * 1024 * 1024;
-        std::unique_ptr<Swapchain> m_swapchain;
-        std::vector<VkCommandBuffer> m_commandBuffers;
         VkShaderModule m_processingVertexShader = VK_NULL_HANDLE;
         VkShaderModule m_processingFragmentShaderBilinear = VK_NULL_HANDLE;
         VkShaderModule m_processingFragmentShaderBicubic = VK_NULL_HANDLE;
@@ -624,7 +428,12 @@ namespace ifap
         u64 m_timelineValue = 0;
         u64 m_frame_value = 0;
 
-        void createDevice(VkInstance instance);
+        void createContentDescriptors();
+        void ensureContentDescriptors();
+        Swapchain& swapchain() { return m_window.swapchain(); }
+        const Swapchain& swapchain() const { return m_window.swapchain(); }
+        VkCommandBuffer frameCommandBuffer(u32 imageIndex) const { return m_window.commandBuffer(imageIndex); }
+
         void createPipelines();
         void destroyPipelines();
         void createShaders();
@@ -634,7 +443,6 @@ namespace ifap
         void createProcessingTarget();
         void destroyProcessingTarget();
         void ensureProcessingTarget();
-        void createCommandBuffers();
         void beginCommandBufferRecording();
         void beginProcessingRendering();
         void endProcessingRendering();
@@ -660,7 +468,7 @@ namespace ifap
         bool isTextureUploadComplete(TextureHandle handle) const;
         bool isTextureLayoutReady(TextureHandle handle) const;
 
-        Impl(VulkanWindow& window, Instance& instance, VkSurfaceKHR surface);
+        Impl(VulkanWindow& window, Instance& instance);
         ~Impl();
 
         void initialize();
@@ -683,17 +491,19 @@ namespace ifap
         int getMaxTextureDimension() const;
     };
 
-    VKRenderer::Impl::Impl(VulkanWindow& window, Instance& instance, VkSurfaceKHR surface)
+    VKRenderer::Impl::Impl(VulkanWindow& window, Instance& instance)
         : m_window(window)
+        , m_physicalDevice(window.physicalDevice())
+        , m_device(window.device())
+        , m_graphicsQueue(window.graphicsQueue())
+        , m_graphicsQueueFamilyIndex(window.graphicsQueueFamilyIndex())
     {
-        createDevice(instance);
+        VkPhysicalDeviceProperties deviceProperties;
+        vkGetPhysicalDeviceProperties(m_physicalDevice, &deviceProperties);
+        m_max_texture_dimension = int(deviceProperties.limits.maxImageDimension2D);
 
-        // VMA backs every image/buffer from here on. The device was created with the
-        // Vulkan 1.3 feature set, so advertise 1.3 to enable VMA's version-specific paths.
         m_allocator = std::make_unique<Allocator>(instance, m_physicalDevice, m_device, VK_API_VERSION_1_3);
 
-        // The unified reclamation clock (see m_timeline). Starts at 0; the first submit
-        // signals 1.
         VkSemaphoreTypeCreateInfo timelineType =
         {
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
@@ -709,7 +519,7 @@ namespace ifap
 
         vkCreateSemaphore(m_device, &timelineInfo, nullptr, &m_timeline);
 
-        const VkSurfaceFormatKHR selectedFormat = selectSurfaceFormat(m_physicalDevice, surface);
+        const VkSurfaceFormatKHR selectedFormat = window.surfaceFormat();
 
         m_swapchain_srgb_format = isSrgbSurfaceFormat(selectedFormat.format);
         m_output_transform = selectOutputTransform(selectedFormat);
@@ -723,18 +533,13 @@ namespace ifap
             isHdrColorSpace(selectedFormat.colorSpace) ? "yes" : "no",
             int(m_sdr_white_nits));
 
-        m_swapchain = std::make_unique<Swapchain>(m_device, m_physicalDevice, surface, selectedFormat, m_graphicsQueue, &window);
-
         VkCommandPoolCreateInfo poolInfo =
         {
             .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-            .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+            .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
             .queueFamilyIndex = m_graphicsQueueFamilyIndex,
         };
 
-        vkCreateCommandPool(m_device, &poolInfo, nullptr, &m_graphicsCommandPool);
-
-        poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
         vkCreateCommandPool(m_device, &poolInfo, nullptr, &m_transferCommandPool);
 
         createShaders();
@@ -742,7 +547,7 @@ namespace ifap
         createDescriptorResources();
         createGeometry();
         createPipelines();
-        createCommandBuffers();
+        createContentDescriptors();
         createProcessingTarget();
     }
 
@@ -760,8 +565,6 @@ namespace ifap
                 }
             }
             m_textures.clear();
-
-            m_swapchain.reset();
 
             destroyProcessingTarget();
             destroyPipelines();
@@ -849,92 +652,9 @@ namespace ifap
             }
 
             vkDestroyCommandPool(m_device, m_transferCommandPool, nullptr);
-            vkDestroyCommandPool(m_device, m_graphicsCommandPool, nullptr);
 
-            // All VMA-backed resources (textures, processing target, vertex buffer,
-            // staging buffers) have been freed above; tear the allocator down before
-            // the device it was created against.
             m_allocator.reset();
-
-            vkDestroyDevice(m_device, nullptr);
         }
-    }
-
-    void VKRenderer::Impl::createDevice(VkInstance instance)
-    {
-        m_physicalDevice = selectPhysicalDevice(instance);
-
-        VkPhysicalDeviceProperties deviceProperties;
-        vkGetPhysicalDeviceProperties(m_physicalDevice, &deviceProperties);
-        m_max_texture_dimension = int(deviceProperties.limits.maxImageDimension2D);
-
-        std::vector<VkQueueFamilyProperties> queueFamilies = getPhysicalDeviceQueueFamilyProperties(m_physicalDevice);
-
-        uint32_t queueFamilyIndex = UINT32_MAX;
-
-        for (uint32_t i = 0; i < queueFamilies.size(); ++i)
-        {
-            if ((queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
-                m_window.getPresentationSupport(m_physicalDevice, i))
-            {
-                queueFamilyIndex = i;
-                break;
-            }
-        }
-
-        if (queueFamilyIndex == UINT32_MAX)
-        {
-            printLine(Print::Error, "VKRenderer: no suitable graphics queue.");
-            return;
-        }
-
-        float queuePriority = 1.0f;
-
-        VkDeviceQueueCreateInfo queueCreateInfo =
-        {
-            .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-            .queueFamilyIndex = queueFamilyIndex,
-            .queueCount = 1,
-            .pQueuePriorities = &queuePriority,
-        };
-
-        std::vector<const char*> deviceExtensions = requiredDeviceExtensions();
-
-        // timelineSemaphore (core in 1.2) is the one monotonic clock used for all GPU
-        // resource reclamation: uploads, clears and frames signal increasing values and
-        // resources are freed once the completed value passes their last-use value.
-        VkPhysicalDeviceVulkan12Features features12 =
-        {
-            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-            .timelineSemaphore = VK_TRUE,
-        };
-
-        VkPhysicalDeviceVulkan13Features features13 =
-        {
-            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-            .pNext = &features12,
-            .dynamicRendering = VK_TRUE,
-        };
-
-        VkDeviceCreateInfo deviceCreateInfo =
-        {
-            .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-            .pNext = &features13,
-            .queueCreateInfoCount = 1,
-            .pQueueCreateInfos = &queueCreateInfo,
-            .enabledExtensionCount = u32(deviceExtensions.size()),
-            .ppEnabledExtensionNames = deviceExtensions.data(),
-        };
-
-        VkResult result = vkCreateDevice(m_physicalDevice, &deviceCreateInfo, nullptr, &m_device);
-        if (result != VK_SUCCESS)
-        {
-            printLine(Print::Error, "vkCreateDevice: {}", getString(result));
-            return;
-        }
-
-        m_graphicsQueueFamilyIndex = queueFamilyIndex;
-        vkGetDeviceQueue(m_device, m_graphicsQueueFamilyIndex, 0, &m_graphicsQueue);
     }
 
     void VKRenderer::Impl::initialize()
@@ -950,6 +670,21 @@ namespace ifap
     {
         MANGO_UNREFERENCED(width);
         MANGO_UNREFERENCED(height);
+
+        if (!m_window.isDeviceReady())
+        {
+            return;
+        }
+
+        vkDeviceWaitIdle(m_device);
+
+        if (m_descriptorPool)
+        {
+            vkResetDescriptorPool(m_device, m_descriptorPool, 0);
+        }
+
+        createContentDescriptors();
+        createProcessingTarget();
     }
 
     VkFormat VKRenderer::Impl::toVkFormat(PixelFormat format)
@@ -1641,7 +1376,7 @@ namespace ifap
     {
         destroyPipelines();
 
-        const VkFormat swapchainFormat = m_swapchain->getFormat();
+        const VkFormat swapchainFormat = swapchain().getFormat();
 
         m_pipelineBilinearBlend = createGraphicsPipeline(m_device, kProcessingFormat, m_processingPipelineLayout,
             m_processingVertexShader, m_processingFragmentShaderBilinear, true);
@@ -1687,12 +1422,12 @@ namespace ifap
     {
         destroyProcessingTarget();
 
-        if (!m_swapchain)
+        if (!m_window.isDeviceReady())
         {
             return;
         }
 
-        const VkExtent2D extent = m_swapchain->getExtent();
+        const VkExtent2D extent = swapchain().getExtent();
         if (extent.width == 0 || extent.height == 0)
         {
             return;
@@ -1744,12 +1479,12 @@ namespace ifap
 
     void VKRenderer::Impl::ensureProcessingTarget()
     {
-        if (!m_swapchain)
+        if (!m_window.isDeviceReady())
         {
             return;
         }
 
-        const VkExtent2D extent = m_swapchain->getExtent();
+        const VkExtent2D extent = swapchain().getExtent();
         if (extent.width == 0 || extent.height == 0)
         {
             return;
@@ -1773,26 +1508,16 @@ namespace ifap
         createProcessingTarget();
     }
 
-    void VKRenderer::Impl::createCommandBuffers()
+    void VKRenderer::Impl::createContentDescriptors()
     {
-        const u32 imageCount = m_swapchain->getImageCount();
-        m_commandBuffers.resize(imageCount);
-
-        VkCommandBufferAllocateInfo allocInfo =
-        {
-            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-            .commandPool = m_graphicsCommandPool,
-            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-            .commandBufferCount = imageCount,
-        };
-
-        vkAllocateCommandBuffers(m_device, &allocInfo, m_commandBuffers.data());
-
-        // One content-descriptor block per swapchain image, reused across frames. Reuse
-        // is safe because the swapchain fences each image's prior submission before its
-        // command buffer is re-recorded, retiring every set in that image's block.
+        const u32 imageCount = swapchain().getImageCount();
         const u32 contentDescriptorCount = imageCount * kContentDescriptorsPerImage;
         m_contentDescriptors.assign(contentDescriptorCount, VK_NULL_HANDLE);
+
+        if (!m_descriptorPool || !m_contentDescriptorSetLayout || contentDescriptorCount == 0)
+        {
+            return;
+        }
 
         std::vector<VkDescriptorSetLayout> layouts(contentDescriptorCount, m_contentDescriptorSetLayout);
 
@@ -1808,6 +1533,22 @@ namespace ifap
         if (result != VK_SUCCESS)
         {
             printLine(Print::Error, "VKRenderer: failed to allocate content descriptor sets.");
+        }
+    }
+
+    void VKRenderer::Impl::ensureContentDescriptors()
+    {
+        const u32 imageCount = swapchain().getImageCount();
+        const u32 expected = imageCount * kContentDescriptorsPerImage;
+
+        if (m_contentDescriptors.size() != expected)
+        {
+            if (m_descriptorPool)
+            {
+                vkResetDescriptorPool(m_device, m_descriptorPool, 0);
+            }
+
+            createContentDescriptors();
         }
     }
 
@@ -2035,9 +1776,10 @@ namespace ifap
         // hands back a correctly-sized image (or an empty frame to drop). We then sync
         // the only extent-sized resource we own — the processing target — to the now
         // final extent; it rebuilds only when the size actually changed.
-        m_frame = m_swapchain->beginFrame();
+        m_frame = m_window.beginDraw();
         if (m_frame)
         {
+            ensureContentDescriptors();
             ensureProcessingTarget();
 
             // The acquired image's prior submission has retired (the swapchain fenced it
@@ -2065,7 +1807,7 @@ namespace ifap
         }
 
         const u32 imageIndex = m_frame.imageIndex();
-        VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
+        VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
 
         vkResetCommandBuffer(commandBuffer, 0);
 
@@ -2089,7 +1831,7 @@ namespace ifap
         beginCommandBufferRecording();
 
         const u32 imageIndex = m_frame.imageIndex();
-        VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
+        VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
 
         const VkPipelineStageFlags srcStage = m_processingLayout == VK_IMAGE_LAYOUT_UNDEFINED
             ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
@@ -2137,7 +1879,7 @@ namespace ifap
         VkRenderingInfo renderingInfo =
         {
             .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-            .renderArea = { .extent = m_swapchain->getExtent() },
+            .renderArea = { .extent = swapchain().getExtent() },
             .layerCount = 1,
             .colorAttachmentCount = 1,
             .pColorAttachments = &colorAttachment,
@@ -2156,7 +1898,7 @@ namespace ifap
         }
 
         const u32 imageIndex = m_frame.imageIndex();
-        VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
+        VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
 
         vkCmdEndRendering(commandBuffer);
         m_processing_rendering_active = false;
@@ -2189,7 +1931,7 @@ namespace ifap
 
     void VKRenderer::Impl::setDynamicViewportScissor(VkCommandBuffer commandBuffer) const
     {
-        const VkExtent2D extent = m_swapchain->getExtent();
+        const VkExtent2D extent = swapchain().getExtent();
 
         VkViewport viewport =
         {
@@ -2230,7 +1972,7 @@ namespace ifap
         push.sdrWhiteNits = m_sdr_white_nits;
 
         const u32 imageIndex = m_frame.imageIndex();
-        VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
+        VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
 
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_resolvePipeline);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_resolvePipelineLayout,
@@ -2253,9 +1995,9 @@ namespace ifap
         beginCommandBufferRecording();
 
         const u32 imageIndex = m_frame.imageIndex();
-        VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
+        VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
 
-        m_swapchain->cmdTransitionImageToColorAttachment(commandBuffer, imageIndex);
+        swapchain().cmdTransitionImageToColorAttachment(commandBuffer, imageIndex);
 
         VkRenderingAttachmentInfo colorAttachment =
         {
@@ -2270,7 +2012,7 @@ namespace ifap
         VkRenderingInfo renderingInfo =
         {
             .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-            .renderArea = { .extent = m_swapchain->getExtent() },
+            .renderArea = { .extent = swapchain().getExtent() },
             .layerCount = 1,
             .colorAttachmentCount = 1,
             .pColorAttachments = &colorAttachment,
@@ -2289,7 +2031,7 @@ namespace ifap
         }
 
         const u32 imageIndex = m_frame.imageIndex();
-        VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
+        VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
 
         vkCmdEndRendering(commandBuffer);
         m_rendering_active = false;
@@ -2370,7 +2112,7 @@ namespace ifap
         push.texScale[0] = 1.0f / float(std::max(1, request.width));
         push.texScale[1] = 1.0f / float(std::max(1, request.height));
 
-        VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
+        VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
 
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, selectPipeline(request));
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_processingPipelineLayout,
@@ -2422,10 +2164,10 @@ namespace ifap
         }
 
         const u32 imageIndex = m_frame.imageIndex();
-        VkCommandBuffer commandBuffer = m_commandBuffers[imageIndex];
+        VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
 
         endSwapchainRendering();
-        m_swapchain->cmdTransitionImageToPresent(commandBuffer, imageIndex);
+        swapchain().cmdTransitionImageToPresent(commandBuffer, imageIndex);
 
         vkEndCommandBuffer(commandBuffer);
         m_command_buffer_recording = false;
@@ -2437,8 +2179,8 @@ namespace ifap
         m_frame_active = false;
     }
 
-    VKRenderer::VKRenderer(VulkanWindow& window, Instance& instance, VkSurfaceKHR surface)
-        : m_impl(std::make_unique<Impl>(window, instance, surface))
+    VKRenderer::VKRenderer(VulkanWindow& window, Instance& instance)
+        : m_impl(std::make_unique<Impl>(window, instance))
     {
     }
 

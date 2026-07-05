@@ -25,7 +25,7 @@ namespace ifap
         std::unique_ptr<Impl> m_impl;
 
     public:
-        VKRenderer(mango::vulkan::VulkanWindow& window, mango::vulkan::Instance& instance, VkSurfaceKHR surface);
+        VKRenderer(mango::vulkan::VulkanWindow& window, mango::vulkan::Instance& instance);
         ~VKRenderer();
 
         void initialize();
