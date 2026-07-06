@@ -420,7 +420,15 @@ namespace ifap
 
     void AppView::onResize(int width, int height)
     {
-        m_renderer.resize(width, height);
+        MANGO_UNREFERENCED(width);
+        MANGO_UNREFERENCED(height);
+
+        // Do not touch GPU resources here. Wayland dispatches onResize from
+        // dispatchPendingResize() before the swapchain extent is updated; rebuilding
+        // the processing target against a stale extent crashes RADV. Swapchain-sized
+        // resources are synced in VKRenderer::beginFrame() via ensureProcessingTarget()
+        // after beginDraw() has acquired a correctly-sized image (same pattern as vkbasic's
+        // onSwapchainResize, which is driven from beginDraw(), not Window::onResize).
     }
 
     void AppView::renderFrame()

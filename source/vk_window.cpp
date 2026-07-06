@@ -47,10 +47,10 @@ namespace ifap
 
         void onSwapchainResize(VkExtent2D extent) override
         {
-            if (m_renderer)
-            {
-                m_renderer->resize(int(extent.width), int(extent.height));
-            }
+            MANGO_UNREFERENCED(extent);
+            // Extent-sized resources are rebuilt in beginFrame() after beginDraw()
+            // returns a correctly-sized image (ensureProcessingTarget /
+            // ensureContentDescriptors). Avoid a second rebuild here.
         }
 
         void onClose() override { if (m_app) m_app->onClose(); }
