@@ -6,7 +6,6 @@
 #include "command_line.hpp"
 #include "app_view.hpp"
 #include "render/vk/vk_renderer.hpp"
-#include "render/vk/vk_surface_format.hpp"
 
 #include <mango/core/system.hpp>
 #include <mango/vulkan/vulkan.hpp>
@@ -37,7 +36,12 @@ namespace ifap
 
         void onDeviceReady() override
         {
-            logSelectedSurfaceFormat(*this);
+            SurfaceFormatSelection selection;
+            selection.format = surfaceFormat();
+            selection.requested = SurfaceFormatIntent::PreferHDR;
+            selection.isHdr = isHDR(selection.format);
+            selection.outputTransform = selectOutputTransform(selection.format);
+            logSurfaceFormats(physicalDevice(), surface(), &selection);
 
             m_renderer = std::make_unique<VKRenderer>(*this, m_instance);
             m_renderer->initialize();
@@ -106,7 +110,9 @@ namespace ifap
             printEnable(Print::Info, true);
         }
 
-        const VulkanDeviceConfig deviceConfig = makeVulkanDeviceConfig();
+        VulkanDeviceConfig deviceConfig;
+        deviceConfig.surfaceFormatIntent = SurfaceFormatIntent::PreferHDR;
+
         Instance instance = createVulkanInstance(parsed.options.debug);
         VKAppWindow window(instance, parsed.commands, deviceConfig);
         window.setTitle("iFap Image Viewer");
