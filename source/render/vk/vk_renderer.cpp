@@ -27,148 +27,10 @@ namespace ifap
             float texScale[2];
         };
 
-        struct ResolvePushConstants
-        {
-            float outputTransform;
-            float sdrWhiteNits;
-        };
-
         static_assert(offsetof(ProcessingPushConstants, texScale) == 16);
         static_assert(sizeof(ProcessingPushConstants) == 24);
-        static_assert(sizeof(ResolvePushConstants) == 8);
 
         constexpr VkFormat kProcessingFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
-
-        enum class OutputTransform : int
-        {
-            Pass = 0,           // sRGB surface: texture decode is sufficient
-            SrgbEncode = 1,       // float/UNORM SDR: linear BT.709 -> sRGB gamma
-            SdrToHdrPQ = 2,       // HDR10 ST2084: BT.709 -> BT.2020 -> PQ
-            SdrToHdrHLG = 3,      // HDR10 HLG: BT.709 -> BT.2020 -> BT.2408 gain -> HLG OETF
-            SdrToAdobeRgb = 4,    // Adobe RGB nonlinear: BT.709 -> Adobe RGB -> Adobe OETF
-            SdrToBt709Nonlinear = 5, // BT.709 nonlinear: SMPTE 170M / ITU OETF
-            SdrToDciP3Nonlinear = 6, // DCI-P3 nonlinear: BT.709 -> P3 -> gamma 2.6
-            SdrToExtendedSrgbLinear = 7, // EXTENDED_SRGB_LINEAR + sRGB RT: pre-compensate encode
-            SdrToLinearSurface = 8,      // linear color space + UNORM/float: linear passthrough
-            SdrToDisplayP3Linear = 9,    // Display P3 linear float: mild desat + linear out
-            SdrToBt2020Linear = 10,      // BT.2020 linear float: desat + linear out
-        };
-
-        static bool isSrgbSurfaceFormat(VkFormat format)
-        {
-            switch (format)
-            {
-                case VK_FORMAT_R8G8B8A8_SRGB:
-                case VK_FORMAT_B8G8R8A8_SRGB:
-                case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
-                    return true;
-                default:
-                    return false;
-            }
-        }
-
-        static bool isLinearSdrColorSpace(VkColorSpaceKHR colorSpace)
-        {
-            switch (colorSpace)
-            {
-                case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
-                case VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT:
-                case VK_COLOR_SPACE_BT2020_LINEAR_EXT:
-                    return true;
-                default:
-                    return false;
-            }
-        }
-
-        static bool isHdrColorSpace(VkColorSpaceKHR colorSpace)
-        {
-            switch (colorSpace)
-            {
-                case VK_COLOR_SPACE_HDR10_ST2084_EXT:
-                case VK_COLOR_SPACE_HDR10_HLG_EXT:
-                case VK_COLOR_SPACE_BT2020_LINEAR_EXT:
-                    return true;
-                default:
-                    return false;
-            }
-        }
-
-        static OutputTransform selectOutputTransform(const VkSurfaceFormatKHR& surfaceFormat)
-        {
-            if (surfaceFormat.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT)
-            {
-                return OutputTransform::SdrToHdrPQ;
-            }
-
-            if (surfaceFormat.colorSpace == VK_COLOR_SPACE_HDR10_HLG_EXT)
-            {
-                return OutputTransform::SdrToHdrHLG;
-            }
-
-            if (surfaceFormat.colorSpace == VK_COLOR_SPACE_ADOBERGB_NONLINEAR_EXT)
-            {
-                return OutputTransform::SdrToAdobeRgb;
-            }
-
-            if (surfaceFormat.colorSpace == VK_COLOR_SPACE_BT709_NONLINEAR_EXT)
-            {
-                return OutputTransform::SdrToBt709Nonlinear;
-            }
-
-            if (surfaceFormat.colorSpace == VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT)
-            {
-                return OutputTransform::SdrToDciP3Nonlinear;
-            }
-
-            if (isLinearSdrColorSpace(surfaceFormat.colorSpace))
-            {
-                if (surfaceFormat.colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
-                    && isSrgbSurfaceFormat(surfaceFormat.format))
-                {
-                    return OutputTransform::SdrToExtendedSrgbLinear;
-                }
-
-                if (surfaceFormat.colorSpace == VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT)
-                {
-                    return OutputTransform::SdrToDisplayP3Linear;
-                }
-
-                if (surfaceFormat.colorSpace == VK_COLOR_SPACE_BT2020_LINEAR_EXT)
-                {
-                    return OutputTransform::SdrToBt2020Linear;
-                }
-
-                return OutputTransform::SdrToLinearSurface;
-            }
-
-            if (!isSrgbSurfaceFormat(surfaceFormat.format))
-            {
-                return OutputTransform::SrgbEncode;
-            }
-
-            return OutputTransform::Pass;
-        }
-
-        // uSdrWhiteNits: SDR diffuse white in nits.
-        //   PQ shader:   linear * nits / 10000
-        //   HLG shader:  BT.2408 gain 0.265 * (nits / 203) before OETF
-        static float defaultSdrWhiteNits(VkColorSpaceKHR colorSpace)
-        {
-            switch (colorSpace)
-            {
-                case VK_COLOR_SPACE_HDR10_ST2084_EXT:
-                case VK_COLOR_SPACE_HDR10_HLG_EXT:
-                    // ITU-R BT.2408 "graphics/diffuse white" reference. PQ is absolute,
-                    // so this is the exact nit level diffuse white scans out at. The strict
-                    // sRGB reference (100) leaves SDR content visibly dimmer than the rest
-                    // of a Windows 11 HDR desktop (which shows SDR white near ~200 nits),
-                    // which reads as "too dark"; 203 matches the HDR graphics-white standard
-                    // (and the divisor the HLG path already uses).
-                    return 203.0f;
-                default:
-                    return 100.0f;
-            }
-        }
 
         // Swapchain format/colorspace is selected by VulkanWindow (vk_surface_format.cpp).
 
@@ -413,9 +275,6 @@ namespace ifap
         bool m_processing_rendering_active = false;
         bool m_content_drawn = false;
         bool m_blend_enabled = true;
-        bool m_swapchain_srgb_format = false;
-        OutputTransform m_output_transform = OutputTransform::Pass;
-        float m_sdr_white_nits = 100.0f;
         int m_max_texture_dimension = 0;
         float m_clear_color[4] = { 0.06f, 0.06f, 0.06f, 1.0f };
 
@@ -521,17 +380,13 @@ namespace ifap
 
         const VkSurfaceFormatKHR selectedFormat = window.surfaceFormat();
 
-        m_swapchain_srgb_format = isSrgbSurfaceFormat(selectedFormat.format);
-        m_output_transform = selectOutputTransform(selectedFormat);
-        m_sdr_white_nits = defaultSdrWhiteNits(selectedFormat.colorSpace);
-
         printLine(Print::Info, "VKRenderer: selected {} | {} (hardware sRGB: {}, output transform: {}, HDR: {}, SDR white: {} nits)",
             getString(selectedFormat.format),
             getString(selectedFormat.colorSpace),
-            m_swapchain_srgb_format ? "yes" : "no",
-            int(m_output_transform),
-            isHdrColorSpace(selectedFormat.colorSpace) ? "yes" : "no",
-            int(m_sdr_white_nits));
+            isSRGB(selectedFormat.format) ? "yes" : "no",
+            int(selectOutputTransform(selectedFormat)),
+            isHDR(selectedFormat) ? "yes" : "no",
+            int(defaultSdrWhiteNits(selectedFormat.colorSpace)));
 
         VkCommandPoolCreateInfo poolInfo =
         {
@@ -1560,7 +1415,8 @@ namespace ifap
         const std::string processingBilinearSource = shaders::fragmentShaderProcessingBilinear();
         const std::string processingBicubicSource = shaders::fragmentShaderProcessingBicubic();
         const std::string resolveVertexSource = shaders::resolveVertexShader();
-        const std::string resolveFragmentSource = shaders::resolveFragmentShader();
+        const std::string resolveFragmentSource = shaders::resolveFragmentShader(
+            swapchain().getOutputTransformGLSL());
 
         Shader processingVertexShader = compiler.compile(processingVertexSource.c_str(), ShaderStage::Vertex);
         Shader processingBilinear = compiler.compile(processingBilinearSource.c_str(), ShaderStage::Fragment);
@@ -1572,6 +1428,10 @@ namespace ifap
             || !resolveVertexShader.valid() || !resolveFragmentShader.valid())
         {
             printLine(Print::Error, "VKRenderer: shader compilation failed.");
+            if (!resolveFragmentShader.valid())
+            {
+                printLine(Print::Error, "Resolve fragment shader:\n{}", resolveFragmentShader.log);
+            }
             return;
         }
 
@@ -1655,20 +1515,11 @@ namespace ifap
 
         vkCreatePipelineLayout(m_device, &processingLayoutInfo, nullptr, &m_processingPipelineLayout);
 
-        VkPushConstantRange resolvePushRange =
-        {
-            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-            .offset = 0,
-            .size = sizeof(ResolvePushConstants),
-        };
-
         VkPipelineLayoutCreateInfo resolvePipelineLayoutInfo =
         {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
             .setLayoutCount = 1,
             .pSetLayouts = &m_resolveDescriptorSetLayout,
-            .pushConstantRangeCount = 1,
-            .pPushConstantRanges = &resolvePushRange,
         };
 
         vkCreatePipelineLayout(m_device, &resolvePipelineLayoutInfo, nullptr, &m_resolvePipelineLayout);
@@ -1967,18 +1818,12 @@ namespace ifap
             return;
         }
 
-        ResolvePushConstants push {};
-        push.outputTransform = float(m_output_transform);
-        push.sdrWhiteNits = m_sdr_white_nits;
-
         const u32 imageIndex = m_frame.imageIndex();
         VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
 
         vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_resolvePipeline);
         vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_resolvePipelineLayout,
             0, 1, &m_resolveDescriptor, 0, nullptr);
-        vkCmdPushConstants(commandBuffer, m_resolvePipelineLayout,
-            VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ResolvePushConstants), &push);
 
         VkDeviceSize offset = 0;
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, &m_vertexBuffer.buffer, &offset);

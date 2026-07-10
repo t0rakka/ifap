@@ -54,183 +54,6 @@ namespace ifap::shaders
             }
         )";
 
-        inline constexpr const char* g_linear_to_srgb = R"(
-            vec3 linearToSrgb(vec3 linear)
-            {
-                vec3 lo = linear * 12.92;
-                vec3 hi = pow(max(linear, vec3(0.0031308)), vec3(1.0 / 2.4)) * 1.055 - 0.055;
-                return mix(lo, hi, step(vec3(0.0031308), linear));
-            }
-        )";
-
-        inline constexpr const char* g_srgb_to_linear = R"(
-            vec3 srgbToLinear(vec3 encoded)
-            {
-                vec3 lo = encoded / 12.92;
-                vec3 hi = pow(max((encoded + 0.055) / 1.055, vec3(0.0)), vec3(2.4));
-                return mix(lo, hi, step(vec3(0.04045), encoded));
-            }
-        )";
-
-        // SMPTE ST 2084 (PQ). Input is linear 0-1 where 1.0 = 10,000 nits.
-        inline constexpr const char* g_linear_to_pq = R"(
-            vec3 linearToPQ(vec3 linear)
-            {
-                const float m1 = 0.1593017578125;
-                const float m2 = 78.84375;
-                const float c1 = 0.8359375;
-                const float c2 = 18.8515625;
-                const float c3 = 18.6875;
-
-                vec3 Lm = pow(max(linear, vec3(0.0)), vec3(m1));
-                vec3 N = (c1 + c2 * Lm) / (1.0 + c3 * Lm);
-                return pow(N, vec3(m2));
-            }
-        )";
-
-        // ARIB STD-B67 / BT.2100 HLG OETF (scene-referred linear in, signal out)
-        inline constexpr const char* g_linear_to_hlg = R"(
-            vec3 linearToHLG(vec3 linear)
-            {
-                const float a = 0.17883277;
-                const float b = 0.28466892;
-                const float c = 0.55991073;
-                vec3 x = max(linear, vec3(0.0));
-                vec3 lo = sqrt(3.0 * x);
-                vec3 hi = a * log(max(12.0 * x - b, 1e-6)) + c;
-                return mix(lo, hi, step(vec3(1.0 / 12.0), x));
-            }
-        )";
-
-        // 0 = pass, 1 = sRGB, 2 = PQ, 3 = HLG, 4 = Adobe, 5 = BT.709, 6 = DCI P3,
-        // 7 = ext-sRGB linear+sRGB RT, 8 = linear surface, 9 = Display P3 linear
-        // ITU-R BT.709 / SMPTE 170M OETF (Khronos TRANSFER_ITU, alpha=1.099 beta=0.018)
-        inline constexpr const char* g_linear_to_smpte170m = R"(
-            vec3 linearToSmpte170m(vec3 linear)
-            {
-                const float alpha = 1.099;
-                const float beta = 0.018;
-                vec3 x = max(linear, vec3(0.0));
-                vec3 lo = x * 4.5;
-                vec3 hi = alpha * pow(x, vec3(0.45)) - (alpha - 1.0);
-                return mix(lo, hi, step(vec3(beta), x));
-            }
-        )";
-
-        // Adobe RGB (1998) OETF: exponent 256/563 per Khronos TRANSFER_ADOBERGB
-        inline constexpr const char* g_linear_to_adobe_rgb = R"(
-            vec3 linearToAdobeRgb(vec3 linear)
-            {
-                return pow(max(linear, vec3(0.0)), vec3(256.0 / 563.0));
-            }
-        )";
-
-        // DCI-P3 nonlinear (VK_EXT_swapchain_colorspace): gamma 2.6 OETF
-        inline constexpr const char* g_linear_to_gamma26 = R"(
-            vec3 linearToGamma26(vec3 linear)
-            {
-                return pow(max(linear, vec3(0.0)), vec3(1.0 / 2.6));
-            }
-        )";
-
-        inline constexpr const char* g_bt709_to_display_p3 = R"(
-            vec3 bt709ToDisplayP3(vec3 linear)
-            {
-                const mat3 m = mat3(
-                    vec3(0.8224619287, 0.0335730637, 0.0170815977),
-                    vec3(0.1775380529, 0.9666420745, 0.0723970842),
-                    vec3(0.0000000000, 0.0000000000, 0.9105199182)
-                );
-                return m * linear;
-            }
-        )";
-
-        // BT.709 -> BT.2020; mat3 columns = input channel coefficients
-        inline constexpr const char* g_bt709_to_bt2020 = R"(
-            vec3 bt709ToBt2020(vec3 linear)
-            {
-                const mat3 m = mat3(
-                    vec3(0.6274040, 0.0690970, 0.0163916),
-                    vec3(0.3292820, 0.9195400, 0.0880132),
-                    vec3(0.0433136, 0.0113612, 0.8955950)
-                );
-                return m * linear;
-            }
-        )";
-
-        // BT.709 (D65) -> Adobe RGB 1998 (D65); mat3 columns = input channel coefficients
-        // (NOT the Adobe->XYZ matrix — inv(Adobe_to_XYZ) * BT709_to_XYZ)
-        inline constexpr const char* g_bt709_to_adobe_rgb = R"(
-            vec3 bt709ToAdobeRgb(vec3 linear)
-            {
-                const mat3 m = mat3(
-                    vec3(0.7151626, 0.0000000, 0.0000000),
-                    vec3(0.2848372, 1.0000000, 0.0411705),
-                    vec3(0.0000000, 0.0000000, 0.9588295)
-                );
-                return m * linear;
-            }
-        )";
-
-        inline constexpr const char* g_encode_output = R"(
-            vec4 encodeOutput(vec4 color)
-            {
-                color.rgb = max(color.rgb, vec3(0.0));
-
-                if (uOutputTransform > 9.5)
-                {
-                    color.rgb = bt709ToBt2020(color.rgb);
-                }
-                else if (uOutputTransform > 8.5)
-                {
-                    color.rgb = bt709ToDisplayP3(color.rgb);
-                }
-                else if (uOutputTransform > 7.5)
-                {
-                    // Linear surface: scene-linear passthrough.
-                }
-                else if (uOutputTransform > 6.5)
-                {
-                    // EXTENDED_SRGB_LINEAR + sRGB swapchain format auto-encodes on write.
-                    color.rgb = srgbToLinear(color.rgb);
-                }
-                else if (uOutputTransform > 5.5)
-                {
-                    // DCI-P3 primaries (same as Display P3) + gamma 2.6 OETF
-                    color.rgb = linearToGamma26(bt709ToDisplayP3(color.rgb));
-                }
-                else if (uOutputTransform > 4.5)
-                {
-                    // BT.709 primaries + SMPTE 170M / ITU OETF
-                    color.rgb = linearToSmpte170m(color.rgb);
-                }
-                else if (uOutputTransform > 3.5)
-                {
-                    // Adobe RGB primaries + Adobe RGB OETF (256/563)
-                    color.rgb = linearToAdobeRgb(bt709ToAdobeRgb(color.rgb));
-                }
-                else if (uOutputTransform > 2.5)
-                {
-                    // BT.2020 primaries + HLG OETF; BT.2408 gain scaled to uSdrWhiteNits
-                    const float kBt2408HlgGain = 0.265;
-                    const float kBt2408HlgReferenceNits = 203.0;
-                    vec3 linear = bt709ToBt2020(color.rgb);
-                    color.rgb = linearToHLG(linear * kBt2408HlgGain * (uSdrWhiteNits / kBt2408HlgReferenceNits));
-                }
-                else if (uOutputTransform > 1.5)
-                {
-                    const float peakNits = 10000.0;
-                    vec3 linear = bt709ToBt2020(color.rgb);
-                    color.rgb = linearToPQ(linear * (uSdrWhiteNits / peakNits));
-                }
-                else if (uOutputTransform > 0.5)
-                {
-                    color.rgb = linearToSrgb(color.rgb);
-                }
-                return color;
-            }
-        )";
-
         inline constexpr const char* g_vertex_main = R"(
             void main()
             {
@@ -276,14 +99,6 @@ namespace ifap::shaders
             } pc;
         )";
 
-        inline constexpr const char* g_resolve_push_constants = R"(
-            layout(push_constant) uniform Push
-            {
-                layout(offset = 0) float uOutputTransform;
-                layout(offset = 4) float uSdrWhiteNits;
-            } pc;
-        )";
-
     } // namespace detail
 
     inline std::string processingVertexShader()
@@ -325,16 +140,13 @@ namespace ifap::shaders
         )") + detail::g_resolve_vertex_main;
     }
 
-    inline std::string resolveFragmentShader()
+    inline std::string resolveFragmentShader(const std::string& outputTransformGlsl)
     {
         return std::string(R"(#version 450
             layout(set = 0, binding = 0) uniform sampler2D uProcessing;
             layout(location = 0) in vec2 texcoord;
             layout(location = 0) out vec4 outColor;
-        )") + detail::g_resolve_push_constants + R"(
-            #define uOutputTransform pc.uOutputTransform
-            #define uSdrWhiteNits pc.uSdrWhiteNits
-        )" + detail::g_linear_to_srgb + detail::g_srgb_to_linear + detail::g_linear_to_smpte170m + detail::g_linear_to_adobe_rgb + detail::g_linear_to_gamma26 + detail::g_linear_to_pq + detail::g_linear_to_hlg + detail::g_bt709_to_display_p3 + detail::g_bt709_to_bt2020 + detail::g_bt709_to_adobe_rgb + detail::g_encode_output + detail::g_resolve_fragment_main;
+        )") + outputTransformGlsl + detail::g_resolve_fragment_main;
     }
 
 } // namespace ifap::shaders
