@@ -32,8 +32,6 @@ namespace ifap
 
         constexpr VkFormat kProcessingFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
 
-        // Swapchain format/colorspace is selected by VulkanWindow (PreferHDR intent).
-
         VkPipelineColorBlendAttachmentState makeBlendAttachment(bool blend)
         {
             VkPipelineColorBlendAttachmentState state =

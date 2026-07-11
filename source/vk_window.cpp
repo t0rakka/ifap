@@ -38,7 +38,7 @@ namespace ifap
         {
             SurfaceFormatSelection selection;
             selection.format = surfaceFormat();
-            selection.requested = SurfaceFormatIntent::PreferHDR;
+            selection.requested = SurfaceFormatIntent::HDR;
             selection.isHdr = isHDR(selection.format);
             logSurfaceFormats(physicalDevice(), surface(), &selection);
 
@@ -110,7 +110,7 @@ namespace ifap
         }
 
         VulkanDeviceConfig deviceConfig;
-        deviceConfig.surfaceFormatIntent = SurfaceFormatIntent::PreferHDR;
+        deviceConfig.surfaceFormatIntent = SurfaceFormatIntent::HDR;
 
         Instance instance = createVulkanInstance(parsed.options.debug);
         VKAppWindow window(instance, parsed.commands, deviceConfig);
