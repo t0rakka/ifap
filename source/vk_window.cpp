@@ -40,7 +40,6 @@ namespace ifap
             selection.format = surfaceFormat();
             selection.requested = SurfaceFormatIntent::PreferHDR;
             selection.isHdr = isHDR(selection.format);
-            selection.outputTransform = selectOutputTransform(selection.format);
             logSurfaceFormats(physicalDevice(), surface(), &selection);
 
             m_renderer = std::make_unique<VKRenderer>(*this, m_instance);

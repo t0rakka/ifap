@@ -380,14 +380,6 @@ namespace ifap
 
         const VkSurfaceFormatKHR selectedFormat = window.surfaceFormat();
 
-        printLine(Print::Info, "VKRenderer: selected {} | {} (hardware sRGB: {}, output transform: {}, HDR: {}, SDR white: {} nits)",
-            getString(selectedFormat.format),
-            getString(selectedFormat.colorSpace),
-            isSRGB(selectedFormat.format) ? "yes" : "no",
-            int(selectOutputTransform(selectedFormat)),
-            isHDR(selectedFormat) ? "yes" : "no",
-            int(defaultSdrWhiteNits(selectedFormat.colorSpace)));
-
         VkCommandPoolCreateInfo poolInfo =
         {
             .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
