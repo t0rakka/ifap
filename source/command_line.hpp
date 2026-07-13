@@ -11,7 +11,7 @@ namespace ifap
 
     struct CommandLineOptions
     {
-        bool debug = false;
+        bool validate = false;
         bool info = false;
     };
 

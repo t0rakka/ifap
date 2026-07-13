@@ -112,7 +112,7 @@ namespace ifap
         VulkanDeviceConfig deviceConfig;
         deviceConfig.surfaceFormatIntent = SurfaceFormatIntent::HDR;
 
-        Instance instance = createVulkanInstance(parsed.options.debug);
+        Instance instance = createVulkanInstance(parsed.options.validate);
         VKAppWindow window(instance, parsed.commands, deviceConfig);
         window.setTitle("iFap Image Viewer");
 

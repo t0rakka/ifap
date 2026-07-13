@@ -20,9 +20,9 @@ namespace ifap
         {
             const std::string_view arg = input[i];
 
-            if (arg == "--debug")
+            if (arg == "--validate")
             {
-                result.options.debug = true;
+                result.options.validate = true;
                 continue;
             }
 
