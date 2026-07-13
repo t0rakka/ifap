@@ -1414,11 +1414,11 @@ namespace ifap
         Shader resolveVertexShader = compiler.compile(resolveVertexSource.c_str(), ShaderStage::Vertex);
         Shader resolveFragmentShader = compiler.compile(resolveFragmentSource.c_str(), ShaderStage::Fragment);
 
-        if (!processingVertexShader.valid() || !processingBilinear.valid() || !processingBicubic.valid()
-            || !resolveVertexShader.valid() || !resolveFragmentShader.valid())
+        if (!processingVertexShader || !processingBilinear || !processingBicubic
+            || !resolveVertexShader || !resolveFragmentShader)
         {
             printLine(Print::Error, "VKRenderer: shader compilation failed.");
-            if (!resolveFragmentShader.valid())
+            if (!resolveFragmentShader)
             {
                 printLine(Print::Error, "Resolve fragment shader:\n{}", resolveFragmentShader.log);
             }
@@ -1832,7 +1832,7 @@ namespace ifap
         const u32 imageIndex = m_frame.imageIndex();
         VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
 
-        swapchain().cmdTransitionImageToColorAttachment(commandBuffer, imageIndex);
+        swapchain().transitionImageToColorAttachment(commandBuffer, imageIndex);
 
         VkRenderingAttachmentInfo colorAttachment =
         {
@@ -2002,7 +2002,7 @@ namespace ifap
         VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
 
         endSwapchainRendering();
-        swapchain().cmdTransitionImageToPresent(commandBuffer, imageIndex);
+        swapchain().transitionImageToPresent(commandBuffer, imageIndex);
 
         vkEndCommandBuffer(commandBuffer);
         m_command_buffer_recording = false;
