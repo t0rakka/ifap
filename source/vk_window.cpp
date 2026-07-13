@@ -52,7 +52,7 @@ namespace ifap
         {
             MANGO_UNREFERENCED(extent);
             // Extent-sized resources are rebuilt in beginFrame() after beginDraw()
-            // returns a correctly-sized image (ensureProcessingTarget /
+            // returns a correctly-sized image (ensureRenderTarget /
             // ensureContentDescriptors). Avoid a second rebuild here.
         }
 

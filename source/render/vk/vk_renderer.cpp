@@ -13,6 +13,7 @@
 #include <mango/vulkan/vulkan.hpp>
 #include <mango/vulkan/compiler.hpp>
 #include <mango/vulkan/allocator.hpp>
+#include <mango/vulkan/render_target.hpp>
 
 namespace ifap
 {
@@ -190,14 +191,9 @@ namespace ifap
         VkShaderModule m_processingVertexShader = VK_NULL_HANDLE;
         VkShaderModule m_processingFragmentShaderBilinear = VK_NULL_HANDLE;
         VkShaderModule m_processingFragmentShaderBicubic = VK_NULL_HANDLE;
-        VkShaderModule m_resolveVertexShader = VK_NULL_HANDLE;
-        VkShaderModule m_resolveFragmentShader = VK_NULL_HANDLE;
         VkDescriptorSetLayout m_contentDescriptorSetLayout = VK_NULL_HANDLE;
-        VkDescriptorSetLayout m_resolveDescriptorSetLayout = VK_NULL_HANDLE;
         VkPipelineLayout m_processingPipelineLayout = VK_NULL_HANDLE;
-        VkPipelineLayout m_resolvePipelineLayout = VK_NULL_HANDLE;
         VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
-        VkDescriptorSet m_resolveDescriptor = VK_NULL_HANDLE;
 
         // Content (processing-pass) descriptor sets are rewritten every frame with the
         // texture being drawn. A single set per texture is illegal: the previous frame's
@@ -213,12 +209,8 @@ namespace ifap
         VkPipeline m_pipelineBilinearNoBlend = VK_NULL_HANDLE;
         VkPipeline m_pipelineBicubicBlend = VK_NULL_HANDLE;
         VkPipeline m_pipelineBicubicNoBlend = VK_NULL_HANDLE;
-        VkPipeline m_resolvePipeline = VK_NULL_HANDLE;
-        VkImage m_processingImage = VK_NULL_HANDLE;
-        VmaAllocation m_processingAllocation = VK_NULL_HANDLE;
-        VkImageView m_processingView = VK_NULL_HANDLE;
+        std::unique_ptr<RenderTarget> m_renderTarget;
         VkImageLayout m_processingLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        VkExtent2D m_processingExtent { 0, 0 };
         BufferAllocation m_vertexBuffer;
         VkSampler m_samplerNearest = VK_NULL_HANDLE;
         VkSampler m_samplerLinear = VK_NULL_HANDLE;
@@ -269,7 +261,6 @@ namespace ifap
         Swapchain::Frame m_frame;
         bool m_frame_active = false;
         bool m_command_buffer_recording = false;
-        bool m_rendering_active = false;
         bool m_processing_rendering_active = false;
         bool m_content_drawn = false;
         bool m_blend_enabled = true;
@@ -297,9 +288,9 @@ namespace ifap
         void createGeometry();
         void createSamplers();
         void createDescriptorResources();
-        void createProcessingTarget();
-        void destroyProcessingTarget();
-        void ensureProcessingTarget();
+        void createRenderTarget();
+        void destroyRenderTarget();
+        void ensureRenderTarget();
         void beginCommandBufferRecording();
         void beginProcessingRendering();
         void endProcessingRendering();
@@ -331,8 +322,6 @@ namespace ifap
         void initialize();
         void resize(int width, int height);
         bool beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend);
-        void beginSwapchainRendering();
-        void endSwapchainRendering();
         void drawImage(const ImageDrawRequest& request);
         void endFrame();
         TextureHandle createTexture(int width, int height, PixelFormat format, const void* initial_data);
@@ -393,7 +382,7 @@ namespace ifap
         createGeometry();
         createPipelines();
         createContentDescriptors();
-        createProcessingTarget();
+        createRenderTarget();
     }
 
     VKRenderer::Impl::~Impl()
@@ -411,7 +400,7 @@ namespace ifap
             }
             m_textures.clear();
 
-            destroyProcessingTarget();
+            destroyRenderTarget();
             destroyPipelines();
 
             if (m_descriptorPool)
@@ -424,19 +413,9 @@ namespace ifap
                 vkDestroyDescriptorSetLayout(m_device, m_contentDescriptorSetLayout, nullptr);
             }
 
-            if (m_resolveDescriptorSetLayout)
-            {
-                vkDestroyDescriptorSetLayout(m_device, m_resolveDescriptorSetLayout, nullptr);
-            }
-
             if (m_processingPipelineLayout)
             {
                 vkDestroyPipelineLayout(m_device, m_processingPipelineLayout, nullptr);
-            }
-
-            if (m_resolvePipelineLayout)
-            {
-                vkDestroyPipelineLayout(m_device, m_resolvePipelineLayout, nullptr);
             }
 
             if (m_processingVertexShader)
@@ -452,16 +431,6 @@ namespace ifap
             if (m_processingFragmentShaderBicubic)
             {
                 vkDestroyShaderModule(m_device, m_processingFragmentShaderBicubic, nullptr);
-            }
-
-            if (m_resolveVertexShader)
-            {
-                vkDestroyShaderModule(m_device, m_resolveVertexShader, nullptr);
-            }
-
-            if (m_resolveFragmentShader)
-            {
-                vkDestroyShaderModule(m_device, m_resolveFragmentShader, nullptr);
             }
 
             m_allocator->destroyBuffer(m_vertexBuffer);
@@ -529,7 +498,7 @@ namespace ifap
         }
 
         createContentDescriptors();
-        createProcessingTarget();
+        createRenderTarget();
     }
 
     VkFormat VKRenderer::Impl::toVkFormat(PixelFormat format)
@@ -1221,8 +1190,6 @@ namespace ifap
     {
         destroyPipelines();
 
-        const VkFormat swapchainFormat = swapchain().getFormat();
-
         m_pipelineBilinearBlend = createGraphicsPipeline(m_device, kProcessingFormat, m_processingPipelineLayout,
             m_processingVertexShader, m_processingFragmentShaderBilinear, true);
 
@@ -1234,38 +1201,17 @@ namespace ifap
 
         m_pipelineBicubicNoBlend = createGraphicsPipeline(m_device, kProcessingFormat, m_processingPipelineLayout,
             m_processingVertexShader, m_processingFragmentShaderBicubic, false);
-
-        m_resolvePipeline = createGraphicsPipeline(m_device, swapchainFormat, m_resolvePipelineLayout,
-            m_resolveVertexShader, m_resolveFragmentShader, false);
     }
 
-    void VKRenderer::Impl::destroyProcessingTarget()
+    void VKRenderer::Impl::destroyRenderTarget()
     {
-        if (m_resolveDescriptor && m_descriptorPool)
-        {
-            vkFreeDescriptorSets(m_device, m_descriptorPool, 1, &m_resolveDescriptor);
-            m_resolveDescriptor = VK_NULL_HANDLE;
-        }
-
-        if (m_processingView)
-        {
-            vkDestroyImageView(m_device, m_processingView, nullptr);
-            m_processingView = VK_NULL_HANDLE;
-        }
-
-        if (m_processingImage)
-        {
-            m_allocator->destroyImage({ m_processingImage, m_processingAllocation });
-            m_processingImage = VK_NULL_HANDLE;
-            m_processingAllocation = VK_NULL_HANDLE;
-        }
-
+        m_renderTarget.reset();
         m_processingLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     }
 
-    void VKRenderer::Impl::createProcessingTarget()
+    void VKRenderer::Impl::createRenderTarget()
     {
-        destroyProcessingTarget();
+        destroyRenderTarget();
 
         if (!m_window.isDeviceReady())
         {
@@ -1278,51 +1224,20 @@ namespace ifap
             return;
         }
 
-        ImageAllocation processing = createImage(int(extent.width), int(extent.height), kProcessingFormat,
-                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-        m_processingImage = processing.image;
-        m_processingAllocation = processing.allocation;
-        createImageView(m_processingImage, kProcessingFormat, m_processingView);
-
-        if (!m_resolveDescriptor && m_descriptorPool && m_resolveDescriptorSetLayout)
+        m_renderTarget = std::make_unique<RenderTarget>(RenderTarget::CreateInfo
         {
-            VkDescriptorSetAllocateInfo allocInfo =
-            {
-                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                .descriptorPool = m_descriptorPool,
-                .descriptorSetCount = 1,
-                .pSetLayouts = &m_resolveDescriptorSetLayout,
-            };
+            .device = m_device,
+            .allocator = m_allocator.get(),
+            .queue = m_graphicsQueue,
+            .queueFamily = m_graphicsQueueFamilyIndex,
+            .format = RenderTargetFormat::Float16,
+            .extent = extent,
+        });
 
-            vkAllocateDescriptorSets(m_device, &allocInfo, &m_resolveDescriptor);
-        }
-
-        if (m_resolveDescriptor)
-        {
-            VkDescriptorImageInfo imageInfo =
-            {
-                .sampler = m_samplerLinear,
-                .imageView = m_processingView,
-                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            };
-
-            VkWriteDescriptorSet descriptorWrite =
-            {
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .dstSet = m_resolveDescriptor,
-                .dstBinding = 0,
-                .descriptorCount = 1,
-                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                .pImageInfo = &imageInfo,
-            };
-
-            vkUpdateDescriptorSets(m_device, 1, &descriptorWrite, 0, nullptr);
-        }
-
-        m_processingExtent = extent;
+        m_processingLayout = VK_IMAGE_LAYOUT_GENERAL;
     }
 
-    void VKRenderer::Impl::ensureProcessingTarget()
+    void VKRenderer::Impl::ensureRenderTarget()
     {
         if (!m_window.isDeviceReady())
         {
@@ -1335,22 +1250,18 @@ namespace ifap
             return;
         }
 
-        if (m_processingImage != VK_NULL_HANDLE &&
-            extent.width == m_processingExtent.width &&
-            extent.height == m_processingExtent.height)
+        if (m_renderTarget && *m_renderTarget &&
+            extent.width == m_renderTarget->extent().width &&
+            extent.height == m_renderTarget->extent().height)
         {
-            // Already matches the swapchain extent — nothing to rebuild. Command buffers
-            // depend only on the (stable) image count, and the pipelines use dynamic
-            // viewport/scissor with a stable format, so the extent-sized processing
-            // target is the only resource a resize touches.
             return;
         }
 
         // beginFrame()'s recreate already waited on all swapchain fences, but the
-        // processing image may still be referenced by an earlier submission; idle the
+        // render target may still be referenced by an earlier submission; idle the
         // device before replacing it.
         vkDeviceWaitIdle(m_device);
-        createProcessingTarget();
+        createRenderTarget();
     }
 
     void VKRenderer::Impl::createContentDescriptors()
@@ -1404,32 +1315,20 @@ namespace ifap
         const std::string processingVertexSource = shaders::processingVertexShader();
         const std::string processingBilinearSource = shaders::fragmentShaderProcessingBilinear();
         const std::string processingBicubicSource = shaders::fragmentShaderProcessingBicubic();
-        const std::string resolveVertexSource = shaders::resolveVertexShader();
-        const std::string resolveFragmentSource = shaders::resolveFragmentShader(
-            swapchain().getOutputTransformGLSL());
 
         Shader processingVertexShader = compiler.compile(processingVertexSource.c_str(), ShaderStage::Vertex);
         Shader processingBilinear = compiler.compile(processingBilinearSource.c_str(), ShaderStage::Fragment);
         Shader processingBicubic = compiler.compile(processingBicubicSource.c_str(), ShaderStage::Fragment);
-        Shader resolveVertexShader = compiler.compile(resolveVertexSource.c_str(), ShaderStage::Vertex);
-        Shader resolveFragmentShader = compiler.compile(resolveFragmentSource.c_str(), ShaderStage::Fragment);
 
-        if (!processingVertexShader || !processingBilinear || !processingBicubic
-            || !resolveVertexShader || !resolveFragmentShader)
+        if (!processingVertexShader || !processingBilinear || !processingBicubic)
         {
             printLine(Print::Error, "VKRenderer: shader compilation failed.");
-            if (!resolveFragmentShader)
-            {
-                printLine(Print::Error, "Resolve fragment shader:\n{}", resolveFragmentShader.log);
-            }
             return;
         }
 
         m_processingVertexShader = Compiler::createShaderModule(m_device, processingVertexShader);
         m_processingFragmentShaderBilinear = Compiler::createShaderModule(m_device, processingBilinear);
         m_processingFragmentShaderBicubic = Compiler::createShaderModule(m_device, processingBicubic);
-        m_resolveVertexShader = Compiler::createShaderModule(m_device, resolveVertexShader);
-        m_resolveFragmentShader = Compiler::createShaderModule(m_device, resolveFragmentShader);
     }
 
     void VKRenderer::Impl::createSamplers()
@@ -1470,23 +1369,6 @@ namespace ifap
 
         vkCreateDescriptorSetLayout(m_device, &contentLayoutInfo, nullptr, &m_contentDescriptorSetLayout);
 
-        VkDescriptorSetLayoutBinding resolveBinding =
-        {
-            .binding = 0,
-            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-        };
-
-        VkDescriptorSetLayoutCreateInfo resolveLayoutInfo =
-        {
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-            .bindingCount = 1,
-            .pBindings = &resolveBinding,
-        };
-
-        vkCreateDescriptorSetLayout(m_device, &resolveLayoutInfo, nullptr, &m_resolveDescriptorSetLayout);
-
         VkPushConstantRange processingPushRange =
         {
             .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -1505,19 +1387,10 @@ namespace ifap
 
         vkCreatePipelineLayout(m_device, &processingLayoutInfo, nullptr, &m_processingPipelineLayout);
 
-        VkPipelineLayoutCreateInfo resolvePipelineLayoutInfo =
-        {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-            .setLayoutCount = 1,
-            .pSetLayouts = &m_resolveDescriptorSetLayout,
-        };
-
-        vkCreatePipelineLayout(m_device, &resolvePipelineLayoutInfo, nullptr, &m_resolvePipelineLayout);
-
         // Sets drawn from this pool: the per-image content ring (image count *
-        // kContentDescriptorsPerImage) plus the single resolve set. Textures no longer
-        // own a set (the content set is bound from the ring at draw time), so this is
-        // small; size generously anyway since descriptor sets are cheap.
+        // kContentDescriptorsPerImage). Textures no longer own a set (the content set
+        // is bound from the ring at draw time), so this is small; size generously anyway
+        // since descriptor sets are cheap.
         const u32 kMaxDescriptorSets = u32(texture_cache_size) * 8 + 32;
 
         VkDescriptorPoolSize poolSize =
@@ -1571,7 +1444,6 @@ namespace ifap
         destroy(m_pipelineBilinearNoBlend);
         destroy(m_pipelineBicubicBlend);
         destroy(m_pipelineBicubicNoBlend);
-        destroy(m_resolvePipeline);
     }
 
     VkSampler VKRenderer::Impl::selectSampler(TextureFilter filter) const
@@ -1609,19 +1481,18 @@ namespace ifap
         m_clear_color[3] = clear_a;
         m_blend_enabled = blend;
         m_command_buffer_recording = false;
-        m_rendering_active = false;
         m_processing_rendering_active = false;
         m_content_drawn = false;
 
         // beginFrame() owns the swapchain recreate + suboptimal retry, so it always
         // hands back a correctly-sized image (or an empty frame to drop). We then sync
-        // the only extent-sized resource we own — the processing target — to the now
-        // final extent; it rebuilds only when the size actually changed.
+        // the only extent-sized resource we own — the float16 render target — to the
+        // now final extent; it rebuilds only when the size actually changed.
         m_frame = m_window.beginDraw();
         if (m_frame)
         {
             ensureContentDescriptors();
-            ensureProcessingTarget();
+            ensureRenderTarget();
 
             // The acquired image's prior submission has retired (the swapchain fenced it
             // before handing the frame back), so its content-descriptor block is idle and
@@ -1664,7 +1535,7 @@ namespace ifap
 
     void VKRenderer::Impl::beginProcessingRendering()
     {
-        if (!m_frame_active || m_processing_rendering_active || !m_processingView)
+        if (!m_frame_active || m_processing_rendering_active || !m_renderTarget || !*m_renderTarget)
         {
             return;
         }
@@ -1674,13 +1545,20 @@ namespace ifap
         const u32 imageIndex = m_frame.imageIndex();
         VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
 
-        const VkPipelineStageFlags srcStage = m_processingLayout == VK_IMAGE_LAYOUT_UNDEFINED
-            ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-            : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        const bool undefinedLayout = m_processingLayout == VK_IMAGE_LAYOUT_UNDEFINED;
+        const bool shaderReadLayout = m_processingLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-        const VkAccessFlags srcAccess = m_processingLayout == VK_IMAGE_LAYOUT_UNDEFINED
+        const VkPipelineStageFlags srcStage = undefinedLayout
+            ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+            : shaderReadLayout
+            ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+            : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+
+        const VkAccessFlags srcAccess = undefinedLayout
             ? VkAccessFlags(0)
-            : VK_ACCESS_SHADER_READ_BIT;
+            : shaderReadLayout
+            ? VK_ACCESS_SHADER_READ_BIT
+            : VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 
         VkImageMemoryBarrier processingBarrier =
         {
@@ -1691,7 +1569,7 @@ namespace ifap
             .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = m_processingImage,
+            .image = m_renderTarget->image(),
             .subresourceRange =
             {
                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -1710,7 +1588,7 @@ namespace ifap
         VkRenderingAttachmentInfo colorAttachment =
         {
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView = m_processingView,
+            .imageView = m_renderTarget->view(),
             .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
@@ -1753,7 +1631,7 @@ namespace ifap
             .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = m_processingImage,
+            .image = m_renderTarget->image(),
             .subresourceRange =
             {
                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -1796,33 +1674,7 @@ namespace ifap
 
     void VKRenderer::Impl::recordResolve()
     {
-        if (!m_frame_active || !m_processingView || !m_resolvePipeline || !m_resolveDescriptor)
-        {
-            return;
-        }
-
-        beginSwapchainRendering();
-
-        if (!m_rendering_active)
-        {
-            return;
-        }
-
-        const u32 imageIndex = m_frame.imageIndex();
-        VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
-
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_resolvePipeline);
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_resolvePipelineLayout,
-            0, 1, &m_resolveDescriptor, 0, nullptr);
-
-        VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(commandBuffer, 0, 1, &m_vertexBuffer.buffer, &offset);
-        vkCmdDraw(commandBuffer, 4, 1, 0, 0);
-    }
-
-    void VKRenderer::Impl::beginSwapchainRendering()
-    {
-        if (!m_frame_active || m_rendering_active)
+        if (!m_frame_active || !m_renderTarget || !*m_renderTarget)
         {
             return;
         }
@@ -1832,44 +1684,8 @@ namespace ifap
         const u32 imageIndex = m_frame.imageIndex();
         VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
 
-        swapchain().transitionImageToColorAttachment(commandBuffer, imageIndex);
-
-        VkRenderingAttachmentInfo colorAttachment =
-        {
-            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView = m_frame.imageView(),
-            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-            .clearValue = { .color = { { m_clear_color[0], m_clear_color[1], m_clear_color[2], m_clear_color[3] } } },
-        };
-
-        VkRenderingInfo renderingInfo =
-        {
-            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-            .renderArea = { .extent = swapchain().getExtent() },
-            .layerCount = 1,
-            .colorAttachmentCount = 1,
-            .pColorAttachments = &colorAttachment,
-        };
-
-        vkCmdBeginRendering(commandBuffer, &renderingInfo);
-        setDynamicViewportScissor(commandBuffer);
-        m_rendering_active = true;
-    }
-
-    void VKRenderer::Impl::endSwapchainRendering()
-    {
-        if (!m_frame_active || !m_rendering_active)
-        {
-            return;
-        }
-
-        const u32 imageIndex = m_frame.imageIndex();
-        VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
-
-        vkCmdEndRendering(commandBuffer);
-        m_rendering_active = false;
+        m_renderTarget->resolve(commandBuffer, swapchain(), imageIndex);
+        m_processingLayout = VK_IMAGE_LAYOUT_GENERAL;
     }
 
     void VKRenderer::Impl::recordDraw(const ImageDrawRequest& request)
@@ -1972,37 +1788,31 @@ namespace ifap
             return;
         }
 
-        if (m_content_drawn)
+        if (m_processing_rendering_active)
         {
             endProcessingRendering();
-            recordResolve();
         }
-        else
+        else if (!m_content_drawn)
         {
-            // Scene-linear clear must go through the resolve pass so empty-window
-            // background matches the encoded grey used when an image is shown.
+            // Scene-linear clear must go through resolve so empty-window background
+            // matches the encoded grey used when an image is shown.
             beginProcessingRendering();
             if (m_processing_rendering_active)
             {
                 endProcessingRendering();
-                recordResolve();
-            }
-            else if (!m_rendering_active)
-            {
-                beginSwapchainRendering();
             }
         }
 
-        if (!m_rendering_active)
+        recordResolve();
+
+        if (!m_command_buffer_recording)
         {
+            m_frame_active = false;
             return;
         }
 
         const u32 imageIndex = m_frame.imageIndex();
         VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
-
-        endSwapchainRendering();
-        swapchain().transitionImageToPresent(commandBuffer, imageIndex);
 
         vkEndCommandBuffer(commandBuffer);
         m_command_buffer_recording = false;

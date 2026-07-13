@@ -76,21 +76,6 @@ namespace ifap::shaders
             }
         )";
 
-        inline constexpr const char* g_resolve_vertex_main = R"(
-            void main()
-            {
-                texcoord = inPosition * vec2(0.5, 0.5) + vec2(0.5);
-                gl_Position = vec4(inPosition, 0.0, 1.0);
-            }
-        )";
-
-        inline constexpr const char* g_resolve_fragment_main = R"(
-            void main()
-            {
-                outColor = encodeOutput(texture(uProcessing, texcoord));
-            }
-        )";
-
         inline constexpr const char* g_processing_push_constants = R"(
             layout(push_constant) uniform Push
             {
@@ -130,23 +115,6 @@ namespace ifap::shaders
         )") + detail::g_processing_push_constants + R"(
             #define uTexScale pc.uTexScale
         )" + detail::g_cubic + detail::g_texture_filter + detail::g_processing_fragment_bicubic_main;
-    }
-
-    inline std::string resolveVertexShader()
-    {
-        return std::string(R"(#version 450
-            layout(location = 0) in vec2 inPosition;
-            layout(location = 0) out vec2 texcoord;
-        )") + detail::g_resolve_vertex_main;
-    }
-
-    inline std::string resolveFragmentShader(const std::string& outputTransformGlsl)
-    {
-        return std::string(R"(#version 450
-            layout(set = 0, binding = 0) uniform sampler2D uProcessing;
-            layout(location = 0) in vec2 texcoord;
-            layout(location = 0) out vec4 outColor;
-        )") + outputTransformGlsl + detail::g_resolve_fragment_main;
     }
 
 } // namespace ifap::shaders
