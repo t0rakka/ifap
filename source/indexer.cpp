@@ -107,13 +107,13 @@ namespace ifap
         m_queue.enqueue([this, pathname]
         {
             u64 time0 = mango::Time::ms();
-            printLine("Indexer: start.");
+            printLine(Print::Info, "Indexer: start.");
 
             Path path(pathname);
             folder(path, pathname, 0);
 
             u64 time1 = mango::Time::ms();
-            printLine("Indexer: complete {} ms.", time1 - time0);
+            printLine(Print::Info, "Indexer: complete {} ms.", time1 - time0);
 
             m_running = false;
         });

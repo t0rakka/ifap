@@ -75,6 +75,7 @@ namespace ifap
         size_t m_current_index = 0;
 
         bool m_loop_active = false;
+        bool m_event_loop_running = false;
         bool m_shutdown = false;
         bool m_awaiting_display = false;
 

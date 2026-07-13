@@ -28,7 +28,15 @@ namespace ifap
 
     bool AppView::isExitRequested() const
     {
-        return m_shutdown || (m_loop_active && !m_window.isRunning());
+        if (m_shutdown)
+        {
+            return true;
+        }
+
+        // Abort background work only after the event loop has actually run. VulkanWindow
+        // calls onFrame() from presentInitialFrame() before running is set, so treating
+        // !isRunning() as exit there would abort the first image prepare/decode.
+        return m_event_loop_running && !m_window.isRunning();
     }
 
     void AppView::shutdown()
@@ -450,9 +458,14 @@ namespace ifap
 
         m_loop_active = true;
 
+        if (m_window.isRunning())
+        {
+            m_event_loop_running = true;
+        }
+
         if (!m_window.isRunning())
         {
-            shutdown();
+            // presentInitialFrame() invokes onFrame() before the event loop sets running.
             return;
         }
 

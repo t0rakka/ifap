@@ -210,7 +210,6 @@ namespace ifap
         VkPipeline m_pipelineBicubicBlend = VK_NULL_HANDLE;
         VkPipeline m_pipelineBicubicNoBlend = VK_NULL_HANDLE;
         std::unique_ptr<RenderTarget> m_renderTarget;
-        VkImageLayout m_processingLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         BufferAllocation m_vertexBuffer;
         VkSampler m_samplerNearest = VK_NULL_HANDLE;
         VkSampler m_samplerLinear = VK_NULL_HANDLE;
@@ -1206,7 +1205,6 @@ namespace ifap
     void VKRenderer::Impl::destroyRenderTarget()
     {
         m_renderTarget.reset();
-        m_processingLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     }
 
     void VKRenderer::Impl::createRenderTarget()
@@ -1233,8 +1231,6 @@ namespace ifap
             .format = RenderTargetFormat::Float16,
             .extent = extent,
         });
-
-        m_processingLayout = VK_IMAGE_LAYOUT_GENERAL;
     }
 
     void VKRenderer::Impl::ensureRenderTarget()
@@ -1545,45 +1541,7 @@ namespace ifap
         const u32 imageIndex = m_frame.imageIndex();
         VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
 
-        const bool undefinedLayout = m_processingLayout == VK_IMAGE_LAYOUT_UNDEFINED;
-        const bool shaderReadLayout = m_processingLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        const VkPipelineStageFlags srcStage = undefinedLayout
-            ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-            : shaderReadLayout
-            ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
-            : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-
-        const VkAccessFlags srcAccess = undefinedLayout
-            ? VkAccessFlags(0)
-            : shaderReadLayout
-            ? VK_ACCESS_SHADER_READ_BIT
-            : VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-
-        VkImageMemoryBarrier processingBarrier =
-        {
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = srcAccess,
-            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-            .oldLayout = m_processingLayout,
-            .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = m_renderTarget->image(),
-            .subresourceRange =
-            {
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .levelCount = 1,
-                .layerCount = 1,
-            },
-        };
-
-        vkCmdPipelineBarrier(commandBuffer,
-            srcStage,
-            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &processingBarrier);
-
-        m_processingLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        m_renderTarget->beginRendering(commandBuffer);
 
         VkRenderingAttachmentInfo colorAttachment =
         {
@@ -1622,30 +1580,7 @@ namespace ifap
         vkCmdEndRendering(commandBuffer);
         m_processing_rendering_active = false;
 
-        VkImageMemoryBarrier processingBarrier =
-        {
-            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = m_renderTarget->image(),
-            .subresourceRange =
-            {
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .levelCount = 1,
-                .layerCount = 1,
-            },
-        };
-
-        vkCmdPipelineBarrier(commandBuffer,
-            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &processingBarrier);
-
-        m_processingLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        m_renderTarget->endRendering(commandBuffer);
     }
 
     void VKRenderer::Impl::setDynamicViewportScissor(VkCommandBuffer commandBuffer) const
@@ -1685,7 +1620,6 @@ namespace ifap
         VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
 
         m_renderTarget->resolve(commandBuffer, swapchain(), imageIndex);
-        m_processingLayout = VK_IMAGE_LAYOUT_GENERAL;
     }
 
     void VKRenderer::Impl::recordDraw(const ImageDrawRequest& request)

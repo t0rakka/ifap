@@ -1051,7 +1051,7 @@ namespace ifap
             return;
         }
 
-        printLine("[decode] {}: total {} ms, first pixels {} ms ({} x {})",
+        printLine(Print::Info, "[decode] {}: total {} ms, first pixels {} ms ({} x {})",
             task.name,
             end - start,
             first ? (first - start) : 0,
@@ -1536,6 +1536,19 @@ namespace ifap
 
         if (priority_entry)
         {
+            // presentInitialFrame() used to trip isExitRequested() and abort prepare
+            // mid-flight, leaving the task stuck in Preparing with no decoder.
+            if (priority_entry->prepare_state == PrepareState::Preparing &&
+                !priority_entry->decoder &&
+                !priority_entry->future.valid() &&
+                !(m_should_abort && m_should_abort()))
+            {
+                WorkerJob job;
+                job.type = WorkerJob::Type::Prepare;
+                job.task = priority_entry;
+                enqueuePrepare(std::move(job), true);
+            }
+
             if (updateDecodeTask(*priority_entry))
             {
                 progress = true;
