@@ -471,7 +471,7 @@ namespace ifap
 
         const ImageFileIndexer& indexer = m_texture_cache;
 
-        if (indexer.size() > 0)
+        if (indexer.size() > 0 && m_current_index < indexer.size())
         {
             std::string filename = indexer[m_current_index];
             std::string title = fmt::format("[{} / {}] {}",

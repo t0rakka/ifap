@@ -15,6 +15,8 @@
 namespace ifap
 {
 
+    std::recursive_mutex filesystem_mutex;
+
     // Flip to false to silence the decode lifecycle trace.
     static constexpr bool trace_decode = false;
 
@@ -531,6 +533,13 @@ namespace ifap
             // user scrolled past this image while a large read was in progress, we bail
             // here instead of holding the worker until the whole file is read.
             {
+                std::lock_guard lock(filesystem_mutex);
+
+                if (!task->path)
+                {
+                    return;
+                }
+
                 File file(*task->path, task->name);
                 ConstMemory src = file;
 
@@ -560,9 +569,8 @@ namespace ifap
                 }
 
                 task->buffer = std::move(buffer);
+                task->decoder = std::make_unique<ImageDecoder>(*task->buffer, *task->path, task->name);
             }
-
-            task->decoder = std::make_unique<ImageDecoder>(*task->buffer, *task->path, task->name);
             ImageHeader header = task->decoder->header();
 
             if (!header.width || !header.height)
@@ -1297,6 +1305,11 @@ namespace ifap
 
         std::shared_ptr<DecodeTask> task = makeTask();
 
+        if (index >= m_indexer.size())
+        {
+            return {};
+        }
+
         task->name = m_indexer[index];
         task->index = index;
 
@@ -1536,19 +1549,6 @@ namespace ifap
 
         if (priority_entry)
         {
-            // presentInitialFrame() used to trip isExitRequested() and abort prepare
-            // mid-flight, leaving the task stuck in Preparing with no decoder.
-            if (priority_entry->prepare_state == PrepareState::Preparing &&
-                !priority_entry->decoder &&
-                !priority_entry->future.valid() &&
-                !(m_should_abort && m_should_abort()))
-            {
-                WorkerJob job;
-                job.type = WorkerJob::Type::Prepare;
-                job.task = priority_entry;
-                enqueuePrepare(std::move(job), true);
-            }
-
             if (updateDecodeTask(*priority_entry))
             {
                 progress = true;

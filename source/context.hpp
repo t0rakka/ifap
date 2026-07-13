@@ -7,9 +7,15 @@
 #include <mango/mango.hpp>
 #include <mango/math/vector.hpp>
 
+#include <mutex>
+
 namespace ifap
 {
 
+    // Serializes mango::filesystem access between the indexer thread and the texture
+    // worker (concurrent Path iteration + File::map is not safe on Windows).
+    // Recursive so the indexer can descend Path(parent, child) while holding the lock.
+    extern std::recursive_mutex filesystem_mutex;
     using mango::u64;
     using mango::math::float32x2;
 

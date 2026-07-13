@@ -1253,10 +1253,14 @@ namespace ifap
             return;
         }
 
-        // beginFrame()'s recreate already waited on all swapchain fences, but the
-        // render target may still be referenced by an earlier submission; idle the
-        // device before replacing it.
         vkDeviceWaitIdle(m_device);
+
+        if (m_renderTarget && *m_renderTarget)
+        {
+            m_renderTarget->resize(extent);
+            return;
+        }
+
         createRenderTarget();
     }
 
@@ -1738,6 +1742,14 @@ namespace ifap
         }
 
         recordResolve();
+
+        // beginDraw() acquired an image; we must always submit (even an empty buffer)
+        // so renderFinished is signalled and present() can retire it. Skipping submit
+        // after acquire eventually exhausts the swapchain and faults the process.
+        if (!m_command_buffer_recording)
+        {
+            beginCommandBufferRecording();
+        }
 
         if (!m_command_buffer_recording)
         {

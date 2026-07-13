@@ -6,6 +6,7 @@
 #include <mango/core/string.hpp>
 #include <mango/core/system.hpp>
 #include <mango/image/decoder.hpp>
+#include "context.hpp"
 #include "indexer.hpp"
 
 namespace ifap
@@ -28,36 +29,49 @@ namespace ifap
     void ImageFileIndexer::reset()
     {
         stop();
-        m_filenames.clear();
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_filenames.clear();
+        }
     }
 
     void ImageFileIndexer::folder(const Path& path, const std::string& prefix, int depth)
     {
         std::vector<std::string> names;
+        std::vector<std::pair<std::string, int>> subfolders;
 
-        // first pass: files
-        for (auto& info : path)
         {
-            if (m_stop)
-            {
-                return;
-            }
+            std::lock_guard<std::recursive_mutex> lock(filesystem_mutex);
 
-            bool encrypted = info.isEncrypted();
-            if (encrypted)
+            for (auto& info : path)
             {
-                // skip encrypted folders and files
-                continue;
-            }
-
-            if (!info.isDirectory())
-            {
-                // Filter only decodable files
-                std::string extension = filesystem::getExtension(info.name);
-                if (!extension.empty() && mango::image::isImageDecoder(extension))
+                if (m_stop)
                 {
-                    std::string filename = mango::removePrefix(path.pathname() + info.name, prefix);
-                    names.emplace_back(filename);
+                    return;
+                }
+
+                bool encrypted = info.isEncrypted();
+                if (encrypted)
+                {
+                    continue;
+                }
+
+                if (!info.isDirectory())
+                {
+                    std::string extension = filesystem::getExtension(info.name);
+                    if (!extension.empty() && mango::image::isImageDecoder(extension))
+                    {
+                        std::string filename = mango::removePrefix(path.pathname() + info.name, prefix);
+                        names.emplace_back(filename);
+                    }
+                }
+                else
+                {
+                    const int cost = info.isContainer();
+                    if (depth < 2)
+                    {
+                        subfolders.emplace_back(info.name, cost);
+                    }
                 }
             }
         }
@@ -72,23 +86,11 @@ namespace ifap
             m_filenames.insert(m_filenames.end(), names.begin(), names.end());
         }
 
-        // second pass: folders
-        for (auto& info : path)
+        for (const auto& [name, cost] : subfolders)
         {
-            if (m_stop)
-            {
-                return;
-            }
-
-            if (info.isDirectory())
-            {
-                const int cost = info.isContainer();
-                if (depth < 2)
-                {
-                    Path temp(path, info.name);
-                    folder(temp, prefix, depth + cost);
-                }
-            }
+            std::lock_guard<std::recursive_mutex> lock(filesystem_mutex);
+            Path child(path, name);
+            folder(child, prefix, depth + cost);
         }
     }
 
@@ -109,8 +111,11 @@ namespace ifap
             u64 time0 = mango::Time::ms();
             printLine(Print::Info, "Indexer: start.");
 
-            Path path(pathname);
-            folder(path, pathname, 0);
+            {
+                std::lock_guard<std::recursive_mutex> lock(filesystem_mutex);
+                Path path(pathname);
+                folder(path, pathname, 0);
+            }
 
             u64 time1 = mango::Time::ms();
             printLine(Print::Info, "Indexer: complete {} ms.", time1 - time0);
@@ -135,6 +140,10 @@ namespace ifap
     std::string ImageFileIndexer::operator [] (size_t index) const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        if (index >= m_filenames.size())
+        {
+            return {};
+        }
         return m_filenames[index];
     }
 
