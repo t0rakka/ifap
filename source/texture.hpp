@@ -46,7 +46,10 @@ namespace ifap
         // The whole compressed file, read once into RAM on the worker thread (bulk
         // sequential I/O, off the UI thread). The decoder reads from this, so it must
         // outlive the async decode; it is released once the decode has finished.
+        // Mid-read aborts stash a prefix in TextureCache::m_partial_reads so a later
+        // prepare for the same index can resume instead of re-reading from offset 0.
         std::unique_ptr<Buffer> buffer;
+        size_t read_bytes = 0; // valid prefix length while a chunked read is in progress
         std::unique_ptr<ImageDecoder> decoder;
         std::unique_ptr<Bitmap> bitmap;
         std::unique_ptr<Bitmap> scaled_bitmap;
@@ -192,10 +195,28 @@ namespace ifap
 
         int m_prefetch_direction = 0;
 
+        // Partial file reads preserved across abort/resume. Keyed by indexer index;
+        // the worker stashes a prefix when a chunked read is abandoned, and the next
+        // prepare for that index picks it up. Bounded so fast scrolling cannot retain
+        // an unbounded number of huge half-read buffers.
+        struct PartialFileRead
+        {
+            std::unique_ptr<Buffer> buffer;
+            size_t bytes = 0;
+        };
+
+        std::mutex m_partial_mutex;
+        std::unordered_map<size_t, PartialFileRead> m_partial_reads;
+
+        void stashPartialRead(size_t index, std::unique_ptr<Buffer> buffer, size_t bytes);
+        PartialFileRead takePartialRead(size_t index);
+        void clearPartialReads();
+
         std::shared_ptr<DecodeTask> makeTask();
         void deferDispose(DecodeTask* task);
         void enqueuePrepare(WorkerJob job, bool front = false);
         void enqueueDispose(WorkerJob job);
+        void abortNonPriorityWork(size_t priority_index);
         void cancelStaleDecodes(size_t priority_index);
 
         // Pinned-overlay helpers (see m_pinned).

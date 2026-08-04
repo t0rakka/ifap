@@ -290,6 +290,7 @@ namespace ifap
         m_cache.clear();
         m_pinned.clear();
         m_pin_set.clear();
+        clearPartialReads();
 
         {
             std::lock_guard lock(m_worker_mutex);
@@ -531,7 +532,8 @@ namespace ifap
             //
             // The copy runs in blocks with an abort/abandonment check between them: if the
             // user scrolled past this image while a large read was in progress, we bail
-            // here instead of holding the worker until the whole file is read.
+            // here and stash the prefix so a later prepare for the same index can resume
+            // instead of re-reading from offset 0.
             {
                 std::lock_guard lock(filesystem_mutex);
 
@@ -543,11 +545,31 @@ namespace ifap
                 File file(*task->path, task->name);
                 ConstMemory src = file;
 
-                auto buffer = std::make_unique<Buffer>(src.size);
+                PartialFileRead partial = takePartialRead(task->index);
+                std::unique_ptr<Buffer> buffer;
+                size_t offset = 0;
+
+                if (partial.buffer && partial.buffer->size() == src.size &&
+                    partial.bytes > 0 && partial.bytes <= src.size)
+                {
+                    buffer = std::move(partial.buffer);
+                    offset = partial.bytes;
+
+                    if (trace_decode)
+                    {
+                        printLine("[trace] #{} resume-read @ {} / {}",
+                            task->index, offset, src.size);
+                    }
+                }
+                else
+                {
+                    buffer = std::make_unique<Buffer>(src.size);
+                }
+
                 u8* dst = buffer->data();
                 bool aborted = false;
 
-                for (size_t offset = 0; offset < src.size; offset += texture_read_block_size)
+                for (; offset < src.size; offset += texture_read_block_size)
                 {
                     if (m_shutdown || (m_should_abort && m_should_abort()) || task.use_count() <= 1)
                     {
@@ -559,12 +581,17 @@ namespace ifap
                     std::memcpy(dst + offset, src.address + offset, block);
                 }
 
+                task->read_bytes = offset;
+
                 if (aborted)
                 {
                     if (trace_decode)
                     {
-                        printLine("[trace] #{} abort-read", task->index);
+                        printLine("[trace] #{} abort-read @ {} / {}",
+                            task->index, offset, src.size);
                     }
+
+                    stashPartialRead(task->index, std::move(buffer), offset);
                     return;
                 }
 
@@ -851,6 +878,145 @@ namespace ifap
         m_prefetch_direction = direction;
     }
 
+    void TextureCache::stashPartialRead(size_t index, std::unique_ptr<Buffer> buffer, size_t bytes)
+    {
+        if (!buffer || bytes == 0)
+        {
+            return;
+        }
+
+        std::lock_guard lock(m_partial_mutex);
+
+        m_partial_reads[index] = PartialFileRead{ std::move(buffer), bytes };
+
+        // Bound retained prefixes so a fast scroll across huge files cannot pin an
+        // unbounded amount of host RAM. Keep the entry we just stashed; drop others
+        // until we are within the prefetch window (+ the visible image).
+        const size_t limit = texture_prefetch_size + 1;
+        while (m_partial_reads.size() > limit)
+        {
+            bool erased = false;
+            for (auto it = m_partial_reads.begin(); it != m_partial_reads.end(); ++it)
+            {
+                if (it->first != index)
+                {
+                    m_partial_reads.erase(it);
+                    erased = true;
+                    break;
+                }
+            }
+
+            if (!erased)
+            {
+                break;
+            }
+        }
+    }
+
+    TextureCache::PartialFileRead TextureCache::takePartialRead(size_t index)
+    {
+        std::lock_guard lock(m_partial_mutex);
+
+        auto it = m_partial_reads.find(index);
+        if (it == m_partial_reads.end())
+        {
+            return {};
+        }
+
+        PartialFileRead partial = std::move(it->second);
+        m_partial_reads.erase(it);
+        return partial;
+    }
+
+    void TextureCache::clearPartialReads()
+    {
+        std::lock_guard lock(m_partial_mutex);
+        m_partial_reads.clear();
+    }
+
+    void TextureCache::abortNonPriorityWork(size_t priority_index)
+    {
+        // Navigation just settled on (or jumped to) priority_index. Drop every other
+        // in-flight prepare/decode so the serialized file-read worker and the decode
+        // pool are free for the visible image. Finished neighbors stay resident for
+        // instant back-navigation; tickPrefetch() rebuilds the window once the
+        // current file has finished prepare.
+
+        std::vector<size_t> drop;
+
+        forEachTask([&] (size_t index, std::shared_ptr<DecodeTask>& task)
+        {
+            if (index == priority_index || !task)
+            {
+                return;
+            }
+
+            // Keep completed textures; only reclaim work that still owns I/O or a
+            // decode slot (Preparing counts via isDecoding()).
+            if (!task->isDecoding())
+            {
+                return;
+            }
+
+            drop.push_back(index);
+        });
+
+        for (size_t index : drop)
+        {
+            auto task = lookupTask(index);
+            if (!task)
+            {
+                continue;
+            }
+
+            // Cancel early so an already-launched decode yields its pool thread
+            // without waiting for the shared_ptr to hit zero.
+            if (task->decoder)
+            {
+                task->decoder->cancel();
+            }
+
+            if (trace_decode)
+            {
+                printLine("[trace] #{} abort-prefetch (priority #{})", index, priority_index);
+            }
+
+            m_pinned.erase(index);
+            m_cache.erase(index);
+        }
+
+        // m_pin_set still names the desired window; empty slots are fine until
+        // tickPrefetch recreates them (and storeTask still routes those indices
+        // into the pin overlay via isPinIndex).
+
+        // Drop queued prepares that are no longer wanted. Erasing above already
+        // dropped the cache/pin refs; releasing the queue's shared_ptr either
+        // orphans an in-flight read (use_count<=1 → abort at next block) or
+        // destroys a not-yet-started task via the reaper.
+        {
+            std::lock_guard lock(m_worker_mutex);
+
+            std::deque<WorkerJob> kept;
+            for (WorkerJob& job : m_worker_jobs)
+            {
+                if (job.type == WorkerJob::Type::Prepare && job.task &&
+                    job.task->index != priority_index)
+                {
+                    if (trace_decode)
+                    {
+                        printLine("[trace] #{} drop-queued (priority #{})",
+                            job.task->index, priority_index);
+                    }
+                    continue;
+                }
+
+                kept.push_back(std::move(job));
+            }
+
+            m_worker_jobs.swap(kept);
+        }
+    }
+
     void TextureCache::cancelStaleDecodes(size_t priority_index)
     {
         const size_t count = m_indexer.size();
@@ -1097,6 +1263,17 @@ namespace ifap
             return;
         }
 
+        // Hold prefetch until the visible image has finished prepare (chunked file
+        // read + decode launch). While it is still Preparing, the single worker is
+        // either reading it or about to; competing I/O would recreate the gray-screen
+        // stall that abortNonPriorityWork() just cleared.
+        auto priority_task = lookupTask(priority_index);
+        if (!priority_task ||
+            priority_task->prepare_state.load() == PrepareState::Preparing)
+        {
+            return;
+        }
+
         // Don't pile on more decodes while the pipeline is already saturated. This
         // keeps the visible image's decode from being starved by prefetch and bounds
         // the number of full-resolution bitmaps held in memory at once.
@@ -1182,6 +1359,7 @@ namespace ifap
         m_cache.clear();
         m_pinned.clear();
         m_pin_set.clear();
+        clearPartialReads();
 
         std::string filename = name;
         Path temp(filename);
@@ -1291,10 +1469,14 @@ namespace ifap
     {
         // Navigation defines a new pin window (current image + prefetch window).
         // Establish it before lookup/creation so the visible image is routed to
-        // the eviction-immune overlay and protected from this point on.
+        // the eviction-immune overlay and protected from this point on. Then abort
+        // every other in-flight prepare/decode so the worker can start this file
+        // immediately (prefetch resumes from update()/tickPrefetch once prepare
+        // completes).
         if (priority)
         {
             repin(index);
+            abortNonPriorityWork(index);
         }
 
         auto entry = lookupTask(index);
@@ -1478,6 +1660,9 @@ namespace ifap
         // Refresh the pin window first so the visible image and its prefetch window
         // are in the eviction-immune overlay before cancelStaleDecodes()/tickPrefetch()
         // run (a prefetch insert here could otherwise evict the just-navigated image).
+        // Prefetch itself is gated inside tickPrefetch until the visible image has
+        // finished prepare; abortNonPriorityWork() (from getTexture priority) already
+        // cleared competing I/O on navigation.
         repin(priority_index);
 
         cancelStaleDecodes(priority_index);
