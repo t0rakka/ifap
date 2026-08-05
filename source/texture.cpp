@@ -1184,9 +1184,12 @@ namespace ifap
         m_pin_set.clear();
 
         std::string filename = name;
-        Path temp(filename);
+        const std::string pathname = getPath(filename);
+        const std::string basename = removePath(filename);
+        Path temp(pathname);
 
-        if (temp.isFile(filename))
+        // Path::isFile() takes a name relative to the path's directory, not the full path.
+        if (!basename.empty() && temp.isFile(basename))
         {
             if (Mapper::isCustomMapper(filename))
             {
@@ -1202,10 +1205,9 @@ namespace ifap
                     return -1u;
                 }
 
-                std::string pathname = getPath(filename);
                 m_current_path = std::make_shared<Path>(pathname);
                 m_indexer.start(pathname);
-                filename = removePath(filename);
+                filename = basename;
             }
         }
         else

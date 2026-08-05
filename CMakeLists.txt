@@ -1,14 +1,15 @@
 cmake_minimum_required(VERSION 3.19)
-project(ifap)
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+project(ifap LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ----------------------------------------------------------------------
-# source files
-# ----------------------------------------------------------------------
-
-FILE(GLOB sources
+file(GLOB sources
     "source/*.cpp"
     "source/*.hpp"
     "source/render/*.cpp"
@@ -18,65 +19,31 @@ FILE(GLOB sources
     "source/resource/ifap.rc"
 )
 
-# ----------------------------------------------------------------------
-# build executable
-# ----------------------------------------------------------------------
-
 add_executable(ifap WIN32 ${sources})
 
-# ----------------------------------------------------------------------
-# configuration
-# ----------------------------------------------------------------------
-
-message(STATUS "Compiler: " ${CMAKE_CXX_COMPILER_ID})
-
-if (CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
-    # msvc is set by cmake
-elseif (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    set(CLANG 1)
-elseif (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Intel")
-    set(GCC 1)
-endif ()
-
-if (MSVC)
-    add_compile_options(/Ox)
-else ()
-    add_compile_options(-Wall -O3)
-endif ()
-
-if (CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
-    add_compile_options(-mavx)
-elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "(arm)")
-    if (!APPLE)
-        # The compiler for Apple Silicons CPUs don't recognize these
-        add_definitions (-mfpu=neon -mfloat-abi=hard)
-    endif()
-    set(CMAKE_CXX_FLAGS "-fpermissive -Wno-psabi")
-endif ()
-
-if (NOT WIN32)
-    add_definitions (-Wno-switch)
-endif ()
-
-find_package(mango REQUIRED)
-target_link_libraries(ifap PUBLIC mango::mango)
 target_include_directories(ifap PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/source)
 
-if (NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release)
+if(MSVC)
+    target_compile_options(ifap PRIVATE
+        /W3
+        $<$<CONFIG:Release>:/Ox>
+    )
+    target_compile_definitions(ifap PRIVATE UNICODE _UNICODE)
+else()
+    target_compile_options(ifap PRIVATE
+        -Wall
+        $<$<CONFIG:Release>:-O3>
+    )
+    if(NOT WIN32)
+        target_compile_options(ifap PRIVATE -Wno-switch)
+    endif()
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i[3-6]86)$")
+        target_compile_options(ifap PRIVATE -mavx)
+    endif()
 endif()
 
+find_package(mango REQUIRED)
+target_link_libraries(ifap PRIVATE mango::mango)
+
+message(STATUS "Compiler: ${CMAKE_CXX_COMPILER_ID}")
 message(STATUS "Build: ${CMAKE_BUILD_TYPE}")
-
-if (APPLE)
-
-    # fix wrapped compiler dropping /usr/local
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -I/usr/local/include")
-    #link_directories("/usr/local/lib")
-
-elseif (UNIX)
-elseif (WIN32)
-
-    target_compile_options(ifap PUBLIC "/DUNICODE")
-
-endif ()

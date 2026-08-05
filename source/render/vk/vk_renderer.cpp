@@ -364,8 +364,6 @@ namespace ifap
 
         vkCreateSemaphore(m_device, &timelineInfo, nullptr, &m_timeline);
 
-        const VkSurfaceFormatKHR selectedFormat = window.surfaceFormat();
-
         VkCommandPoolCreateInfo poolInfo =
         {
             .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
