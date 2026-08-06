@@ -19,15 +19,13 @@ namespace ifap
     class VKAppWindow : public VulkanWindow
     {
     protected:
-        Instance& m_instance;
         const CommandLine& m_commands;
         std::unique_ptr<VKRenderer> m_renderer;
         std::unique_ptr<AppView> m_app;
 
     public:
-        VKAppWindow(Instance& instance, const CommandLine& commands, const VulkanDeviceConfig& config)
-            : VulkanWindow(instance, 1280, 800, 0, &config)
-            , m_instance(instance)
+        VKAppWindow(VulkanContext& context, const CommandLine& commands, const VulkanDeviceConfig& config)
+            : VulkanWindow(context, 1280, 800, 0, &config)
             , m_commands(commands)
         {
         }
@@ -42,7 +40,7 @@ namespace ifap
             selection.isHdr = isHDR(selection.format);
             logSurfaceFormats(physicalDevice(), surface(), &selection);
 
-            m_renderer = std::make_unique<VKRenderer>(*this, m_instance);
+            m_renderer = std::make_unique<VKRenderer>(*this);
             m_renderer->initialize();
             m_app = std::make_unique<AppView>(*this, *m_renderer);
             m_app->startup(m_commands);
@@ -113,14 +111,17 @@ namespace ifap
         deviceConfig.surfaceFormatIntent = SurfaceFormatIntent::HDR;
 
         Instance instance = createVulkanInstance(parsed.options.validate);
-        VKAppWindow window(instance, parsed.commands, deviceConfig);
+        VulkanContext context(instance);
+        VKAppWindow window(context, parsed.commands, deviceConfig);
         window.setTitle("iFap Image Viewer");
 
         EventLoopConfig config;
         config.mode = FrameMode::OnDemand;
         config.waitForFrame = true;
 
-        window.enterEventLoop(config);
+        EventLoop loop;
+        loop.attach(window, config);
+        loop.run();
     }
 
 } // namespace ifap

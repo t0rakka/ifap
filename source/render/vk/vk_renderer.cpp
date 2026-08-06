@@ -315,7 +315,7 @@ namespace ifap
         bool isTextureUploadComplete(TextureHandle handle) const;
         bool isTextureLayoutReady(TextureHandle handle) const;
 
-        Impl(VulkanWindow& window, Instance& instance);
+        Impl(VulkanWindow& window);
         ~Impl();
 
         void initialize();
@@ -336,7 +336,7 @@ namespace ifap
         int getMaxTextureDimension() const;
     };
 
-    VKRenderer::Impl::Impl(VulkanWindow& window, Instance& instance)
+    VKRenderer::Impl::Impl(VulkanWindow& window)
         : m_window(window)
         , m_physicalDevice(window.physicalDevice())
         , m_device(window.device())
@@ -347,7 +347,7 @@ namespace ifap
         vkGetPhysicalDeviceProperties(m_physicalDevice, &deviceProperties);
         m_max_texture_dimension = int(deviceProperties.limits.maxImageDimension2D);
 
-        m_allocator = std::make_unique<Allocator>(instance, m_physicalDevice, m_device, VK_API_VERSION_1_3);
+        m_allocator = std::make_unique<Allocator>(window.instance(), m_physicalDevice, m_device, VK_API_VERSION_1_3);
 
         VkSemaphoreTypeCreateInfo timelineType =
         {
@@ -1768,8 +1768,8 @@ namespace ifap
         m_frame_active = false;
     }
 
-    VKRenderer::VKRenderer(VulkanWindow& window, Instance& instance)
-        : m_impl(std::make_unique<Impl>(window, instance))
+    VKRenderer::VKRenderer(VulkanWindow& window)
+        : m_impl(std::make_unique<Impl>(window))
     {
     }
 

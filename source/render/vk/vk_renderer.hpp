@@ -11,7 +11,6 @@
 
 namespace mango::vulkan
 {
-    class Instance;
     class VulkanWindow;
 }
 
@@ -25,7 +24,7 @@ namespace ifap
         std::unique_ptr<Impl> m_impl;
 
     public:
-        VKRenderer(mango::vulkan::VulkanWindow& window, mango::vulkan::Instance& instance);
+        VKRenderer(mango::vulkan::VulkanWindow& window);
         ~VKRenderer();
 
         void initialize();
