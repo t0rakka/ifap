@@ -114,6 +114,26 @@ namespace ifap
             const bool explicit_gamma = color.gamma != 0.0f;
             const bool bt709 = prim == ColorPrimaries::BT709;
 
+            // Block-compressed LDR (ASTC, BC, etc.): the CPU decompressor outputs
+            // gamma-encoded bytes for SRGB-tagged blocks. Bake to scene-linear fp16
+            // before the HDR resolve pass — same contract as the wide-gamut path, and
+            // avoids relying on VkFormat sRGB sampling quirks for uploaded decode buffers.
+            if (header.compression != TextureCompression::NONE && !is_float)
+            {
+                TextureCompression info(header.compression);
+                plan.bitmap_format = decodeBitmapFormat(header);
+                if (!info.isLinear())
+                {
+                    plan.convert = true;
+                    plan.upload_format = PixelFormat::RGBA16F;
+                }
+                else
+                {
+                    plan.upload_format = PixelFormat::RGBA8_UNORM;
+                }
+                return plan;
+            }
+
             // Fast GPU paths: BT.709 primaries, no ICC, no explicit gamma, transfer the
             // VkFormat can express (sRGB hardware decode or linear passthrough).
             if (bt709 && !has_icc && !explicit_gamma)
@@ -639,7 +659,7 @@ namespace ifap
             // per-frame draw path never reads dims/format while we write them here.
             task->bitmap_format = plan.bitmap_format;
             task->header_format = plan.upload_format;
-            task->header_linear = true; // sampled texels are scene-linear in every path
+            task->header_linear = plan.convert || plan.upload_format != PixelFormat::RGBA8_SRGB;
             task->needs_color_convert = plan.convert;
             task->header_color = header.color;
             task->header_width = header.width;
