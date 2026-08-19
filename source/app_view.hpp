@@ -4,10 +4,11 @@
 */
 #pragma once
 
+#include <string_view>
+
 #include "context.hpp"
 #include "texture.hpp"
 #include "render/vk/vk_renderer.hpp"
-#include "window.hpp"
 
 #include <mango/window/window.hpp>
 
@@ -100,7 +101,7 @@ namespace ifap
         AppView(Window& window, VKRenderer& renderer);
         ~AppView();
 
-        void startup(const CommandLine& commands);
+        void startup(std::string_view initial_path = {});
 
         void onClose();
         void onMouseMove(int x, int y);

@@ -3,7 +3,6 @@
     Copyright 2013-2025 Twilight 3D Finland Oy. All rights reserved.
 */
 #include "window.hpp"
-#include "command_line.hpp"
 #include "app_view.hpp"
 #include "render/vk/vk_renderer.hpp"
 
@@ -16,17 +15,44 @@ namespace ifap
     using namespace mango::filesystem;
     using namespace mango::vulkan;
 
+    namespace
+    {
+        struct IfapArgs
+        {
+            bool validate = false;
+            bool info = false;
+        };
+
+        void configureParser(CommandLineParser& parser, IfapArgs& args)
+        {
+            parser.usage("[options] [image-or-folder]");
+
+            parser.flag("--info", "enable decode timing and informational output",
+                [&]()
+                {
+                    args.info = true;
+                });
+
+            parser.flag("--validate", "enable Khronos validation layer",
+                [&]()
+                {
+                    args.validate = true;
+                });
+        }
+
+    } // namespace
+
     class VKAppWindow : public VulkanWindow
     {
     protected:
-        const CommandLine& m_commands;
+        std::string_view m_initial_path;
         std::unique_ptr<VKRenderer> m_renderer;
         std::unique_ptr<AppView> m_app;
 
     public:
-        VKAppWindow(VulkanContext& context, const CommandLine& commands, const VulkanDeviceConfig& config)
+        VKAppWindow(VulkanContext& context, std::string_view initial_path, const VulkanDeviceConfig& config)
             : VulkanWindow(context, 1280, 800, 0, &config)
-            , m_commands(commands)
+            , m_initial_path(initial_path)
         {
         }
 
@@ -43,7 +69,7 @@ namespace ifap
             m_renderer = std::make_unique<VKRenderer>(*this);
             m_renderer->initialize();
             m_app = std::make_unique<AppView>(*this, *m_renderer);
-            m_app->startup(m_commands);
+            m_app->startup(m_initial_path);
         }
 
         void onSwapchainResize(VkExtent2D extent) override
@@ -100,19 +126,32 @@ namespace ifap
 
     void runApp(const CommandLine& commands)
     {
-        const ParsedCommandLine parsed = parseCommandLine(commands);
+        IfapArgs args;
+        CommandLineParser parser;
+        configureParser(parser, args);
 
-        if (parsed.options.info)
+        if (!parser.parse(commands))
+        {
+            return;
+        }
+
+        if (args.info)
         {
             printEnable(Print::Info, true);
+        }
+
+        std::string_view initial_path;
+        if (!parser.positionals().empty())
+        {
+            initial_path = parser.positionals()[0];
         }
 
         VulkanDeviceConfig deviceConfig;
         deviceConfig.surfaceFormatIntent = SurfaceFormatIntent::HDR;
 
-        Instance instance = createVulkanInstance(parsed.options.validate);
+        Instance instance = createVulkanInstance(args.validate);
         VulkanContext context(instance);
-        VKAppWindow window(context, parsed.commands, deviceConfig);
+        VKAppWindow window(context, initial_path, deviceConfig);
         window.setTitle("iFap Image Viewer");
 
         EventLoopConfig config;

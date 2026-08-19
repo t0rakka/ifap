@@ -50,15 +50,15 @@ namespace ifap
         m_texture_cache.shutdown();
     }
 
-    void AppView::startup(const CommandLine& commands)
+    void AppView::startup(std::string_view initial_path)
     {
         m_left_time = 0;
         m_right_time = 0;
 
-        if (commands.size() > 1)
+        if (!initial_path.empty())
         {
             FileIndex index;
-            index.emplace(std::string(commands[1]));
+            index.emplace(std::string(initial_path));
             onDropFiles(index);
         }
     }

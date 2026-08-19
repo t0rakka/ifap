@@ -4,14 +4,11 @@
 */
 #pragma once
 
-#include <vector>
-#include <string_view>
+#include <mango/core/system.hpp>
 
 namespace ifap
 {
 
-    using CommandLine = std::vector<std::string_view>;
-
-    void runApp(const CommandLine& commands);
+    void runApp(const mango::CommandLine& commands);
 
 } // namespace ifap
