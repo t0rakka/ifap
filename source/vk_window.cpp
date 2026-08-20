@@ -21,6 +21,7 @@ namespace ifap
         {
             bool validate = false;
             bool info = false;
+            bool sdr = false;
         };
 
         void configureParser(CommandLineParser& parser, IfapArgs& args)
@@ -38,6 +39,12 @@ namespace ifap
                 {
                     args.validate = true;
                 });
+
+            parser.flag("--sdr", "force SDR swapchain (sRGB / Rec.709)",
+                [&]()
+                {
+                    args.sdr = true;
+                });
         }
 
     } // namespace
@@ -46,6 +53,7 @@ namespace ifap
     {
     protected:
         std::string_view m_initial_path;
+        SurfaceFormatIntent m_requestedFormat = SurfaceFormatIntent::HDR;
         std::unique_ptr<VKRenderer> m_renderer;
         std::unique_ptr<AppView> m_app;
 
@@ -53,6 +61,7 @@ namespace ifap
         VKAppWindow(VulkanContext& context, std::string_view initial_path, const VulkanDeviceConfig& config)
             : VulkanWindow(context, 1280, 800, 0, &config)
             , m_initial_path(initial_path)
+            , m_requestedFormat(config.surfaceFormatIntent)
         {
         }
 
@@ -60,11 +69,7 @@ namespace ifap
 
         void onDeviceReady() override
         {
-            SurfaceFormatSelection selection;
-            selection.format = surfaceFormat();
-            selection.requested = SurfaceFormatIntent::HDR;
-            selection.isHdr = isHDR(selection.format);
-            logSurfaceFormats(physicalDevice(), surface(), &selection);
+            logSurfaceFormats(*this, m_requestedFormat);
 
             m_renderer = std::make_unique<VKRenderer>(*this);
             m_renderer->initialize();
@@ -147,7 +152,8 @@ namespace ifap
         }
 
         VulkanDeviceConfig deviceConfig;
-        deviceConfig.surfaceFormatIntent = SurfaceFormatIntent::HDR;
+        applyRecommendedSurfaceFormats(deviceConfig,
+            args.sdr ? SurfaceFormatIntent::SDR : SurfaceFormatIntent::HDR);
 
         Instance instance = createVulkanInstance(args.validate);
         VulkanContext context(instance);

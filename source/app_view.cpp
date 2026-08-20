@@ -152,6 +152,7 @@ namespace ifap
             request.width = texture.sample_width;
             request.height = texture.sample_height;
             request.linear = texture.linear;
+            request.needs_tonemap = texture.needs_tonemap;
         }
         request.translate = translate;
         request.scale = scale;

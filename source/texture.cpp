@@ -80,6 +80,46 @@ namespace ifap
             bool        convert = false;                         // linearize() to scene-linear BT.709
         };
 
+        // True when scene-linear values can exceed display range and SDR resolve should
+        // tonemap (Reinhard). LDR sRGB/8-bit and block-compressed LDR stay false.
+        bool isHdrContent(const ImageHeader& header, const ColorPlan& plan)
+        {
+            if (header.format.isFloat())
+            {
+                return true;
+            }
+
+            if (header.linear)
+            {
+                return true;
+            }
+
+            TransferFunction transfer = header.color.transfer;
+            if (transfer == TransferFunction::Unspecified)
+            {
+                transfer = TransferFunction::sRGB;
+            }
+
+            if (transfer == TransferFunction::PQ || transfer == TransferFunction::HLG)
+            {
+                return true;
+            }
+
+            // Block-compressed LDR: baked to scene-linear fp16 but still display-range.
+            if (header.compression != TextureCompression::NONE)
+            {
+                return false;
+            }
+
+            // 16-bit linear integer (HDR PNG): transfer is Linear, header.linear usually set.
+            if (plan.convert && header.format.bits > 32)
+            {
+                return transfer == TransferFunction::Linear;
+            }
+
+            return false;
+        }
+
         // Decides how an image reaches the sampler as scene-linear BT.709:
         //   - fast GPU paths use the VkFormat alone (RGBA8_SRGB hw-decode, or linear
         //     UNORM/float passthrough) for BT.709 sRGB/linear content;
@@ -229,6 +269,7 @@ namespace ifap
             texture.sample_height = task.header_sample_height;
             texture.format = task.header_format;
             texture.linear = task.header_linear;
+            texture.needs_tonemap = task.header_needs_tonemap;
             task.header_applied = true;
         }
 
@@ -660,6 +701,7 @@ namespace ifap
             task->bitmap_format = plan.bitmap_format;
             task->header_format = plan.upload_format;
             task->header_linear = plan.convert || plan.upload_format != PixelFormat::RGBA8_SRGB;
+            task->header_needs_tonemap = isHdrContent(header, plan);
             task->needs_color_convert = plan.convert;
             task->header_color = header.color;
             task->header_width = header.width;

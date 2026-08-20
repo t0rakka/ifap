@@ -67,6 +67,7 @@ namespace ifap
         int header_sample_height = 0;
         PixelFormat header_format = PixelFormat::RGBA8_UNORM;
         bool header_linear = false;
+        bool header_needs_tonemap = false;
         bool header_applied = false; // UI-only guard for one-shot promotion
 
         Format bitmap_format;

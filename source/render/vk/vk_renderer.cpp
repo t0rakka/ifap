@@ -265,6 +265,8 @@ namespace ifap
         bool m_blend_enabled = true;
         int m_max_texture_dimension = 0;
         float m_clear_color[4] = { 0.06f, 0.06f, 0.06f, 1.0f };
+        OutputTransformOptions m_outputOptions;
+        bool m_content_needs_tonemap = false;
 
         // The unified GPU clock. Every queue submission (upload, clear, frame) signals
         // ++m_timelineValue; resources record the value of their last use and are
@@ -290,6 +292,7 @@ namespace ifap
         void createRenderTarget();
         void destroyRenderTarget();
         void ensureRenderTarget();
+        void updateOutputOptions(bool needs_tonemap);
         void beginCommandBufferRecording();
         void beginProcessingRendering();
         void endProcessingRendering();
@@ -379,6 +382,7 @@ namespace ifap
         createGeometry();
         createPipelines();
         createContentDescriptors();
+        updateOutputOptions(false);
         createRenderTarget();
     }
 
@@ -495,7 +499,20 @@ namespace ifap
         }
 
         createContentDescriptors();
+        updateOutputOptions(m_content_needs_tonemap);
         createRenderTarget();
+    }
+
+    void VKRenderer::Impl::updateOutputOptions(bool needs_tonemap)
+    {
+        const VkSurfaceFormatKHR surfaceFormat = swapchain().getSurfaceFormat();
+
+        m_outputOptions = defaultOutputOptions(surfaceFormat);
+        if (!isHDR(surfaceFormat))
+        {
+            m_outputOptions.tonemap = needs_tonemap ? TonemapMode::Reinhard : TonemapMode::None;
+        }
+        m_content_needs_tonemap = needs_tonemap;
     }
 
     VkFormat VKRenderer::Impl::toVkFormat(PixelFormat format)
@@ -1621,7 +1638,7 @@ namespace ifap
         const u32 imageIndex = m_frame.imageIndex();
         VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
 
-        m_renderTarget->resolve(commandBuffer, swapchain(), imageIndex);
+        m_renderTarget->resolve(commandBuffer, swapchain(), imageIndex, &m_outputOptions);
     }
 
     void VKRenderer::Impl::recordDraw(const ImageDrawRequest& request)
@@ -1635,6 +1652,12 @@ namespace ifap
         if (!texture->layout_ready)
         {
             return;
+        }
+
+        if (!isHDR(swapchain().getSurfaceFormat()) &&
+            request.needs_tonemap != m_content_needs_tonemap)
+        {
+            updateOutputOptions(request.needs_tonemap);
         }
 
         const u32 imageIndex = m_frame.imageIndex();

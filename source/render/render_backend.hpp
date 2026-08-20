@@ -37,6 +37,7 @@ namespace ifap
         int sample_height = 0;
         PixelFormat format = PixelFormat::RGBA8_UNORM;
         bool linear = false;
+        bool needs_tonemap = false;
 
         explicit operator bool () const
         {
@@ -50,6 +51,7 @@ namespace ifap
         int width = 0;
         int height = 0;
         bool linear = false;
+        bool needs_tonemap = false;
 
         float32x2 translate;
         float32x2 scale;
