@@ -73,6 +73,11 @@ namespace ifap
         u64 m_left_time = 0;
         u64 m_right_time = 0;
 
+        bool m_nav_pending = false;
+        size_t m_pending_nav_index = 0;
+        u64 m_last_nav_input_ms = 0;
+        u64 m_last_nav_commit_ms = 0;
+
         std::shared_ptr<DecodeTask> m_current_task;
         size_t m_current_index = 0;
 
@@ -84,7 +89,9 @@ namespace ifap
         WorkerUtilizationOverlay m_debug_overlay;
         u64 m_debug_next_sample_ms = 0;
 
-        void nextImage(int direction);
+        void commitNavigation(size_t index);
+        void tryCommitNavigation(bool force = false);
+        void nextImage(int direction, bool latch = false);
         void resetTransformation();
 
         float32x2 computeAspect() const;

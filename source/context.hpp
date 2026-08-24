@@ -43,4 +43,8 @@ namespace ifap
     static constexpr u64 repeat_treshold = 420;
     static constexpr u64 repeat_delay = 3;
 
+    // While arrow keys auto-repeat (~3 ms), only commit a new visible index this often
+    // so the priority decode can surface pixels instead of staying on gray placeholders.
+    static constexpr u64 nav_latch_interval_ms = 10;
+
 } // namespace ifap

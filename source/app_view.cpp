@@ -72,23 +72,79 @@ namespace ifap
         }
     }
 
-    void AppView::nextImage(int direction)
+    void AppView::commitNavigation(size_t index)
     {
-        if (direction)
+        const ImageFileIndexer& indexer = m_texture_cache;
+        const size_t count = indexer.size();
+        if (!count)
         {
-            const ImageFileIndexer& indexer = m_texture_cache;
-            size_t count = indexer.size();
-            if (!count)
+            return;
+        }
+
+        m_current_index = modulo(index, count);
+        m_nav_pending = false;
+        m_pending_nav_index = m_current_index;
+        m_last_nav_commit_ms = mango::Time::ms();
+        m_current_task = m_texture_cache.getTexture(m_current_index, true);
+        resetTransformation();
+        m_awaiting_display = true;
+    }
+
+    void AppView::tryCommitNavigation(bool force)
+    {
+        if (!m_nav_pending)
+        {
+            return;
+        }
+
+        const u64 now = mango::Time::ms();
+        const bool due = (now - m_last_nav_commit_ms) >= nav_latch_interval_ms;
+        const bool quiet = (now - m_last_nav_input_ms) >= nav_latch_interval_ms;
+        if (!force && !due && !quiet)
+        {
+            return;
+        }
+
+        if (m_pending_nav_index == m_current_index)
+        {
+            if (force || quiet)
             {
-                return;
+                m_nav_pending = false;
             }
+            return;
+        }
 
-            m_current_index = modulo(m_current_index + direction, count);
-            m_texture_cache.setPrefetchDirection(direction);
-            m_current_task = m_texture_cache.getTexture(m_current_index, true);
+        commitNavigation(m_pending_nav_index);
+    }
 
-            resetTransformation();
-            m_awaiting_display = true;
+    void AppView::nextImage(int direction, bool latch)
+    {
+        if (!direction)
+        {
+            return;
+        }
+
+        const ImageFileIndexer& indexer = m_texture_cache;
+        const size_t count = indexer.size();
+        if (!count)
+        {
+            return;
+        }
+
+        m_texture_cache.setPrefetchDirection(direction);
+        m_last_nav_input_ms = mango::Time::ms();
+
+        if (latch)
+        {
+            const size_t base = m_nav_pending ? m_pending_nav_index : m_current_index;
+            m_pending_nav_index = modulo(base + direction, count);
+            m_nav_pending = true;
+            tryCommitNavigation(false);
+        }
+        else
+        {
+            const size_t index = modulo(m_current_index + direction, count);
+            commitNavigation(index);
         }
     }
 
@@ -437,10 +493,8 @@ namespace ifap
         size_t index = m_texture_cache.setCurrentPath(object.name);
         if (index != -1u)
         {
-            m_current_index = index;
-            m_current_task = m_texture_cache.getTexture(m_current_index, true);
-            resetTransformation();
-            m_awaiting_display = true;
+            m_nav_pending = false;
+            commitNavigation(index);
             requestRedraw();
             m_window.dispatchFrame();
         }
@@ -510,22 +564,30 @@ namespace ifap
 
         u64 current_time = mango::Time::ms();
 
-        if (m_window.isKeyPressed(KEYCODE_LEFT) || m_window.isKeyPressed(KEYCODE_Q))
+        const bool nav_left = m_window.isKeyPressed(KEYCODE_LEFT) || m_window.isKeyPressed(KEYCODE_Q);
+        const bool nav_right = m_window.isKeyPressed(KEYCODE_RIGHT) || m_window.isKeyPressed(KEYCODE_W);
+
+        if (nav_left)
         {
             if (current_time - m_left_time > repeat_treshold)
             {
                 m_left_time = current_time - (repeat_treshold - repeat_delay);
-                nextImage(-1);
+                nextImage(-1, true);
             }
         }
 
-        if (m_window.isKeyPressed(KEYCODE_RIGHT) || m_window.isKeyPressed(KEYCODE_W))
+        if (nav_right)
         {
             if (current_time - m_right_time > repeat_treshold)
             {
                 m_right_time = current_time - (repeat_treshold - repeat_delay);
-                nextImage(1);
+                nextImage(1, true);
             }
+        }
+
+        if (!nav_left && !nav_right)
+        {
+            tryCommitNavigation(true);
         }
 
         // Input and texture work before swapchain acquire so event handling stays
