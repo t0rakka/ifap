@@ -117,4 +117,41 @@ namespace ifap::shaders
         )" + detail::g_cubic + detail::g_texture_filter + detail::g_processing_fragment_bicubic_main;
     }
 
+    inline std::string solidVertexShader()
+    {
+        return std::string(R"(#version 450
+            layout(location = 0) in vec2 inPosition;
+            layout(location = 0) out vec2 vTexcoord;
+            layout(push_constant) uniform Push
+            {
+                layout(offset = 0) vec4 uTransform;
+                layout(offset = 16) vec4 uColor;
+            } pc;
+            #define uTransform pc.uTransform
+            void main()
+            {
+                vTexcoord = inPosition * vec2(0.5, 0.5) + vec2(0.5);
+                gl_Position = vec4((inPosition + uTransform.xy) * uTransform.zw, 0.0, 1.0);
+            }
+        )");
+    }
+
+    inline std::string solidFragmentShader()
+    {
+        return R"(#version 450
+            layout(location = 0) in vec2 vTexcoord;
+            layout(location = 0) out vec4 outColor;
+            layout(push_constant) uniform Push
+            {
+                layout(offset = 0) vec4 uTransform;
+                layout(offset = 16) vec4 uColor;
+            } pc;
+            void main()
+            {
+                vec4 c = pc.uColor;
+                outColor = vec4(c.rgb * c.a, c.a);
+            }
+        )";
+    }
+
 } // namespace ifap::shaders

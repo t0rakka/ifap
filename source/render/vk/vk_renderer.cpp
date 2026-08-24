@@ -28,6 +28,12 @@ namespace ifap
             float texScale[2];
         };
 
+        struct SolidPushConstants
+        {
+            float transform[4];
+            float color[4];
+        };
+
         static_assert(offsetof(ProcessingPushConstants, texScale) == 16);
         static_assert(sizeof(ProcessingPushConstants) == 24);
 
@@ -51,9 +57,27 @@ namespace ifap
             return state;
         }
 
+        VkPipelineColorBlendAttachmentState makePremultipliedBlendAttachment(bool blend)
+        {
+            VkPipelineColorBlendAttachmentState state =
+            {
+                .blendEnable = blend ? VK_TRUE : VK_FALSE,
+                .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
+                .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                .colorBlendOp = VK_BLEND_OP_ADD,
+                .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+                .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                .alphaBlendOp = VK_BLEND_OP_ADD,
+                .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                  VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+            };
+
+            return state;
+        }
+
         VkPipeline createGraphicsPipeline(VkDevice device, VkFormat colorFormat, VkPipelineLayout layout,
                                           VkShaderModule vertexShader, VkShaderModule fragmentShader,
-                                          bool blend)
+                                          bool blend, bool premultiplied = false)
         {
             VkPipelineShaderStageCreateInfo stages[] =
             {
@@ -138,7 +162,9 @@ namespace ifap
                 .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
             };
 
-            VkPipelineColorBlendAttachmentState blendAttachment = makeBlendAttachment(blend);
+            VkPipelineColorBlendAttachmentState blendAttachment = premultiplied
+                ? makePremultipliedBlendAttachment(blend)
+                : makeBlendAttachment(blend);
 
             VkPipelineColorBlendStateCreateInfo colorBlending =
             {
@@ -175,6 +201,18 @@ namespace ifap
             return pipeline;
         }
 
+        void pixelRectToTransform(int x, int y, int w, int h, int win_w, int win_h, float out[4])
+        {
+            const float sx = float(w) / float(std::max(win_w, 1));
+            const float sy = float(h) / float(std::max(win_h, 1));
+            const float cx = 2.0f * (float(x) + float(w) * 0.5f) / float(std::max(win_w, 1)) - 1.0f;
+            const float cy = 1.0f - 2.0f * (float(y) + float(h) * 0.5f) / float(std::max(win_h, 1));
+            out[0] = cx / sx;
+            out[1] = cy / sy;
+            out[2] = sx;
+            out[3] = sy;
+        }
+
     } // namespace
 
     struct VKRenderer::Impl
@@ -209,6 +247,10 @@ namespace ifap
         VkPipeline m_pipelineBilinearNoBlend = VK_NULL_HANDLE;
         VkPipeline m_pipelineBicubicBlend = VK_NULL_HANDLE;
         VkPipeline m_pipelineBicubicNoBlend = VK_NULL_HANDLE;
+        VkShaderModule m_solidVertexShader = VK_NULL_HANDLE;
+        VkShaderModule m_solidFragmentShader = VK_NULL_HANDLE;
+        VkPipelineLayout m_solidPipelineLayout = VK_NULL_HANDLE;
+        VkPipeline m_pipelineSolidBlend = VK_NULL_HANDLE;
         std::unique_ptr<RenderTarget> m_renderTarget;
         BufferAllocation m_vertexBuffer;
         VkSampler m_samplerNearest = VK_NULL_HANDLE;
@@ -315,6 +357,8 @@ namespace ifap
         VkSampler selectSampler(TextureFilter filter) const;
         VkPipeline selectPipeline(const ImageDrawRequest& request) const;
         void recordDraw(const ImageDrawRequest& request);
+        void recordSolidRect(int x, int y, int width, int height, float r, float g, float b, float a);
+        void ensureProcessingRendering();
         bool isTextureUploadComplete(TextureHandle handle) const;
         bool isTextureLayoutReady(TextureHandle handle) const;
 
@@ -325,6 +369,7 @@ namespace ifap
         void resize(int width, int height);
         bool beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend);
         void drawImage(const ImageDrawRequest& request);
+        void drawSolidRect(int x, int y, int width, int height, float r, float g, float b, float a);
         void endFrame();
         TextureHandle createTexture(int width, int height, PixelFormat format, const void* initial_data);
         void uploadTextureRegion(TextureHandle handle, PixelFormat format,
@@ -337,6 +382,8 @@ namespace ifap
         void setUploadBytesPerFrame(size_t bytes);
         void freeTextureResources(GpuTexture& texture, TextureHandle handle);
         int getMaxTextureDimension() const;
+        int swapchainWidth() const;
+        int swapchainHeight() const;
     };
 
     VKRenderer::Impl::Impl(VulkanWindow& window)
@@ -434,6 +481,21 @@ namespace ifap
                 vkDestroyShaderModule(m_device, m_processingFragmentShaderBicubic, nullptr);
             }
 
+            if (m_solidVertexShader)
+            {
+                vkDestroyShaderModule(m_device, m_solidVertexShader, nullptr);
+            }
+
+            if (m_solidFragmentShader)
+            {
+                vkDestroyShaderModule(m_device, m_solidFragmentShader, nullptr);
+            }
+
+            if (m_solidPipelineLayout)
+            {
+                vkDestroyPipelineLayout(m_device, m_solidPipelineLayout, nullptr);
+            }
+
             m_allocator->destroyBuffer(m_vertexBuffer);
             m_vertexBuffer = {};
 
@@ -479,6 +541,16 @@ namespace ifap
     int VKRenderer::Impl::getMaxTextureDimension() const
     {
         return m_max_texture_dimension;
+    }
+
+    int VKRenderer::Impl::swapchainWidth() const
+    {
+        return int(swapchain().getExtent().width);
+    }
+
+    int VKRenderer::Impl::swapchainHeight() const
+    {
+        return int(swapchain().getExtent().height);
     }
 
     void VKRenderer::Impl::resize(int width, int height)
@@ -1215,6 +1287,9 @@ namespace ifap
 
         m_pipelineBicubicNoBlend = createGraphicsPipeline(m_device, kProcessingFormat, m_processingPipelineLayout,
             m_processingVertexShader, m_processingFragmentShaderBicubic, false);
+
+        m_pipelineSolidBlend = createGraphicsPipeline(m_device, kProcessingFormat, m_solidPipelineLayout,
+            m_solidVertexShader, m_solidFragmentShader, true, true);
     }
 
     void VKRenderer::Impl::destroyRenderTarget()
@@ -1344,6 +1419,19 @@ namespace ifap
         m_processingVertexShader = Compiler::createShaderModule(m_device, processingVertexShader);
         m_processingFragmentShaderBilinear = Compiler::createShaderModule(m_device, processingBilinear);
         m_processingFragmentShaderBicubic = Compiler::createShaderModule(m_device, processingBicubic);
+
+        const std::string solidVertexSource = shaders::solidVertexShader();
+        const std::string solidFragmentSource = shaders::solidFragmentShader();
+        Shader solidVertexShader = compiler.compile(solidVertexSource.c_str(), ShaderStage::Vertex);
+        Shader solidFragmentShader = compiler.compile(solidFragmentSource.c_str(), ShaderStage::Fragment);
+        if (!solidVertexShader || !solidFragmentShader)
+        {
+            printLine(Print::Error, "VKRenderer: solid overlay shader compilation failed.");
+            return;
+        }
+
+        m_solidVertexShader = Compiler::createShaderModule(m_device, solidVertexShader);
+        m_solidFragmentShader = Compiler::createShaderModule(m_device, solidFragmentShader);
     }
 
     void VKRenderer::Impl::createSamplers()
@@ -1402,6 +1490,22 @@ namespace ifap
 
         vkCreatePipelineLayout(m_device, &processingLayoutInfo, nullptr, &m_processingPipelineLayout);
 
+        VkPushConstantRange solidPushRange =
+        {
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            .offset = 0,
+            .size = sizeof(SolidPushConstants),
+        };
+
+        VkPipelineLayoutCreateInfo solidLayoutInfo =
+        {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &solidPushRange,
+        };
+
+        vkCreatePipelineLayout(m_device, &solidLayoutInfo, nullptr, &m_solidPipelineLayout);
+
         // Sets drawn from this pool: the per-image content ring (image count *
         // kContentDescriptorsPerImage). Textures no longer own a set (the content set
         // is bound from the ring at draw time), so this is small; size generously anyway
@@ -1459,6 +1563,7 @@ namespace ifap
         destroy(m_pipelineBilinearNoBlend);
         destroy(m_pipelineBicubicBlend);
         destroy(m_pipelineBicubicNoBlend);
+        destroy(m_pipelineSolidBlend);
     }
 
     VkSampler VKRenderer::Impl::selectSampler(TextureFilter filter) const
@@ -1735,9 +1840,62 @@ namespace ifap
         vkCmdDraw(commandBuffer, 4, 1, 0, 0);
     }
 
+    void VKRenderer::Impl::ensureProcessingRendering()
+    {
+        if (!m_processing_rendering_active)
+        {
+            beginProcessingRendering();
+        }
+    }
+
+    void VKRenderer::Impl::recordSolidRect(int x, int y, int width, int height,
+                                           float r, float g, float b, float a)
+    {
+        if (!m_frame_active || !m_pipelineSolidBlend || width <= 0 || height <= 0)
+        {
+            return;
+        }
+
+        ensureProcessingRendering();
+        if (!m_processing_rendering_active)
+        {
+            return;
+        }
+
+        const VkExtent2D extent = swapchain().getExtent();
+        if (!extent.width || !extent.height)
+        {
+            return;
+        }
+
+        SolidPushConstants push {};
+        pixelRectToTransform(x, y, width, height, int(extent.width), int(extent.height), push.transform);
+        push.color[0] = r;
+        push.color[1] = g;
+        push.color[2] = b;
+        push.color[3] = a;
+
+        const u32 imageIndex = m_frame.imageIndex();
+        VkCommandBuffer commandBuffer = frameCommandBuffer(imageIndex);
+
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineSolidBlend);
+        vkCmdPushConstants(commandBuffer, m_solidPipelineLayout,
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(SolidPushConstants), &push);
+
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(commandBuffer, 0, 1, &m_vertexBuffer.buffer, &offset);
+        vkCmdDraw(commandBuffer, 4, 1, 0, 0);
+    }
+
     void VKRenderer::Impl::drawImage(const ImageDrawRequest& request)
     {
         recordDraw(request);
+    }
+
+    void VKRenderer::Impl::drawSolidRect(int x, int y, int width, int height,
+                                         float r, float g, float b, float a)
+    {
+        recordSolidRect(x, y, width, height, r, g, b, a);
     }
 
     void VKRenderer::Impl::endFrame()
@@ -1802,8 +1960,14 @@ namespace ifap
     void VKRenderer::resize(int width, int height) { m_impl->resize(width, height); }
     bool VKRenderer::beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend) { return m_impl->beginFrame(clear_r, clear_g, clear_b, clear_a, blend); }
     void VKRenderer::drawImage(const ImageDrawRequest& request) { m_impl->drawImage(request); }
+    void VKRenderer::drawSolidRect(int x, int y, int width, int height, float r, float g, float b, float a)
+    {
+        m_impl->drawSolidRect(x, y, width, height, r, g, b, a);
+    }
     void VKRenderer::endFrame() { m_impl->endFrame(); }
     int VKRenderer::getMaxTextureDimension() const { return m_impl->getMaxTextureDimension(); }
+    int VKRenderer::swapchainWidth() const { return m_impl->swapchainWidth(); }
+    int VKRenderer::swapchainHeight() const { return m_impl->swapchainHeight(); }
     TextureHandle VKRenderer::createTexture(int width, int height, PixelFormat format, const void* initial_data) { return m_impl->createTexture(width, height, format, initial_data); }
     void VKRenderer::uploadTextureRegion(TextureHandle handle, PixelFormat format, int x, int y, int width, int height, const void* pixels) { m_impl->uploadTextureRegion(handle, format, x, y, width, height, pixels); }
     size_t VKRenderer::uploadTextureRegions(TextureHandle handle, PixelFormat format, const TextureRegionUpload* regions, size_t count) { return m_impl->uploadTextureRegions(handle, format, regions, count); }

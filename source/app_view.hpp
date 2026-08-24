@@ -8,6 +8,7 @@
 
 #include "context.hpp"
 #include "texture.hpp"
+#include "debug_overlay.hpp"
 #include "render/vk/vk_renderer.hpp"
 
 #include <mango/window/window.hpp>
@@ -79,6 +80,9 @@ namespace ifap
         bool m_event_loop_running = false;
         bool m_shutdown = false;
         bool m_awaiting_display = false;
+        bool m_debug = false;
+        WorkerUtilizationOverlay m_debug_overlay;
+        u64 m_debug_next_sample_ms = 0;
 
         void nextImage(int direction);
         void resetTransformation();
@@ -92,6 +96,7 @@ namespace ifap
         void renderFrame();
         void requestRedraw();
         void scheduleNextFrame();
+        void scheduleDebugFrame();
         bool needsContinuousUpdate() const;
         bool isContentDisplayed() const;
         bool isExitRequested() const;
@@ -101,7 +106,7 @@ namespace ifap
         AppView(Window& window, VKRenderer& renderer);
         ~AppView();
 
-        void startup(std::string_view initial_path = {});
+        void startup(std::string_view initial_path = {}, bool debug = false);
 
         void onClose();
         void onMouseMove(int x, int y);

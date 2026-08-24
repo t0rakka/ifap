@@ -50,10 +50,19 @@ namespace ifap
         m_texture_cache.shutdown();
     }
 
-    void AppView::startup(std::string_view initial_path)
+    void AppView::startup(std::string_view initial_path, bool debug)
     {
         m_left_time = 0;
         m_right_time = 0;
+        m_debug = debug;
+        m_debug_overlay.reset();
+        m_debug_next_sample_ms = 0;
+
+        if (m_debug)
+        {
+            requestRedraw();
+            scheduleDebugFrame();
+        }
 
         if (!initial_path.empty())
         {
@@ -190,6 +199,16 @@ namespace ifap
         const double hz = m_window.getDisplayRefreshRate();
         const double interval = hz > 0.0 ? (1.0 / hz) : (1.0 / 60.0);
         m_window.requestFrameIn(interval);
+    }
+
+    void AppView::scheduleDebugFrame()
+    {
+        if (isExitRequested())
+        {
+            return;
+        }
+
+        m_window.requestFrameIn(1.0 / double(WorkerUtilizationOverlay::kSampleHz));
     }
 
     bool AppView::isContentDisplayed() const
@@ -450,6 +469,11 @@ namespace ifap
             m_renderer.drawImage(makeDrawRequest());
         }
 
+        if (frame_active && m_debug)
+        {
+            m_debug_overlay.draw(m_renderer, m_renderer.swapchainWidth(), m_renderer.swapchainHeight());
+        }
+
         m_renderer.endFrame();
     }
 
@@ -509,6 +533,19 @@ namespace ifap
         const bool texture_progress = m_texture_cache.update(m_current_index, m_current_task);
 
         renderFrame();
+
+        if (m_debug)
+        {
+            const u64 now = mango::Time::ms();
+            if (m_debug_next_sample_ms == 0 || now >= m_debug_next_sample_ms)
+            {
+                m_debug_overlay.tick();
+                m_debug_next_sample_ms = now + 1000 / WorkerUtilizationOverlay::kSampleHz;
+            }
+
+            scheduleDebugFrame();
+            requestRedraw();
+        }
 
         if (m_current_task && m_current_task->present_settle_frames > 0)
         {

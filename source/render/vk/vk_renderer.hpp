@@ -32,7 +32,11 @@ namespace ifap
 
         bool beginFrame(float clear_r, float clear_g, float clear_b, float clear_a, bool blend);
         void drawImage(const ImageDrawRequest& request);
+        void drawSolidRect(int x, int y, int width, int height, float r, float g, float b, float a);
         void endFrame();
+
+        int swapchainWidth() const;
+        int swapchainHeight() const;
 
         int getMaxTextureDimension() const;
 

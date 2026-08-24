@@ -22,6 +22,7 @@ namespace ifap
             bool validate = false;
             bool info = false;
             bool sdr = false;
+            bool debug = false;
         };
 
         void configureParser(CommandLineParser& parser, IfapArgs& args)
@@ -45,6 +46,12 @@ namespace ifap
                 {
                     args.sdr = true;
                 });
+
+            parser.flag("--debug", "show thread-pool utilization overlay",
+                [&]()
+                {
+                    args.debug = true;
+                });
         }
 
     } // namespace
@@ -54,14 +61,17 @@ namespace ifap
     protected:
         std::string_view m_initial_path;
         SurfaceFormatIntent m_requestedFormat = SurfaceFormatIntent::HDR;
+        bool m_debug = false;
         std::unique_ptr<VKRenderer> m_renderer;
         std::unique_ptr<AppView> m_app;
 
     public:
-        VKAppWindow(VulkanContext& context, std::string_view initial_path, const VulkanDeviceConfig& config)
+        VKAppWindow(VulkanContext& context, std::string_view initial_path,
+                    const VulkanDeviceConfig& config, bool debug)
             : VulkanWindow(context, 1280, 800, 0, &config)
             , m_initial_path(initial_path)
             , m_requestedFormat(config.surfaceFormatIntent)
+            , m_debug(debug)
         {
         }
 
@@ -74,7 +84,7 @@ namespace ifap
             m_renderer = std::make_unique<VKRenderer>(*this);
             m_renderer->initialize();
             m_app = std::make_unique<AppView>(*this, *m_renderer);
-            m_app->startup(m_initial_path);
+            m_app->startup(m_initial_path, m_debug);
         }
 
         void onSwapchainResize(VkExtent2D extent) override
@@ -157,7 +167,7 @@ namespace ifap
 
         Instance instance = createVulkanInstance(args.validate);
         VulkanContext context(instance);
-        VKAppWindow window(context, initial_path, deviceConfig);
+        VKAppWindow window(context, initial_path, deviceConfig, args.debug);
         window.setTitle("iFap Image Viewer");
 
         EventLoopConfig config;
