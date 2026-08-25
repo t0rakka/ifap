@@ -25,29 +25,29 @@ namespace ifap
             bool debug = false;
         };
 
-        void configureParser(CommandLineParser& parser, IfapArgs& args)
+        void configureCommandLine(const CommandLine& commands, IfapArgs& args)
         {
-            parser.usage("[options] [image-or-folder]");
+            commands.usage("[options] [image-or-folder]");
 
-            parser.flag("--info", "enable decode timing and informational output",
+            commands.flag("--info", "enable decode timing and informational output",
                 [&]()
                 {
                     args.info = true;
                 });
 
-            parser.flag("--validate", "enable Khronos validation layer",
+            commands.flag("--validate", "enable Khronos validation layer",
                 [&]()
                 {
                     args.validate = true;
                 });
 
-            parser.flag("--sdr", "force SDR swapchain (sRGB / Rec.709)",
+            commands.flag("--sdr", "force SDR swapchain (sRGB / Rec.709)",
                 [&]()
                 {
                     args.sdr = true;
                 });
 
-            parser.flag("--debug", "show thread-pool utilization overlay",
+            commands.flag("--debug", "show thread-pool utilization overlay",
                 [&]()
                 {
                     args.debug = true;
@@ -142,10 +142,9 @@ namespace ifap
     void runApp(const CommandLine& commands)
     {
         IfapArgs args;
-        CommandLineParser parser;
-        configureParser(parser, args);
+        configureCommandLine(commands, args);
 
-        if (!parser.parse(commands))
+        if (!commands.parse())
         {
             return;
         }
@@ -156,9 +155,9 @@ namespace ifap
         }
 
         std::string_view initial_path;
-        if (!parser.positionals().empty())
+        if (!commands.positionals().empty())
         {
-            initial_path = parser.positionals()[0];
+            initial_path = commands.positionals()[0];
         }
 
         VulkanDeviceConfig deviceConfig;
