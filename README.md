@@ -2,14 +2,18 @@
 
 HDR image viewer built on the [MANGO](https://github.com/t0rakka/mango) multimedia library. iFap decodes images on background worker threads, uploads them to the GPU, and displays them through a Vulkan HDR swapchain with scene-linear processing and colorspace-aware output (PQ HDR10, sRGB, and other surface formats supported by the display).
 
-Open a single file, browse a folder recursively, or open an archive directly. iFap reads images from compressed containers (ZIP, RAR, ISO, HBS, and related comic-book extensions such as CBZ/CBR) without extracting them first — handy for manga and image collections stored as multi-file archives. Large images are decoded progressively; navigation stays responsive while uploads continue in the background.
+> **Open the archive. Browse inside. Never extract.**
+>
+> Point iFap at a `.7z`, `.zip`, `.rar`, `.iso`, or comic pack (`.cbz` / `.cbr` / `.cb7`) and flip through every image inside as if it were a normal folder. MANGO maps containers through a virtual filesystem — nested archives, paths inside archives, the works — with the same decode-and-upload pipeline used for loose files on disk. No temp directories, no unpack step, no waiting to start reading.
+
+Large images are decoded progressively; navigation stays responsive while uploads continue in the background.
 
 ## Features
 
+- **Container-native browsing** — ZIP/ZIPX, RAR, **7z** (new), ISO, HBS, and comic-book packs; open archives in place via MANGO's mapper layer, including nested containers
 - Vulkan rendering with float16 processing target and HDR output transforms via MANGO
 - Bilinear and bicubic filtering, pan/zoom, optional alpha blending
 - Folder indexing with prefetch in the navigation direction
-- **Archive support** — open `.zip`/`.cbz`, `.rar`/`.cbr`, `.iso`, `.hbs` (and nested paths inside them) via MANGO's virtual filesystem; browse and view images inside without manual extraction
 - Broad image format support inherited from MANGO's decoders (see below)
 
 ## Usage
@@ -33,23 +37,34 @@ Open a single file, browse a folder recursively, or open an archive directly. iF
 
 ### Archives and containers
 
-Point iFap at an archive file or a path inside one (MANGO resolves the container transparently):
+This is where MANGO earns its keep. iFap does not shell out to `unzip` or spawn extractors — the viewer opens the container, indexes what's inside, and streams individual members through the image decoders directly.
 
 ```bash
 ./ifap ~/downloads/chapter.zip
 ./ifap ~/manga/series/vol01.rar
+./ifap ~/scans/archive.7z
+./ifap ~/disc/photos.iso
+```
+
+Works the same for a path *inside* an archive (MANGO resolves the mapper chain transparently):
+
+```bash
+./ifap ~/manga/series/vol01.cbz/pages/0042.png
 ```
 
 Supported container types (via MANGO):
 
 | Extension | Type |
 |-----------|------|
-| `.zip`, `.zipx`, `.cbz` | ZIP archive (CBZ = comic/manga zip) |
+| `.zip`, `.zipx`, `.cbz`, `.apk` | ZIP archive (CBZ = comic/manga zip) |
 | `.rar`, `.cbr` | RAR archive (CBR = comic/manga rar) |
+| `.7z`, `.cb7` | 7-Zip archive (CB7 = comic/manga 7z; LZMA/LZMA2, PPMd, BZIP2, …) |
 | `.iso` | ISO disc image |
 | `.hbs` | HBS archive |
 
-You can navigate prev/next through all decodable images found in the archive, the same as in a normal folder. RAR-based manga releases are a common case and work out of the box.
+Nested archives are supported — an archive inside an archive is just another path segment. Prev/next walks every decodable image the indexer finds, whether the files live on disk or several layers deep inside a `.7z` full of `.cbz` chapters.
+
+7z/CB7 support is built when MANGO is compiled with LZMA enabled (default in most installs).
 
 ## Supported formats
 
