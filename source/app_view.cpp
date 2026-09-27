@@ -476,6 +476,11 @@ namespace ifap
                 requestRedraw();
                 break;
 
+            case KEYCODE_B:
+                m_alpha_blend = !m_alpha_blend;
+                requestRedraw();
+                break;
+
             default:
                 break;
         }
@@ -515,8 +520,7 @@ namespace ifap
 
     void AppView::renderFrame()
     {
-        const bool blend = !m_window.isKeyPressed(KEYCODE_B);
-        const bool frame_active = m_renderer.beginFrame(0.06f, 0.06f, 0.06f, 1.0f, blend);
+        const bool frame_active = m_renderer.beginFrame(0.06f, 0.06f, 0.06f, 1.0f, m_alpha_blend);
 
         if (frame_active && m_current_task && m_current_task->texture)
         {
