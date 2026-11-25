@@ -21,8 +21,7 @@
             "description": "Ninja Release with vcpkg toolchain (requires VCPKG_ROOT)",
             "inherits": ["ninja"],
             "cacheVariables": {
-                "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-                "VCPKG_INSTALL_OPTIONS": "--no-print-usage"
+                "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
             }
         }
     ],
