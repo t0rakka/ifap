@@ -1,6 +1,6 @@
 /*
     iFap Image Viewer Example for MANGO
-    Copyright 2013-2025 Twilight 3D Finland Oy. All rights reserved.
+    Copyright 2013-2026 Twilight 3D Finland Oy. All rights reserved.
 */
 #pragma once
 
@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <vulkan/vulkan.h>
+#include <mango/vulkan/texture_decoder.hpp>
 
 namespace mango::vulkan
 {
@@ -67,6 +68,21 @@ namespace ifap
 
         // True once an upload/clear submit has retired and the image is sampleable.
         bool isTextureLayoutReady(TextureHandle handle) const;
+
+        // Decoder sharing this renderer's device, graphics queue and allocator. Its
+        // process() must run on the thread that renders (it submits to the queue).
+        std::unique_ptr<mango::vulkan::TextureDecoder> createTextureDecoder(
+            const mango::vulkan::TextureDecoderConfig& config);
+
+        // Takes ownership of a decoded image (TextureStatus::Ready, in
+        // SHADER_READ_ONLY_OPTIMAL layout) and returns a regular texture handle,
+        // released with destroyTexture()/tryDestroyTexture(). Returns 0 and frees
+        // the image when the view cannot be created.
+        TextureHandle adoptTexture(const mango::vulkan::ImageAllocation& image,
+                                   const mango::vulkan::TextureInfo& info);
+
+        // Frees an image from a failed or cancelled decode.
+        void destroyImage(const mango::vulkan::ImageAllocation& image);
     };
 
 } // namespace ifap

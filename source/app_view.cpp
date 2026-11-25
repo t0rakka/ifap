@@ -1,11 +1,9 @@
 /*
     iFap Image Viewer Example for MANGO
-    Copyright 2013-2025 Twilight 3D Finland Oy. All rights reserved.
+    Copyright 2013-2026 Twilight 3D Finland Oy. All rights reserved.
 */
 #include "app_view.hpp"
 
-#include <chrono>
-#include <future>
 #include <string>
 
 namespace ifap
@@ -239,6 +237,7 @@ namespace ifap
         }
 
         m_window.invalidate();
+        m_window.requestFrameIn(0);
     }
 
     void AppView::scheduleNextFrame()
@@ -248,13 +247,9 @@ namespace ifap
             return;
         }
 
-        // OnDemand idles with WAIT_INFINITE until an OS event arrives. Worker-thread
-        // invalidate/wake is not reliable on macOS (mouse click "fixes" a gray window
-        // because it delivers a real event). Arm a timed wake so we keep pumping until
-        // the image is actually on screen.
-        const double hz = m_window.getDisplayRefreshRate();
-        const double interval = hz > 0.0 ? (1.0 / hz) : (1.0 / 60.0);
-        m_window.requestFrameIn(interval);
+        // Prefer an immediate wake so a finished decode is not delayed until the
+        // next vsync; fall back to the refresh interval only as a heartbeat.
+        m_window.requestFrameIn(0);
     }
 
     void AppView::scheduleDebugFrame()
@@ -276,27 +271,18 @@ namespace ifap
 
         const DecodeTask& task = *m_current_task;
 
+        // Nothing more will arrive for a failed image; the placeholder is final.
+        if (task.prepare_state == PrepareState::Failed)
+        {
+            return true;
+        }
+
         if (task.prepare_state != PrepareState::Ready || !task.gpu_texture_ready)
         {
             return false;
         }
 
         if (!task.texture.handle || !m_renderer.isTextureLayoutReady(task.texture.handle))
-        {
-            return false;
-        }
-
-        if (!task.content_uploaded)
-        {
-            return false;
-        }
-
-        if (task.hasPendingUpdates() || task.isDecoding())
-        {
-            return false;
-        }
-
-        if (!m_renderer.isTextureUploadComplete(task.texture.handle))
         {
             return false;
         }
@@ -332,40 +318,11 @@ namespace ifap
             return true;
         }
 
-        if (m_current_task)
+        // Decodes in flight need no frames: the decoder's wake hook requests one
+        // when a texture is ready.
+        if (m_current_task && m_current_task->present_settle_frames > 0)
         {
-            if (m_current_task->prepare_state != PrepareState::Ready)
-            {
-                return true;
-            }
-
-            if (!m_current_task->gpu_texture_ready || m_current_task->hasPendingUpdates())
-            {
-                return true;
-            }
-
-            if (m_current_task->texture.handle &&
-                !m_renderer.isTextureLayoutReady(m_current_task->texture.handle))
-            {
-                return true;
-            }
-
-            if (m_current_task->texture.handle &&
-                !m_renderer.isTextureUploadComplete(m_current_task->texture.handle))
-            {
-                return true;
-            }
-
-            if (m_current_task->present_settle_frames > 0)
-            {
-                return true;
-            }
-
-            if (m_current_task->future.valid() &&
-                m_current_task->future.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
-            {
-                return true;
-            }
+            return true;
         }
 
         return false;
@@ -593,12 +550,18 @@ namespace ifap
         {
             tryCommitNavigation(true);
         }
-
         // Input and texture work before swapchain acquire so event handling stays
         // responsive even when the GPU is busy decoding/uploading.
         const bool texture_progress = m_texture_cache.update(m_current_index, m_current_task);
 
-        renderFrame();
+        // Compute shares the graphics queue with the swapchain. Presenting while
+        // a decode is in flight parks the decode behind a vsync wait (~one refresh
+        // of READY latency). Skip present until the visible image is ready; the
+        // wake hook keeps the loop pumping.
+        const bool defer_present = m_awaiting_display && m_current_task &&
+            m_current_task->isDecoding();
+        if (!defer_present)
+            renderFrame();
 
         if (m_debug)
         {

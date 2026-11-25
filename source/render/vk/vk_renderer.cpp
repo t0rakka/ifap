@@ -1,6 +1,6 @@
 /*
     iFap Image Viewer Example for MANGO
-    Copyright 2013-2025 Twilight 3D Finland Oy. All rights reserved.
+    Copyright 2013-2026 Twilight 3D Finland Oy. All rights reserved.
 */
 #include "vk_renderer.hpp"
 #include "../image_shaders.hpp"
@@ -361,6 +361,8 @@ namespace ifap
         void ensureProcessingRendering();
         bool isTextureUploadComplete(TextureHandle handle) const;
         bool isTextureLayoutReady(TextureHandle handle) const;
+        TextureHandle adoptTexture(const ImageAllocation& image, const TextureInfo& info);
+        static PixelFormat toPixelFormat(VkFormat format);
 
         Impl(VulkanWindow& window);
         ~Impl();
@@ -1170,6 +1172,44 @@ namespace ifap
         return handle;
     }
 
+    PixelFormat VKRenderer::Impl::toPixelFormat(VkFormat format)
+    {
+        switch (format)
+        {
+            case VK_FORMAT_R8G8B8A8_SRGB:       return PixelFormat::RGBA8_SRGB;
+            case VK_FORMAT_R16G16B16A16_SFLOAT: return PixelFormat::RGBA16F;
+            case VK_FORMAT_R32G32B32A32_SFLOAT: return PixelFormat::RGBA32F;
+            default:                            return PixelFormat::RGBA8_UNORM;
+        }
+    }
+
+    TextureHandle VKRenderer::Impl::adoptTexture(const ImageAllocation& image, const TextureInfo& info)
+    {
+        if (image.image == VK_NULL_HANDLE)
+        {
+            return 0;
+        }
+
+        VkImageView view = createTextureView(m_device, image, info);
+        if (view == VK_NULL_HANDLE)
+        {
+            m_allocator->destroyImage(image);
+            return 0;
+        }
+
+        auto texture = std::make_unique<GpuTexture>();
+        texture->width = int(info.width);
+        texture->height = int(info.height);
+        texture->format = toPixelFormat(info.format);
+        texture->image = image.image;
+        texture->allocation = image.allocation;
+        texture->view = view;
+        texture->layout_ready = true;
+
+        m_textures.push_back(std::move(texture));
+        return TextureHandle(m_textures.size());
+    }
+
     void VKRenderer::Impl::uploadTextureRegion(TextureHandle handle, PixelFormat format,
                                          int x, int y, int width, int height, const void* pixels)
     {
@@ -1977,5 +2017,24 @@ namespace ifap
     void VKRenderer::setUploadBytesPerFrame(size_t bytes) { m_impl->setUploadBytesPerFrame(bytes); }
     bool VKRenderer::isTextureUploadComplete(TextureHandle handle) const { return m_impl->isTextureUploadComplete(handle); }
     bool VKRenderer::isTextureLayoutReady(TextureHandle handle) const { return m_impl->isTextureLayoutReady(handle); }
+
+    std::unique_ptr<TextureDecoder> VKRenderer::createTextureDecoder(const TextureDecoderConfig& config)
+    {
+        return std::make_unique<TextureDecoder>(m_impl->m_physicalDevice, m_impl->m_device,
+            m_impl->m_graphicsQueue, m_impl->m_graphicsQueueFamilyIndex, *m_impl->m_allocator, config);
+    }
+
+    TextureHandle VKRenderer::adoptTexture(const ImageAllocation& image, const TextureInfo& info)
+    {
+        return m_impl->adoptTexture(image, info);
+    }
+
+    void VKRenderer::destroyImage(const ImageAllocation& image)
+    {
+        if (image.image != VK_NULL_HANDLE)
+        {
+            m_impl->m_allocator->destroyImage(image);
+        }
+    }
 
 } // namespace ifap
