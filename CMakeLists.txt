@@ -45,5 +45,19 @@ endif()
 find_package(mango REQUIRED)
 target_link_libraries(ifap PRIVATE mango::mango)
 
+# Prefer package mango headers over a stale /usr/local install. AppleClang puts
+# /usr/local/include ahead of -isystem package paths; a distinct -I overlay
+# (symlink) wins. REALPATH collapses ".." from mango_DIR.
+if (mango_DIR)
+    get_filename_component(_mango_prefix "${mango_DIR}/../../.." REALPATH)
+    if (EXISTS "${_mango_prefix}/include/mango/core/system.hpp")
+        set(_mango_hdr_overlay "${CMAKE_BINARY_DIR}/mango_include_overlay")
+        file(MAKE_DIRECTORY "${_mango_hdr_overlay}")
+        file(CREATE_LINK "${_mango_prefix}/include/mango" "${_mango_hdr_overlay}/mango" SYMBOLIC)
+        target_compile_options(ifap PRIVATE "-I${_mango_hdr_overlay}")
+        message(STATUS "mango include overlay (-I): ${_mango_hdr_overlay}")
+    endif ()
+endif ()
+
 message(STATUS "Compiler: ${CMAKE_CXX_COMPILER_ID}")
 message(STATUS "Build: ${CMAKE_BUILD_TYPE}")

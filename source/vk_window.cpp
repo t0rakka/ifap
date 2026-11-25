@@ -47,7 +47,7 @@ namespace ifap
                     args.sdr = true;
                 });
 
-            commands.flag("--debug", "show thread-pool utilization overlay",
+            commands.flag("--debug", "show TP / process-CPU / GPU utilization overlay",
                 [&]()
                 {
                     args.debug = true;
