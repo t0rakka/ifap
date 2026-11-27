@@ -78,6 +78,11 @@ namespace ifap
         TextureDecoderConfig config;
         // on_content_changed is AppView::requestRedraw → invalidate + schedule.
         config.wake = m_on_content_changed;
+        // Match texture_inflight_decode_limit: enough prepare threads and compute
+        // slots that scrolling can use CPU headroom to keep the GPU queue dense.
+        config.max_inflight_compute = 12;
+        config.prepare_workers = 8;
+        config.max_concurrent_cpu = 4;
         m_decoder = m_renderer.createTextureDecoder(config);
 
         m_worker = std::thread([this] { workerThreadMain(); });

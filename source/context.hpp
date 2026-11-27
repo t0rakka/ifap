@@ -19,13 +19,14 @@ namespace ifap
     using mango::u64;
     using mango::math::float32x2;
 
-    static constexpr size_t texture_cache_size = 16;
-    static constexpr size_t texture_prefetch_size = 4;
+    static constexpr size_t texture_cache_size = 24;
+    static constexpr size_t texture_prefetch_size = 12;
 
     // Upper bound on decodes in flight at once (the visible image plus prefetch).
-    // Bounds peak RAM: each in-flight decode holds its compressed file and, on the
-    // CPU path, a full-resolution bitmap.
-    static constexpr size_t texture_inflight_decode_limit = 4;
+    // Elevated so prepare workers and the GPU queue stay fed while scrolling;
+    // each in-flight decode holds its compressed file and, on the CPU path, a
+    // full-resolution bitmap.
+    static constexpr size_t texture_inflight_decode_limit = 12;
 
     // The worker reads each file into RAM in blocks of this size, checking for abort /
     // abandonment between blocks. This keeps a stale read (e.g. a huge file the user just
