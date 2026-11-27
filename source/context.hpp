@@ -19,13 +19,21 @@ namespace ifap
     using mango::u64;
     using mango::math::float32x2;
 
+    // Slot ceilings for small images (hackatron-sized JPEGs). Extreme resolutions
+    // shrink the live window from texture_memory_budget_bytes so a folder of
+    // 16k² RGBA (~1 GB/frame) cannot pin tens of gigabytes and start paging.
     static constexpr size_t texture_cache_size = 24;
     static constexpr size_t texture_prefetch_size = 12;
+
+    // Soft cap on resident decoded image memory (pinned window + evictable cache +
+    // pending GPU destroys). Sized for a couple of 16k² RGBA frames (~1 GB each)
+    // plus headroom — above this, macOS unified memory starts paging hard.
+    static constexpr size_t texture_memory_budget_bytes = 3ull << 30; // 3 GiB
 
     // Upper bound on decodes in flight at once (the visible image plus prefetch).
     // Elevated so prepare workers and the GPU queue stay fed while scrolling;
     // each in-flight decode holds its compressed file and, on the CPU path, a
-    // full-resolution bitmap.
+    // full-resolution bitmap. Large frames clamp this via the memory budget.
     static constexpr size_t texture_inflight_decode_limit = 12;
 
     // The worker reads each file into RAM in blocks of this size, checking for abort /

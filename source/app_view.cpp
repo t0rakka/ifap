@@ -83,7 +83,15 @@ namespace ifap
         m_nav_pending = false;
         m_pending_nav_index = m_current_index;
         m_last_nav_commit_ms = mango::Time::ms();
-        m_current_task = m_texture_cache.getTexture(m_current_index, true);
+
+        // Hold-to-scroll: title index races ahead, but do not abort in-flight
+        // prepares every latch — that left zero Ready frames for findDisplayTask
+        // until key-up. Soft commit lets trail images land and paint mid-journey.
+        const bool nav_held =
+            m_window.isKeyPressed(KEYCODE_LEFT) || m_window.isKeyPressed(KEYCODE_Q) ||
+            m_window.isKeyPressed(KEYCODE_RIGHT) || m_window.isKeyPressed(KEYCODE_W);
+        m_current_task = m_texture_cache.getTexture(m_current_index, true, /*abort_others=*/!nav_held);
+
         resetTransformation();
         m_awaiting_display = true;
     }
@@ -129,6 +137,7 @@ namespace ifap
             return;
         }
 
+        m_nav_direction = direction;
         m_texture_cache.setPrefetchDirection(direction);
         m_last_nav_input_ms = mango::Time::ms();
 
@@ -158,9 +167,13 @@ namespace ifap
         window_size.x = std::max(1, window_size.x);
         window_size.y = std::max(1, window_size.y);
 
+        auto display = m_texture_cache.findDisplayTask(m_current_index, m_nav_direction);
+        if (!display)
+            display = m_current_task;
+
         int32x2 image_size;
-        image_size.x = std::max(1, m_current_task ? m_current_task->texture.width : 1);
-        image_size.y = std::max(1, m_current_task ? m_current_task->texture.height : 1);
+        image_size.x = std::max(1, display ? display->texture.width : 1);
+        image_size.y = std::max(1, display ? display->texture.height : 1);
 
         float32x2 aspect;
         aspect.x = float(window_size.x) / float(image_size.x);
@@ -208,9 +221,12 @@ namespace ifap
         float32x2 translate = m_translate + computeTranslate() / scale;
 
         ImageDrawRequest request;
-        if (m_current_task)
+        auto display = m_texture_cache.findDisplayTask(m_current_index, m_nav_direction);
+        if (!display)
+            display = m_current_task;
+        if (display)
         {
-            const GpuTexture& texture = m_current_task->texture;
+            const GpuTexture& texture = display->texture;
             request.texture = texture.handle;
             request.width = texture.sample_width;
             request.height = texture.sample_height;
@@ -479,9 +495,11 @@ namespace ifap
     {
         const bool frame_active = m_renderer.beginFrame(0.06f, 0.06f, 0.06f, 1.0f, m_alpha_blend);
 
-        if (frame_active && m_current_task && m_current_task->texture)
+        if (frame_active)
         {
-            m_renderer.drawImage(makeDrawRequest());
+            const ImageDrawRequest request = makeDrawRequest();
+            if (request.texture)
+                m_renderer.drawImage(request);
         }
 
         if (frame_active && m_debug)
@@ -546,20 +564,35 @@ namespace ifap
             }
         }
 
-        if (!nav_left && !nav_right)
+        const bool nav_held = nav_left || nav_right;
+        if (!nav_held)
         {
             tryCommitNavigation(true);
+            // Key-up: abort trail prepares and focus the live index so the final
+            // frame catches up immediately (hold path intentionally left them alone).
+            if (m_nav_was_held)
+            {
+                m_current_task = m_texture_cache.getTexture(m_current_index, true, true);
+                m_awaiting_display = true;
+            }
         }
+        m_nav_was_held = nav_held;
+
         // Input and texture work before swapchain acquire so event handling stays
         // responsive even when the GPU is busy decoding/uploading.
         const bool texture_progress = m_texture_cache.update(m_current_index, m_current_task);
 
         // Compute shares the graphics queue with the swapchain. Presenting while
         // a decode is in flight parks the decode behind a vsync wait (~one refresh
-        // of READY latency). Skip present until the visible image is ready; the
-        // wake hook keeps the loop pumping.
+        // of READY latency) — worth it for small JPEGs that finish in a frame or
+        // two. Hold-to-scroll on extreme/ keeps isDecoding() true for hundreds of
+        // ms per 16k (and aborts/restarts each latch), so deferring present freezes
+        // the HUD with a live titlebar index. Keep painting while keys are held or
+        // the frame is huge; the wake hook still pumps when decode completes.
+        const size_t pending_bytes = m_current_task ? m_current_task->estimatedBytes() : 0;
         const bool defer_present = m_awaiting_display && m_current_task &&
-            m_current_task->isDecoding();
+            m_current_task->isDecoding() && !nav_held &&
+            pending_bytes < (256ull << 20);
         if (!defer_present)
             renderFrame();
 

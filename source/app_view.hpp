@@ -81,6 +81,8 @@ namespace ifap
 
         std::shared_ptr<DecodeTask> m_current_task;
         size_t m_current_index = 0;
+        int m_nav_direction = 1; // last scroll sign; display walks the opposite trail
+        bool m_nav_was_held = false;
 
         bool m_loop_active = false;
         bool m_event_loop_running = false;

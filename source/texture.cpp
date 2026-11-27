@@ -78,11 +78,11 @@ namespace ifap
         TextureDecoderConfig config;
         // on_content_changed is AppView::requestRedraw → invalidate + schedule.
         config.wake = m_on_content_changed;
-        // Match texture_inflight_decode_limit: enough prepare threads and compute
-        // slots that scrolling can use CPU headroom to keep the GPU queue dense.
-        config.max_inflight_compute = 12;
-        config.prepare_workers = 8;
-        config.max_concurrent_cpu = 4;
+        // Decoder allocates the VkImage only at record/submit. Still keep slots
+        // low so extreme/ cannot stack many full-frame GPU images + staging.
+        config.max_inflight_compute = 2;
+        config.prepare_workers = 2;
+        config.max_concurrent_cpu = 1;
         m_decoder = m_renderer.createTextureDecoder(config);
 
         m_worker = std::thread([this] { workerThreadMain(); });
@@ -100,7 +100,10 @@ namespace ifap
         m_worker_cv.notify_all();
         m_worker.join();
 
-        // Dropping the tasks cancels their decodes and queues their textures.
+        // Drop every shared_ptr while this object (and its mutexes) are still alive.
+        // m_display_holdout is declared before m_gpu_destroy_mutex; if it were left to
+        // member-destruction order, releaseTask would lock a destroyed mutex on exit.
+        m_display_holdout.reset();
         m_cache.clear();
         m_pinned.clear();
         m_pin_set.clear();
@@ -111,9 +114,10 @@ namespace ifap
 
         while (!m_gpu_destroy_queue.empty())
         {
-            m_renderer.destroyTexture(m_gpu_destroy_queue.front());
+            m_renderer.destroyTexture(m_gpu_destroy_queue.front().handle);
             m_gpu_destroy_queue.pop_front();
         }
+        m_pending_destroy_bytes.store(0, std::memory_order_relaxed);
 
         if (m_placeholder)
         {
@@ -162,7 +166,8 @@ namespace ifap
 
     // Runs on whichever thread drops the last reference: cancels the decode (its
     // callback still fires and frees the image) and defers the texture destroy to
-    // the UI thread.
+    // the UI thread. UI-thread eviction prefers reclaimTaskGpu() so the handle is
+    // already cleared and this path is a no-op for the VkImage.
     void TextureCache::releaseTask(DecodeTask* task)
     {
         if (!task)
@@ -179,11 +184,41 @@ namespace ifap
         const TextureHandle texture = task->texture.handle;
         if (texture && texture != m_placeholder)
         {
-            std::lock_guard lock(m_gpu_destroy_mutex);
-            m_gpu_destroy_queue.push_back(texture);
+            size_t bytes = task->image_bytes ? task->image_bytes : task->estimatedBytes();
+            if (!bytes)
+                bytes = m_typical_image_bytes.load(std::memory_order_relaxed);
+            queueGpuDestroy(texture, bytes);
         }
 
         delete task;
+    }
+
+    void TextureCache::queueGpuDestroy(TextureHandle handle, size_t bytes)
+    {
+        if (!handle || handle == m_placeholder)
+            return;
+
+        {
+            std::lock_guard lock(m_gpu_destroy_mutex);
+            m_gpu_destroy_queue.push_back(PendingDestroy{ handle, bytes });
+        }
+        if (bytes)
+            m_pending_destroy_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+
+    void TextureCache::reclaimTaskGpu(DecodeTask& task)
+    {
+        // Keep the paint holdout's VkImage — findDisplayTask may still be showing it.
+        if (m_display_holdout && m_display_holdout.get() == &task)
+            return;
+
+        const TextureHandle handle = task.texture.handle;
+        if (!handle || handle == m_placeholder)
+            return;
+
+        // Detach so releaseTask / a later shared_ptr drop does not queue again.
+        task.texture.handle = 0;
+        m_renderer.destroyTexture(handle);
     }
 
     void TextureCache::enqueuePrepare(std::shared_ptr<DecodeTask> task, bool front)
@@ -267,6 +302,12 @@ namespace ifap
             File file(*task->path, task->name);
             ConstMemory src = file;
 
+            // Huge compressed JPEGs are almost always huge RGBA. Bump the folder
+            // typical before header so prefetch clamps before the first 16k lands
+            // (mix folders otherwise ramp on small-image ceilings).
+            if (src.size >= (16ull << 20))
+                observeImageBytes(1024ull * 1024ull * 1024ull);
+
             PartialFileRead partial = takePartialRead(task->index);
             std::unique_ptr<Buffer> buffer;
             size_t offset = 0;
@@ -306,6 +347,23 @@ namespace ifap
             {
                 m_on_content_changed();
             }
+            return;
+        }
+
+        // Refuse prefetch when resident + pending destroys already fill the budget.
+        // (VkImage is deferred until GPU record, but Ready textures + file RAM still count.)
+        const size_t need = task->estimatedBytes()
+            ? task->estimatedBytes()
+            : (data->size() >= (16ull << 20)
+                ? size_t(1024ull * 1024ull * 1024ull)
+                : m_typical_image_bytes.load(std::memory_order_relaxed));
+        if (!task->priority && need &&
+            pressureBytes() + need > texture_memory_budget_bytes)
+        {
+            // Back to Pending so tickPrefetch can retry once destroys catch up.
+            task->prepare_state = PrepareState::Pending;
+            if (m_on_content_changed)
+                m_on_content_changed();
             return;
         }
 
@@ -388,6 +446,12 @@ namespace ifap
         task->gpu_texture_ready = true;
         task->present_settle_frames = 2;
         task->prepare_state = PrepareState::Ready;
+        task->image_bytes = result.report.image_bytes
+            ? result.report.image_bytes
+            : size_t(result.info.width) * size_t(result.info.height) * 4;
+        observeImageBytes(task->image_bytes);
+        refreshCacheCost(task->index, task);
+        enforceMemoryBudget(task->index);
 
         if (trace_decode)
         {
@@ -395,10 +459,14 @@ namespace ifap
         }
     }
 
-    void TextureCache::drainGpuDestroys()
+    void TextureCache::drainGpuDestroys(bool force)
     {
-        // Attempt each currently-queued handle once: tryDestroyTexture refuses
-        // textures an in-flight frame still references, which go to the back.
+        // Under memory pressure, block on the timeline so VkImages actually return
+        // instead of accumulating in this queue while residentBytes() looks fine.
+        const bool pressure = force
+            || pressureBytes() > texture_memory_budget_bytes
+            || m_pending_destroy_bytes.load(std::memory_order_relaxed) > (texture_memory_budget_bytes / 4);
+
         size_t remaining;
         {
             std::lock_guard lock(m_gpu_destroy_mutex);
@@ -407,23 +475,35 @@ namespace ifap
 
         for (; remaining > 0; --remaining)
         {
-            TextureHandle handle = 0;
+            PendingDestroy pending;
 
             {
                 std::lock_guard lock(m_gpu_destroy_mutex);
                 if (m_gpu_destroy_queue.empty())
-                {
                     return;
-                }
 
-                handle = m_gpu_destroy_queue.front();
+                pending = m_gpu_destroy_queue.front();
                 m_gpu_destroy_queue.pop_front();
             }
 
-            if (!m_renderer.tryDestroyTexture(handle))
+            bool freed = m_renderer.tryDestroyTexture(pending.handle);
+            if (!freed && pressure)
+            {
+                m_renderer.destroyTexture(pending.handle);
+                freed = true;
+            }
+
+            if (freed)
+            {
+                if (pending.bytes)
+                    m_pending_destroy_bytes.fetch_sub(
+                        std::min(pending.bytes, m_pending_destroy_bytes.load(std::memory_order_relaxed)),
+                        std::memory_order_relaxed);
+            }
+            else
             {
                 std::lock_guard lock(m_gpu_destroy_mutex);
-                m_gpu_destroy_queue.push_back(handle);
+                m_gpu_destroy_queue.push_back(pending);
             }
         }
     }
@@ -438,6 +518,179 @@ namespace ifap
 
         task.texture.width = task.header_width;
         task.texture.height = task.header_height;
+        observeImageBytes(task.estimatedBytes());
+    }
+
+    size_t TextureCache::prefetchLimit() const
+    {
+        const size_t typical = m_typical_image_bytes.load(std::memory_order_relaxed);
+        if (typical == 0)
+            return texture_prefetch_size;
+
+        // How many full frames fit in the budget; keep at least current + one ahead.
+        const size_t max_frames = std::max(size_t(2), texture_memory_budget_bytes / typical);
+        size_t limit = std::min(texture_prefetch_size, max_frames - 1);
+        // ≥256 MB/frame: at most one ahead — otherwise scroll outruns reclaim.
+        if (typical >= (256ull << 20))
+            limit = std::min(limit, size_t(1));
+        return limit;
+    }
+
+    size_t TextureCache::inflightLimit() const
+    {
+        // Large frames: keep concurrent decodes ~half the resident window so
+        // in-flight VkImages and already-Ready pins do not both sit at the budget.
+        const size_t typical = m_typical_image_bytes.load(std::memory_order_relaxed);
+        if (typical == 0)
+            return texture_inflight_decode_limit;
+
+        const size_t by_budget = std::max(size_t(1),
+            (texture_memory_budget_bytes / typical + 1) / 2);
+        size_t limit = std::min({ texture_inflight_decode_limit, prefetchLimit() + 1, by_budget });
+        if (typical >= (256ull << 20))
+            limit = std::min(limit, size_t(2));
+        return limit;
+    }
+
+    size_t TextureCache::taskCost(const DecodeTask& task) const
+    {
+        if (const size_t bytes = task.estimatedBytes())
+            return bytes;
+        // Unknown footprint (decode not headed yet): reserve the folder worst-case
+        // so a pending 16k does not look free next to cheap hackatron entries.
+        if (const size_t typical = m_typical_image_bytes.load(std::memory_order_relaxed))
+            return typical;
+        return 1;
+    }
+
+    size_t TextureCache::residentBytes() const
+    {
+        // Sum live task footprints — do NOT trust CostLRUCache::used(). Entries are
+        // often inserted at cost 1 / small-header size before Ready, and the book
+        // was never updated; that let ~50×1 GB PIAs sit under an "8 GiB" budget.
+        size_t bytes = 0;
+        for (const auto& entry : m_pinned)
+        {
+            if (entry.second)
+                bytes += taskCost(*entry.second);
+        }
+        m_cache.for_each([&] (size_t /*index*/, const std::shared_ptr<DecodeTask>& task)
+        {
+            if (task)
+                bytes += taskCost(*task);
+        });
+        // Holdout may sit outside pin/cache after eviction; still counts toward budget.
+        if (m_display_holdout)
+        {
+            auto still = peekTask(m_display_holdout->index);
+            if (still.get() != m_display_holdout.get())
+                bytes += taskCost(*m_display_holdout);
+        }
+        return bytes;
+    }
+
+    size_t TextureCache::pendingDestroyBytes() const
+    {
+        return m_pending_destroy_bytes.load(std::memory_order_relaxed);
+    }
+
+    size_t TextureCache::pressureBytes() const
+    {
+        return residentBytes() + pendingDestroyBytes();
+    }
+
+    void TextureCache::observeImageBytes(size_t bytes)
+    {
+        if (!bytes)
+            return;
+
+        size_t cur = m_typical_image_bytes.load(std::memory_order_relaxed);
+        while (bytes > cur &&
+               !m_typical_image_bytes.compare_exchange_weak(
+                   cur, bytes, std::memory_order_relaxed))
+        {
+        }
+    }
+
+    void TextureCache::refreshCacheCost(size_t index, const std::shared_ptr<DecodeTask>& task)
+    {
+        if (!task || m_pinned.find(index) != m_pinned.end())
+            return;
+
+        // Re-insert so the cost ledger matches the real VkImage. get() no-ops when
+        // absent (task already dropped) and promotes when present (just-finished = hot).
+        if (m_cache.get(index))
+            m_cache.insert(index, task, taskCost(*task));
+    }
+
+    void TextureCache::enforceMemoryBudget(size_t keep_index)
+    {
+        auto over = [this] {
+            return pressureBytes() > texture_memory_budget_bytes;
+        };
+
+        // Evictable store first. Prefer dropping unfinished work; keep Ready trail
+        // frames for findDisplayTask until we truly need the bytes (large-frame folders).
+        auto evictOne = [&] () -> bool
+        {
+            if (m_cache.size() == 0)
+                return false;
+
+            // Pass 1: non-Ready LRU.
+            for (auto it = m_cache.end(); it != m_cache.begin(); )
+            {
+                --it;
+                if (!it->value)
+                {
+                    m_cache.erase(it->key);
+                    return true;
+                }
+                if (it->value->prepare_state.load() != PrepareState::Ready)
+                {
+                    reclaimTaskGpu(*it->value);
+                    m_cache.erase(it->key);
+                    return true;
+                }
+            }
+
+            // Pass 2: Ready LRU (large-frame pressure only).
+            auto victim = std::prev(m_cache.end());
+            const size_t key = victim->key;
+            if (victim->value)
+                reclaimTaskGpu(*victim->value);
+            m_cache.erase(key);
+            return true;
+        };
+
+        while (over() && evictOne())
+        {
+        }
+
+        // Pin window can itself exceed the budget if it was built before typical
+        // grew (mix: small headers → wide prefetch, then 16k frames fill it). Drop
+        // prefetch-tail pins, never the keep/visible index.
+        while (over() && m_pinned.size() > 1)
+        {
+            size_t victim = size_t(-1);
+            for (auto it = m_pin_set.rbegin(); it != m_pin_set.rend(); ++it)
+            {
+                if (*it != keep_index && m_pinned.find(*it) != m_pinned.end())
+                {
+                    victim = *it;
+                    break;
+                }
+            }
+            if (victim == size_t(-1))
+                break;
+
+            if (auto it = m_pinned.find(victim); it != m_pinned.end() && it->second)
+                reclaimTaskGpu(*it->second);
+            m_pinned.erase(victim);
+            m_pin_set.erase(std::remove(m_pin_set.begin(), m_pin_set.end(), victim), m_pin_set.end());
+        }
+
+        if (over())
+            drainGpuDestroys(true);
     }
 
     void TextureCache::setPrefetchDirection(int direction)
@@ -459,7 +712,7 @@ namespace ifap
         // Bound retained prefixes so a fast scroll across huge files cannot pin an
         // unbounded amount of host RAM. Keep the entry we just stashed; drop others
         // until we are within the prefetch window (+ the visible image).
-        const size_t limit = texture_prefetch_size + 1;
+        const size_t limit = prefetchLimit() + 1;
         while (m_partial_reads.size() > limit)
         {
             bool erased = false;
@@ -517,7 +770,9 @@ namespace ifap
             }
         });
 
-        // Erasing drops the last reference; the deleter cancels the decode.
+        // Drop references only — these are still Decoding (placeholder texture).
+        // Avoid reclaimTaskGpu here; it would block the UI thread on the timeline
+        // during hold-to-scroll and starve process()/Ready updates.
         for (size_t index : drop)
         {
             m_pinned.erase(index);
@@ -551,7 +806,7 @@ namespace ifap
 
         // Keep in-flight decodes bounded to a window around the visible image.
         // Finished textures stay cached so navigating back to them is instant.
-        const size_t keep = texture_prefetch_size;
+        const size_t keep = prefetchLimit();
 
         std::vector<size_t> stale;
 
@@ -599,6 +854,86 @@ namespace ifap
         return {};
     }
 
+    std::shared_ptr<DecodeTask> TextureCache::peekTask(size_t index) const
+    {
+        auto it = m_pinned.find(index);
+        if (it != m_pinned.end())
+            return it->second;
+
+        // Const scan — avoid LRU touch on a paint-path lookup.
+        std::shared_ptr<DecodeTask> found;
+        m_cache.for_each([&] (size_t key, const std::shared_ptr<DecodeTask>& task)
+        {
+            if (key == index)
+                found = task;
+        });
+        return found;
+    }
+
+    std::shared_ptr<DecodeTask> TextureCache::findDisplayTask(size_t index, int scroll_direction) const
+    {
+        const size_t count = m_indexer.size();
+        if (!count)
+            return {};
+
+        auto isPaintReady = [this] (const DecodeTask& task) -> bool
+        {
+            return task.prepare_state.load() == PrepareState::Ready
+                && task.gpu_texture_ready
+                && task.texture.handle != 0
+                && task.texture.handle != m_placeholder;
+        };
+
+        // Trail distance from `index` walking opposite the scroll direction.
+        const int step = scroll_direction < 0 ? 1 : -1;
+        auto trailDistance = [&] (size_t candidate) -> size_t
+        {
+            for (size_t n = 0; n < count; ++n)
+            {
+                const size_t idx = size_t(modulo(
+                    ptrdiff_t(index) + ptrdiff_t(step) * ptrdiff_t(n),
+                    ptrdiff_t(count)));
+                if (idx == candidate)
+                    return n;
+            }
+            return count;
+        };
+
+        // Prefer the Ready frame closest behind (or at) the live index among
+        // everything still resident — not just the first hit / sticky holdout.
+        std::shared_ptr<DecodeTask> best;
+        size_t best_dist = count;
+
+        auto consider = [&] (const std::shared_ptr<DecodeTask>& task)
+        {
+            if (!task || !isPaintReady(*task))
+                return;
+            const size_t dist = trailDistance(task->index);
+            if (dist < best_dist)
+            {
+                best_dist = dist;
+                best = task;
+            }
+        };
+
+        consider(peekTask(index));
+        for (const auto& entry : m_pinned)
+            consider(entry.second);
+        m_cache.for_each([&] (size_t /*key*/, const std::shared_ptr<DecodeTask>& task)
+        {
+            consider(task);
+        });
+        consider(m_display_holdout);
+
+        if (best)
+        {
+            m_display_holdout = best;
+            return best;
+        }
+
+        return peekTask(index);
+    }
+
     void TextureCache::storeTask(size_t index, const std::shared_ptr<DecodeTask>& task, bool pin_overlay)
     {
         if (pin_overlay)
@@ -622,7 +957,8 @@ namespace ifap
         }
         else
         {
-            m_cache.insert(index, task);
+            m_cache.insert(index, task, taskCost(*task));
+            enforceMemoryBudget(index);
         }
     }
 
@@ -651,7 +987,8 @@ namespace ifap
         desired.push_back(priority_index % count);
 
         const int dir = m_prefetch_direction ? m_prefetch_direction : 1;
-        for (size_t i = 0; i < texture_prefetch_size; ++i)
+        const size_t prefetch = prefetchLimit();
+        for (size_t i = 0; i < prefetch; ++i)
         {
             const size_t idx = modulo(priority_index + (i + 1) * size_t(dir), count);
             if (std::find(desired.begin(), desired.end(), idx) == desired.end())
@@ -671,7 +1008,7 @@ namespace ifap
         {
             if (!inDesired(it->first))
             {
-                m_cache.insert(it->first, it->second);
+                m_cache.insert(it->first, it->second, taskCost(*it->second));
                 it = m_pinned.erase(it);
             }
             else
@@ -697,6 +1034,8 @@ namespace ifap
                 m_cache.erase(idx);
             }
         }
+
+        enforceMemoryBudget(priority_index);
     }
 
     size_t TextureCache::countActiveDecodes() const
@@ -724,7 +1063,8 @@ namespace ifap
 
     void TextureCache::tickPrefetch(size_t priority_index)
     {
-        if (isAborting() || !m_prefetch_direction || texture_prefetch_size == 0)
+        const size_t prefetch = prefetchLimit();
+        if (isAborting() || !m_prefetch_direction || prefetch == 0)
         {
             return;
         }
@@ -738,7 +1078,14 @@ namespace ifap
         }
 
         // Bound the number of decodes (and their memory) in flight at once.
-        if (countActiveDecodes() >= texture_inflight_decode_limit)
+        if (countActiveDecodes() >= inflightLimit())
+        {
+            return;
+        }
+
+        // Stay under the byte budget before starting another full-resolution decode
+        // (include destroy-queue backlog — those VkImages are still alive).
+        if (pressureBytes() + taskCost(*priority_task) > texture_memory_budget_bytes)
         {
             return;
         }
@@ -749,12 +1096,19 @@ namespace ifap
             return;
         }
 
-        for (size_t i = 0; i < texture_prefetch_size; ++i)
+        for (size_t i = 0; i < prefetch; ++i)
         {
             const size_t index = modulo(priority_index + (i + 1) * size_t(m_prefetch_direction), count);
 
-            if (lookupTask(index))
+            if (auto existing = lookupTask(index))
             {
+                // Retry a prefetch that deferred decode() under memory pressure.
+                if (existing->prepare_state.load() == PrepareState::Pending)
+                {
+                    existing->prepare_state = PrepareState::Preparing;
+                    enqueuePrepare(existing, false);
+                    return;
+                }
                 continue;
             }
 
@@ -768,6 +1122,8 @@ namespace ifap
         m_cache.clear();
         m_pinned.clear();
         m_pin_set.clear();
+        m_typical_image_bytes.store(0, std::memory_order_relaxed);
+        m_display_holdout.reset();
         clearPartialReads();
 
         std::string filename = name;
@@ -876,27 +1232,42 @@ namespace ifap
         return m_current_index;
     }
 
-    std::shared_ptr<DecodeTask> TextureCache::getTexture(size_t index, bool priority)
+    std::shared_ptr<DecodeTask> TextureCache::getTexture(size_t index, bool priority, bool abort_others)
     {
         // Navigation defines a new pin window (current image + prefetch window).
         // Establish it before lookup/creation so the visible image is routed to the
-        // eviction-immune overlay, then abort every other in-flight read/decode so
-        // this file starts immediately.
+        // eviction-immune overlay. abort_others cancels sibling prepares so a tap
+        // focuses immediately; hold-to-scroll skips that so trail Ready frames land.
         if (priority)
         {
             repin(index);
-            abortNonPriorityWork(index);
+            if (abort_others)
+                abortNonPriorityWork(index);
         }
 
         auto entry = lookupTask(index);
         if (entry)
         {
+            if (priority && entry->prepare_state.load() == PrepareState::Pending)
+            {
+                entry->priority = true;
+                entry->prepare_state = PrepareState::Preparing;
+                enqueuePrepare(entry, true);
+            }
             return entry;
         }
 
         if (index >= m_indexer.size())
         {
             return {};
+        }
+
+        // Hold-to-scroll without abort: don't start another prepare if we're already
+        // at the inflight cap — caller still updates the title index; paint uses
+        // findDisplayTask on whatever Ready frames have landed.
+        if (priority && !abort_others && countActiveDecodes() >= inflightLimit())
+        {
+            return findDisplayTask(index, m_prefetch_direction ? m_prefetch_direction : 1);
         }
 
         std::shared_ptr<DecodeTask> task = makeTask();
@@ -914,6 +1285,7 @@ namespace ifap
         texture.sample_height = 1;
         texture.format = PixelFormat::RGBA8_UNORM;
 
+        task->priority = priority;
         task->prepare_state = PrepareState::Preparing;
 
         enqueuePrepare(task, priority);
@@ -928,14 +1300,10 @@ namespace ifap
             return false;
         }
 
-        drainGpuDestroys();
+        drainGpuDestroys(pressureBytes() > texture_memory_budget_bytes);
 
         m_completed = 0;
         m_decoder->process();
-
-        repin(priority_index);
-        cancelStaleDecodes(priority_index);
-        tickPrefetch(priority_index);
 
         forEachTask([this] (size_t /*index*/, std::shared_ptr<DecodeTask>& task)
         {
@@ -945,7 +1313,15 @@ namespace ifap
         if (priority_task)
         {
             promoteHeader(*priority_task);
+            observeImageBytes(priority_task->estimatedBytes());
         }
+
+        // Observe size before repin/prefetch so a folder of huge frames clamps the
+        // window on the same frame the header arrives (avoids the 45 GB ramp).
+        repin(priority_index);
+        cancelStaleDecodes(priority_index);
+        enforceMemoryBudget(priority_index);
+        tickPrefetch(priority_index);
 
         return m_completed > 0;
     }
